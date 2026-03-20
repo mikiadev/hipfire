@@ -557,12 +557,9 @@ pub fn forward(
         weight_gemv(gpu, &layer.wo, &attn_gpu, &o)?;
         gpu.free_tensor(attn_gpu)?;
 
-        // Residual: x = x + o
-        let x_new = gpu.alloc_tensor(&[dim], DType::F32)?;
-        gpu.add_f32(&x, &o, &x_new)?;
-        gpu.free_tensor(x)?;
+        // Residual: x += o (in-place)
+        gpu.add_inplace_f32(&x, &o)?;
         gpu.free_tensor(o)?;
-        x = x_new;
 
         // FFN
         gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
@@ -583,12 +580,9 @@ pub fn forward(
         weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
         gpu.free_tensor(ffn_hidden)?;
 
-        // Residual
-        let x_new = gpu.alloc_tensor(&[dim], DType::F32)?;
-        gpu.add_f32(&x, &ffn_out, &x_new)?;
-        gpu.free_tensor(x)?;
+        // Residual: x += ffn_out (in-place)
+        gpu.add_inplace_f32(&x, &ffn_out)?;
         gpu.free_tensor(ffn_out)?;
-        x = x_new;
     }
 
     // Final norm

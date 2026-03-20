@@ -370,6 +370,20 @@ extern "C" __global__ void add_f32(
 }
 "#;
 
+/// Element-wise in-place add: a[i] += b[i]
+pub const ADD_INPLACE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void add_inplace_f32(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+}
+"#;
+
 /// Element-wise multiply
 pub const MUL_SRC: &str = r#"
 #include <hip/hip_runtime.h>

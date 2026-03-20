@@ -398,6 +398,27 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
     }
 
+    /// a += b (in-place element-wise add)
+    pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
+        self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;
+        let func = &self.functions["add_inplace_f32"];
+
+        let n = a.numel() as i32;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut b_ptr = b.buf.as_ptr();
+        let mut n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+    }
+
     /// c = a * b (element-wise)
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.ensure_kernel("mul", kernels::MUL_SRC, "mul_f32")?;
