@@ -5,3 +5,4 @@ experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	descri
 3	task2	gemv_q4k	-	52.4 GB/s	11.7	PASS	-	v5: warp shuffle reduction, 2.26x faster than F32 at attn_q, 35-52 GB/s range	YES
 4	task2	integration	7.2	-	-	PASS	570	quantized weights on GPU: VRAM 4300→570MB, load 3.1→0.5s, same tok/s	YES
 5	task2	integration	0.8	-	-	PASS	~5000	QWEN3-8B RUNNING on RX 5700 XT! Correct <think> output. 0.8 tok/s.	YES
+6	task3	attention	7.1	-	-	PASS	1900	GPU attention + GPU KV cache. Identical output. 140ms/tok. CPU RoPE still bottleneck.	YES

@@ -543,22 +543,25 @@ pub fn forward(
         let q_rope = gpu.upload_f32(&q_data, &[q_dim])?;
         gpu.free_tensor(q)?;
 
-        // Store K, V in cache
-        kv_cache.store_kv(gpu, layer_idx, pos, &k_data, &gpu.download_f32(&v)?)?;
+        // Store K, V in GPU cache
+        let v_data = gpu.download_f32(&v)?;
+        kv_cache.store_kv(gpu, layer_idx, pos, &k_data, &v_data)?;
         gpu.free_tensor(k)?;
         gpu.free_tensor(v)?;
 
-        // Attention: score = softmax(Q * K^T / sqrt(head_dim)) * V
-        // CPU-side for correctness (GPU attention kernel is complex)
-        let attn_out = attention_cpu(
-            &q_data,
-            kv_cache,
-            layer_idx,
-            pos,
-            config,
-        );
-
-        let attn_gpu = gpu.upload_f32(&attn_out, &[q_dim])?;
+        // GPU-side attention
+        let attn_gpu = gpu.zeros(&[q_dim], DType::F32)?;
+        gpu.attention_f32(
+            &q_rope,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &attn_gpu,
+            pos + 1, // seq_len = positions 0..pos inclusive
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.max_seq,
+        )?;
         gpu.free_tensor(q_rope)?;
 
         // Output projection: o = Wo * attn_out
@@ -653,95 +656,59 @@ fn per_head_rmsnorm_cpu(data: &mut [f32], weight: &[f32], n_heads: usize, head_d
     }
 }
 
-/// KV cache for autoregressive generation.
+/// GPU-resident KV cache for autoregressive generation.
+/// Pre-allocates [max_seq * n_kv_heads * head_dim] per layer on GPU.
 pub struct KvCache {
-    // [layer][position] -> (k_data, v_data)
-    k: Vec<Vec<Vec<f32>>>,
-    v: Vec<Vec<Vec<f32>>>,
-    kv_dim: usize,
+    pub k_gpu: Vec<GpuTensor>,   // [n_layers] each [max_seq * kv_dim]
+    pub v_gpu: Vec<GpuTensor>,   // [n_layers] each [max_seq * kv_dim]
+    pub kv_dim: usize,
+    pub max_seq: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
 }
 
 impl KvCache {
-    pub fn new(n_layers: usize, kv_dim: usize, max_seq_len: usize) -> Self {
-        Self {
-            k: vec![Vec::with_capacity(max_seq_len); n_layers],
-            v: vec![Vec::with_capacity(max_seq_len); n_layers],
-            kv_dim,
+    pub fn new_gpu(
+        gpu: &Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let cache_size = max_seq_len * kv_dim;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
         }
+        Ok(Self { k_gpu, v_gpu, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim })
     }
 
+    /// Store K, V at position `pos` in layer cache (CPU → GPU copy into cache slot).
     fn store_kv(
         &mut self,
-        _gpu: &Gpu,
+        gpu: &Gpu,
         layer: usize,
         pos: usize,
         k_data: &[f32],
         v_data: &[f32],
     ) -> HipResult<()> {
-        // Extend cache to include this position
-        while self.k[layer].len() <= pos {
-            self.k[layer].push(vec![0.0; self.kv_dim]);
-            self.v[layer].push(vec![0.0; self.kv_dim]);
-        }
-        self.k[layer][pos] = k_data.to_vec();
-        self.v[layer][pos] = v_data.to_vec();
+        let byte_offset = pos * self.kv_dim * 4; // float = 4 bytes
+        let k_bytes = unsafe {
+            std::slice::from_raw_parts(k_data.as_ptr() as *const u8, k_data.len() * 4)
+        };
+        let v_bytes = unsafe {
+            std::slice::from_raw_parts(v_data.as_ptr() as *const u8, v_data.len() * 4)
+        };
+        gpu.hip.memcpy_htod_offset(&self.k_gpu[layer].buf, byte_offset, k_bytes)?;
+        gpu.hip.memcpy_htod_offset(&self.v_gpu[layer].buf, byte_offset, v_bytes)?;
         Ok(())
     }
 }
 
-fn attention_cpu(
-    q: &[f32],
-    kv_cache: &KvCache,
-    layer: usize,
-    pos: usize,
-    config: &LlamaConfig,
-) -> Vec<f32> {
-    let n_heads = config.n_heads;
-    let n_kv_heads = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_group = n_heads / n_kv_heads;
-    let seq_len = pos + 1;
-
-    let q_dim = n_heads * head_dim;
-    let mut out = vec![0.0f32; q_dim];
-
-    for h in 0..n_heads {
-        let kv_h = h / kv_group;
-        let q_offset = h * head_dim;
-
-        // Compute attention scores
-        let mut scores = vec![0.0f32; seq_len];
-        for t in 0..seq_len {
-            let k = &kv_cache.k[layer][t];
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q[q_offset + d] * k[kv_h * head_dim + d];
-            }
-            scores[t] = dot / (head_dim as f32).sqrt();
-        }
-
-        // Softmax
-        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for s in &mut scores {
-            *s = (*s - max_score).exp();
-            sum += *s;
-        }
-        for s in &mut scores {
-            *s /= sum;
-        }
-
-        // Weighted sum of values
-        for t in 0..seq_len {
-            let v = &kv_cache.v[layer][t];
-            for d in 0..head_dim {
-                out[q_offset + d] += scores[t] * v[kv_h * head_dim + d];
-            }
-        }
-    }
-
-    out
-}
+// attention_cpu removed — GPU attention is now used
 
 /// Sample the next token from logits using argmax (greedy).
 pub fn argmax(logits: &[f32]) -> u32 {

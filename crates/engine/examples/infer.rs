@@ -49,7 +49,7 @@ fn main() {
 
     // Initialize KV cache
     let kv_dim = config.n_kv_heads * config.head_dim;
-    let mut kv_cache = KvCache::new(config.n_layers, kv_dim, config.max_seq_len);
+    let mut kv_cache = KvCache::new_gpu(&gpu, config.n_layers, config.n_kv_heads, config.head_dim, config.max_seq_len).unwrap();
 
     // Process prompt tokens
     eprintln!("\nProcessing prompt...");

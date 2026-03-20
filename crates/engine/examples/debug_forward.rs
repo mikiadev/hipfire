@@ -74,7 +74,7 @@ fn main() {
     stats("k_rope_L0", &k_rope);
 
     // 6. Full forward pass result
-    let mut kv_cache = KvCache::new(config.n_layers, kv_dim, config.max_seq_len);
+    let mut kv_cache = KvCache::new_gpu(&gpu, config.n_layers, config.n_kv_heads, config.head_dim, config.max_seq_len).unwrap();
     let logits = llama::forward(&mut gpu, &weights, &config, 1, 0, &mut kv_cache).unwrap();
 
     let top5: Vec<(usize, f32)> = {
