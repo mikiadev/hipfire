@@ -487,6 +487,7 @@ pub struct WeightTensor {
     pub gpu_dtype: DType, // dispatch type for kernel selection
     pub m: usize,         // output dim (rows)
     pub k: usize,         // input dim (cols)
+    pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
 }
 
 /// How the embedding table is stored on GPU.
@@ -533,6 +534,7 @@ pub fn weight_gemv(
         DType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
         DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
         DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
+        DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         other => {
@@ -564,19 +566,19 @@ pub fn load_weights(
         match info.dtype {
             GgmlType::Q4K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0 })
             }
             GgmlType::Q6K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k, row_stride: 0 })
             }
             GgmlType::Q8_0 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
             }
             GgmlType::F32 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
             }
             _ => {
                 // Unsupported: dequant to F32 on CPU, upload as raw bytes
@@ -585,7 +587,7 @@ pub fn load_weights(
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
                 };
                 let buf = gpu.upload_raw(bytes, &[bytes.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
             }
         }
     }
@@ -612,7 +614,7 @@ pub fn load_weights(
         let info = gguf.find_tensor("token_embd.weight").unwrap();
         let data = load_tensor_f32(gguf, info);
         let buf = gpu.upload_f32(&data, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);

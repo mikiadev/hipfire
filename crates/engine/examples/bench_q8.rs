@@ -94,29 +94,79 @@ fn main() {
     let q8_us = ms * 1000.0 / n_iter as f32;
     eprintln!("Q8_0  (1.06 B/w, 32thr):  {:6.1}us  {:6.1} GB/s  {:4.1}% peak", q8_us, q8_bw, q8_bw/448.0*100.0);
     
+    // Create Q8_HFQ data (split-metadata layout)
+    let n_groups = k / 32;
+    let scales_bytes = n_groups * 2;
+    let raw_row = scales_bytes + k;
+    let row_stride = (raw_row + 127) & !127;
+    let mut q8hfq_data = vec![0u8; m * row_stride];
+    for row in 0..m {
+        for g in 0..n_groups {
+            let start = row * k + g * 32;
+            let block = &a_f32[start..start + 32];
+            let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let scale = max_abs / 127.0;
+            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            let row_off = row * row_stride;
+            let scale_f16 = engine::llama::f32_to_f16(scale);
+            q8hfq_data[row_off + g * 2..row_off + g * 2 + 2].copy_from_slice(&scale_f16.to_le_bytes());
+            for i in 0..32 {
+                let q = (block[i] * inv_scale).round().max(-128.0).min(127.0) as i8;
+                q8hfq_data[row_off + scales_bytes + g * 32 + i] = q as u8;
+            }
+        }
+    }
+    eprintln!("Q8HFQ data: {} bytes ({:.3} bytes/weight, stride={})", q8hfq_data.len(), q8hfq_data.len() as f64 / (m*k) as f64, row_stride);
+
+    let d_q8hfq = gpu.upload_raw(&q8hfq_data, &[q8hfq_data.len()]).unwrap();
+    let d_y4 = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+
+    // Warmup Q8HFQ
+    for _ in 0..n_warmup {
+        gpu.gemv_q8hfq(&d_q8hfq, &d_x, &d_y4, m, k, row_stride).unwrap();
+    }
+
+    // Q8_HFQ
+    gpu.hip.event_record(&start, None).unwrap();
+    for _ in 0..n_iter { gpu.gemv_q8hfq(&d_q8hfq, &d_x, &d_y4, m, k, row_stride).unwrap(); }
+    gpu.hip.event_record(&stop, None).unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();
+    let q8hfq_bytes = (m * row_stride + k * 4) as f64;
+    let q8hfq_bw = q8hfq_bytes * n_iter as f64 / (ms as f64 / 1000.0) / 1e9;
+    let q8hfq_us = ms * 1000.0 / n_iter as f32;
+    eprintln!("Q8HFQ (split, 32thr):     {:6.1}us  {:6.1} GB/s  {:4.1}% peak", q8hfq_us, q8hfq_bw, q8hfq_bw/448.0*100.0);
+
     // Effective throughput comparison (elements/second)
     let f32_elems = m as f64 * k as f64 * n_iter as f64 / (f32_us as f64 * n_iter as f64 / 1e6);
     let q4k_elems = m as f64 * k as f64 * n_iter as f64 / (q4k_us as f64 * n_iter as f64 / 1e6);
     let q8_elems = m as f64 * k as f64 * n_iter as f64 / (q8_us as f64 * n_iter as f64 / 1e6);
-    
+    let q8hfq_elems = m as f64 * k as f64 * n_iter as f64 / (q8hfq_us as f64 * n_iter as f64 / 1e6);
+
     eprintln!("\n=== Effective throughput (what matters for tok/s) ===");
-    eprintln!("F32:  {:6.1}us/GEMV → {:.1} Gelem/s", f32_us, f32_elems / 1e9);
-    eprintln!("Q4_K: {:6.1}us/GEMV → {:.1} Gelem/s  ({:.1}x vs F32 time)", q4k_us, q4k_elems / 1e9, f32_us / q4k_us);
-    eprintln!("Q8_0: {:6.1}us/GEMV → {:.1} Gelem/s  ({:.1}x vs F32 time)", q8_us, q8_elems / 1e9, f32_us / q8_us);
-    
+    eprintln!("F32:   {:6.1}us/GEMV → {:.1} Gelem/s", f32_us, f32_elems / 1e9);
+    eprintln!("Q4_K:  {:6.1}us/GEMV → {:.1} Gelem/s  ({:.1}x vs F32 time)", q4k_us, q4k_elems / 1e9, f32_us / q4k_us);
+    eprintln!("Q8_0:  {:6.1}us/GEMV → {:.1} Gelem/s  ({:.1}x vs F32 time)", q8_us, q8_elems / 1e9, f32_us / q8_us);
+    eprintln!("Q8HFQ: {:6.1}us/GEMV → {:.1} Gelem/s  ({:.1}x vs F32 time)", q8hfq_us, q8hfq_elems / 1e9, f32_us / q8hfq_us);
+
     // Model-level estimate
     eprintln!("\n=== TinyLlama 1.1B tok/s estimate ===");
     let gemvs_per_token = 220.0; // ~10 GEMVs × 22 layers
     let other_overhead_ms = 1.0; // non-GEMV ops
-    
+
     let q4k_tok = 1000.0 / (q4k_us as f64 / 1000.0 * gemvs_per_token + other_overhead_ms);
     let q8_tok = 1000.0 / (q8_us as f64 / 1000.0 * gemvs_per_token + other_overhead_ms);
-    eprintln!("Q4_K: ~{:.0} tok/s  (GEMV={:.1}ms + overhead={:.1}ms)", q4k_tok, q4k_us as f64 / 1000.0 * gemvs_per_token, other_overhead_ms);
-    eprintln!("Q8_0: ~{:.0} tok/s  (GEMV={:.1}ms + overhead={:.1}ms)", q8_tok, q8_us as f64 / 1000.0 * gemvs_per_token, other_overhead_ms);
-    
-    // Verify correctness of Q8 vs reference
+    let q8hfq_tok = 1000.0 / (q8hfq_us as f64 / 1000.0 * gemvs_per_token + other_overhead_ms);
+    eprintln!("Q4_K:  ~{:.0} tok/s  (GEMV={:.1}ms + overhead={:.1}ms)", q4k_tok, q4k_us as f64 / 1000.0 * gemvs_per_token, other_overhead_ms);
+    eprintln!("Q8_0:  ~{:.0} tok/s  (GEMV={:.1}ms + overhead={:.1}ms)", q8_tok, q8_us as f64 / 1000.0 * gemvs_per_token, other_overhead_ms);
+    eprintln!("Q8HFQ: ~{:.0} tok/s  (GEMV={:.1}ms + overhead={:.1}ms)", q8hfq_tok, q8hfq_us as f64 / 1000.0 * gemvs_per_token, other_overhead_ms);
+
+    // Verify correctness
     let y_ref = gpu.download_f32(&d_y1).unwrap();
     let y_q8 = gpu.download_f32(&d_y3).unwrap();
-    let max_err: f32 = y_ref.iter().zip(y_q8.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
-    eprintln!("\nQ8_0 vs F32 max error: {max_err:.6}");
+    let y_hfq = gpu.download_f32(&d_y4).unwrap();
+    let max_err_q8: f32 = y_ref.iter().zip(y_q8.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+    let max_err_hfq: f32 = y_ref.iter().zip(y_hfq.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+    eprintln!("\nQ8_0  vs F32 max error: {max_err_q8:.6}");
+    eprintln!("Q8HFQ vs F32 max error: {max_err_hfq:.6}");
 }

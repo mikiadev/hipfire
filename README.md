@@ -1,6 +1,6 @@
 # Hipfire: RDNA-Native ML Inference Engine
 
-Rust-native LLM inference engine for AMD RDNA GPUs. No Python in the hot path, no ROCm link-time dependency — just `dlopen`, raw HIP kernels, and 198 tok/s on a $200 GPU.
+Rust-native LLM inference engine for AMD RDNA GPUs. No Python in the hot path, no ROCm link-time dependency — just `dlopen`, raw HIP kernels, and 227 tok/s on a $200 GPU. **Faster than llama.cpp on every model tested.**
 
 ## The Finding: Q8 Beats Q4 on RDNA
 
@@ -33,18 +33,18 @@ All measurements on AMD RX 5700 XT (gfx1010, RDNA1, 8GB GDDR6, 448 GB/s peak).
 
 ```
 TinyLlama 1.1B:
-  Q8_0 (GGUF):          193 tok/s    (27x from 7.2 baseline)
-  Q4_K_M (GGUF):        109 tok/s
-  llama.cpp Q8_0:        192 tok/s    (parity)
+  HFQ Q8+Q4K mixed:     226 tok/s    (31x from 7.2 baseline)
+  GGUF Q8_0:             193 tok/s
+  llama.cpp Q8_0:         192 tok/s
 
 Qwen3 0.6B:
-  Q8_FP16 (HFQ mixed):  108 tok/s
-  Q8_0 (GGUF):           83 tok/s
+  HFQ Q8+Q4K mixed:     227 tok/s    (beats llama.cpp's 218)
+  GGUF Q8_0:             128 tok/s
 
 Qwen3 8B:
-  HFQ mixed (Q8+Q4):     27 tok/s    (Q8 attn + Q4 FFN, fits 8GB VRAM)
-  Q4_K_M (GGUF):         15 tok/s    (Q4K embedding saves 2.1GB)
-  llama.cpp:             OOM          (can't fit with F32 embedding dequant)
+  HFQ Q8+Q4K mixed:      42 tok/s    (Q8 attn + Q4_K FFN, fits 8GB)
+  GGUF Q4_K_M:            15 tok/s
+  llama.cpp:              OOM
 ```
 
 ## Architecture
@@ -71,15 +71,14 @@ hipfire/
 
 ## Supported Models
 
-| Model | Format | VRAM | tok/s | Notes |
-|-------|--------|------|-------|-------|
-| TinyLlama 1.1B | Q8_0 (GGUF) | ~1.2 GB | 193 | Matches llama.cpp |
-| TinyLlama 1.1B | Q4_K_M (GGUF) | ~0.6 GB | 109 | |
-| Qwen3 0.6B | Q8 mixed (HFQ) | ~0.8 GB | 108 | Q8 attn + Q4 FFN |
-| Qwen3 0.6B | Q8_0 (GGUF) | ~0.6 GB | 83 | |
-| **Qwen3 8B** | **Q8 mixed (HFQ)** | **~6.0 GB** | **27** | **Q8 attn + Q4 FFN** |
-| Qwen3 8B | Q4_K_M (GGUF) | ~4.7 GB | 15 | Q4K embedding saves 2.1GB |
-| Qwen3 0.6B | Q8_0 (GGUF) | ~0.6 GB | 83 |
+| Model | Format | VRAM | tok/s | vs llama.cpp |
+|-------|--------|------|-------|-------------|
+| **TinyLlama 1.1B** | **HFQ Q8+Q4K** | **~0.8 GB** | **226** | **1.18x faster** |
+| TinyLlama 1.1B | GGUF Q8_0 | ~1.2 GB | 193 | parity |
+| **Qwen3 0.6B** | **HFQ Q8+Q4K** | **~0.7 GB** | **227** | **1.04x faster** |
+| Qwen3 0.6B | GGUF Q8_0 | ~0.6 GB | 128 | 0.59x |
+| **Qwen3 8B** | **HFQ Q8+Q4K** | **~6.0 GB** | **42** | **llama.cpp OOMs** |
+| Qwen3 8B | GGUF Q4_K_M | ~4.7 GB | 15 | llama.cpp OOMs |
 
 Architectures: LLaMA, Qwen3 (dense). Qwen3.5 (DeltaNet hybrid) is in progress.
 

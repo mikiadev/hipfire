@@ -33,6 +33,7 @@ pub enum DType {
     Q8_0,      // 34 bytes per 32 elements
     Q4F16G64,  // 36 bytes per 64 elements (RDNA-native FP16 dequant)
     Q4F16G32,  // 20 bytes per 32 elements (RDNA-native FP16 dequant)
+    Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
     Raw,       // raw bytes, no element interpretation
 }
 
@@ -41,7 +42,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -512,6 +513,49 @@ impl Gpu {
                 None,
                 &mut params,
             )
+        }
+    }
+
+    /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
+    pub fn gemv_q8hfq(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        row_stride: usize,
+    ) -> HipResult<()> {
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut rs_val = row_stride as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut rs_val as *mut _ as *mut c_void,
+        ];
+
+        if k <= 1536 {
+            self.ensure_kernel("gemv_q8hfq_wide", kernels::GEMV_Q8HFQ_WIDE_SRC, "gemv_q8hfq_wide")?;
+            let func = &self.functions["gemv_q8hfq_wide"];
+            let block_size = 64u32;
+            let grid = ((m + 1) / 2) as u32;
+            return unsafe {
+                self.hip.launch_kernel(func, [grid, 1, 1], [block_size, 1, 1], 0, None, &mut params)
+            };
+        }
+
+        self.ensure_kernel("gemv_q8hfq", kernels::GEMV_Q8HFQ_SRC, "gemv_q8hfq")?;
+        let func = &self.functions["gemv_q8hfq"];
+        unsafe {
+            self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, None, &mut params)
         }
     }
 

@@ -355,6 +355,46 @@ fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+// ─── Q8_HFQ Quantization (Split-Metadata Row Layout) ─────────────────────────
+
+/// Quantize F32 weights to Q8_HFQ format (split-metadata, 128B-aligned rows).
+/// Row layout: [f16 scales × n_groups | int8 values × K | padding to 128B].
+/// Returns (data, row_stride). Same 1.0625 B/w as Q8_0 for K=2048/4096 (zero padding waste).
+fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
+    let group_size = 32;
+    let n_groups = k / group_size;
+    let scales_bytes = n_groups * 2;
+    let raw_row = scales_bytes + k;
+    let row_stride = (raw_row + 127) & !127; // pad to 128-byte boundary
+
+    let mut output = vec![0u8; m * row_stride];
+
+    for row in 0..m {
+        let row_data = &f32_data[row * k..(row + 1) * k];
+        let row_out = &mut output[row * row_stride..(row + 1) * row_stride];
+
+        for g in 0..n_groups {
+            let start = g * group_size;
+            let group = &row_data[start..start + group_size];
+
+            let max_abs = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let scale = max_abs / 127.0;
+            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+
+            // Write f16 scale into scale array
+            row_out[g * 2..g * 2 + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+
+            // Write int8 values into value array (after all scales)
+            for i in 0..group_size {
+                let q = (group[i] * inv_scale).round().max(-128.0).min(127.0) as i8;
+                row_out[scales_bytes + start + i] = q as u8;
+            }
+        }
+    }
+
+    (output, row_stride)
+}
+
 // ─── HFQ File Format ────────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -368,6 +408,7 @@ enum QuantType {
     F32 = 2,
     Q8F16 = 3,
     Q4K = 4,
+    Q8HFQ = 5,
 }
 
 struct HfqTensor {
@@ -495,13 +536,15 @@ fn main() {
     let format = args.iter().position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
-    // q8f16 = all weights Q8
+    // q8f16 = all weights Q8 (interleaved blocks)
     // q4f16 = all weights Q4_F16_G64
     // q8-mixed = Q8 attn + Q4_K FFN (best tok/s for VRAM-constrained)
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
+    // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
     let use_q8 = format == "q8f16" || format == "q8";
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
+    let use_q8hfq = format == "q8hfq";
 
     let input_dir = Path::new(input_dir);
     let output_path = Path::new(output_path);
@@ -572,11 +615,56 @@ fn main() {
             let f32_data = to_f32(raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
 
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+
+            // Q8HFQ path: split-metadata per-row layout (needs M and K)
+            // Exclude embeddings — they use a lookup kernel, not GEMV
+            if use_q8hfq && meta.shape.len() == 2 && !name.contains("embed_tokens") {
+                let m = meta.shape[0];
+                let k = meta.shape[1];
+                let (quantized, row_stride) = quantize_q8hfq(&f32_data, m, k);
+
+                // Compute quantization error for Q8HFQ
+                let n_groups = k / 32;
+                let scales_bytes = n_groups * 2;
+                for row in 0..m {
+                    let row_off = row * row_stride;
+                    for g in 0..n_groups {
+                        let scale = f16_to_f32(u16::from_le_bytes([
+                            quantized[row_off + g * 2],
+                            quantized[row_off + g * 2 + 1],
+                        ]));
+                        for i in 0..32 {
+                            let qval = quantized[row_off + scales_bytes + g * 32 + i] as i8;
+                            let dequant = scale * qval as f32;
+                            let orig_idx = row * k + g * 32 + i;
+                            let err = (dequant - f32_data[orig_idx]).abs();
+                            total_quant_error += err as f64;
+                            max_quant_error = max_quant_error.max(err);
+                        }
+                        _n_quant_groups += 1;
+                    }
+                }
+
+                eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB, stride={})",
+                    "Q8_HFQ", name, meta.shape, n_elements,
+                    raw_data.len() as f64 / 1024.0,
+                    quantized.len() as f64 / 1024.0,
+                    row_stride);
+
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::Q8HFQ,
+                    shape,
+                    group_size: 32,
+                    data: quantized,
+                });
+            } else {
             // Choose quant format per tensor
             let this_q8 = if use_mixed || use_fast {
                 is_q8_tensor(name)
             } else {
-                use_q8
+                use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
             };
             let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
 
@@ -631,7 +719,6 @@ fn main() {
                 _n_quant_groups += 1;
             }
 
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
                 name, meta.shape, n_elements,
                 raw_data.len() as f64 / 1024.0,
@@ -644,6 +731,7 @@ fn main() {
                 group_size: gs,
                 data: quantized,
             });
+            } // end else (non-Q8HFQ path)
         } else {
             // Keep as F16 (convert BF16 → F16 if needed)
             let f16_data = match meta.dtype.as_str() {

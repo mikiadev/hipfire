@@ -262,15 +262,22 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
     match info.quant_type {
         0 => { // Q4F16G64
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0 })
         }
         3 => { // Q8F16 — same block format as GGML Q8_0 (34 bytes per 32 elements)
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
         }
         4 => { // Q4_K — GGML-compatible Q4_K blocks (144 bytes per 256 elements)
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0 })
+        }
+        5 => { // Q8HFQ — split-metadata layout (scales then values, 128B-aligned rows)
+            let n_groups = k / 32;
+            let raw_row = n_groups * 2 + k;
+            let row_stride = (raw_row + 127) & !127;
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8HFQ, m, k, row_stride })
         }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
@@ -280,7 +287,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
         }
         _ => panic!("unsupported quant_type {} for weight {st_name}", info.quant_type),
     }
@@ -321,7 +328,7 @@ pub fn load_weights_hfq(
             std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
         };
         let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
