@@ -188,6 +188,38 @@ fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
 
 // ─── Q8_FP16 Quantization ────────────────────────────────────────────────────
 
+/// Quantize to Q4-as-Q8: 4-bit precision (range [-8,7]) stored in Q8_0 format.
+/// Same storage as Q8 (34 bytes per 32 elements, 1.0625 B/w) but values use only 4 bits.
+/// Gets Q8 kernel speed (82% peak BW) with 4-bit quality. Best for VRAM-fitting models.
+fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 32;
+    let block_bytes = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let max_abs = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = max_abs / 7.0; // 4-bit symmetric: -8 to 7
+        let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+
+        for i in 0..32 {
+            let val = if start + i < end { group[i] } else { 0.0 };
+            let q = (val * inv_scale).round().max(-8.0).min(7.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+    }
+
+    output
+}
+
 /// Quantize F32 weights to Q8_0 format (compatible with GGML Q8_0).
 /// Block: f16 scale (2B) + 32 × int8 = 34 bytes per 32 elements (1.0625 bytes/weight).
 /// Symmetric quantization: scale = max(|w|) / 127, q = round(w / scale).
@@ -359,9 +391,12 @@ fn main() {
     let format = args.iter().position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
-    // q8f16 = all weights Q8, q4f16 = all weights Q4, q8-mixed = Q8 attn + Q4 FFN
+    // q8f16 = all weights Q8, q4f16 = all weights Q4
+    // q8-mixed = Q8 attn + Q4_F16 FFN (smallest mixed)
+    // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, 4-bit FFN quality)
     let use_q8 = format == "q8f16" || format == "q8";
     let use_mixed = format == "q8-mixed" || format == "mixed";
+    let use_fast = format == "q8-fast" || format == "fast";
 
     let input_dir = Path::new(input_dir);
     let output_path = Path::new(output_path);
@@ -432,16 +467,20 @@ fn main() {
             let f32_data = to_f32(raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
 
-            // Choose quant format: Q8 for attn (occupancy), Q4 for FFN (compression)
-            let this_q8 = if use_mixed {
+            // Choose quant format per tensor
+            let this_q8 = if use_mixed || use_fast {
                 is_q8_tensor(name)
             } else {
                 use_q8
             };
+            let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
 
             let (quantized, qt, gs, label) = if this_q8 {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_FP16")
+            } else if this_q4as8 {
+                let q = quantize_q4_as_q8(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q4asQ8") // Same format as Q8, just 4-bit values
             } else {
                 let q = quantize_q4f16_g64(&f32_data);
                 (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
@@ -453,7 +492,7 @@ fn main() {
             for b in 0..n_blocks {
                 let start = b * block_size;
                 let end = (start + block_size).min(n_elements);
-                if this_q8 {
+                if this_q8 || this_q4as8 {
                     let off = b * 34;
                     let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
                     for i in 0..(end - start) {
