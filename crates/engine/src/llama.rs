@@ -489,10 +489,18 @@ pub struct WeightTensor {
     pub k: usize,         // input dim (cols)
 }
 
+/// How the embedding table is stored on GPU.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EmbeddingFormat {
+    F32,   // dequantized to F32, use D2D copy
+    Q4K,   // raw Q4K blocks, use GPU dequant kernel
+    Q8_0,  // raw Q8_0 blocks, use GPU dequant kernel
+}
+
 /// GPU-resident LLaMA model weights.
 pub struct LlamaWeights {
     pub token_embd: GpuTensor,
-    pub token_embd_is_q4k: bool, // true = raw Q4K on GPU, use embedding_lookup_q4k
+    pub embd_format: EmbeddingFormat,
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
@@ -584,15 +592,15 @@ pub fn load_weights(
 
     eprintln!("  loading token_embd...");
     let embd_info = gguf.find_tensor("token_embd.weight").expect("token_embd not found");
-    let (token_embd, token_embd_is_q4k) = if embd_info.dtype == GgmlType::Q4K {
+    let (token_embd, embd_fmt) = if embd_info.dtype == GgmlType::Q4K {
         let raw = gguf.tensor_data(embd_info);
         eprintln!("    (Q4K raw, {} MB — saves {} MB vs F32)",
             raw.len() / 1_000_000,
             (config.vocab_size * config.dim * 4 - raw.len()) / 1_000_000);
-        (gpu.upload_raw(raw, &[raw.len()])?, true)
+        (gpu.upload_raw(raw, &[raw.len()])?, EmbeddingFormat::Q4K)
     } else {
         let data = load_tensor_f32(gguf, embd_info);
-        (gpu.upload_f32(&data, &[config.vocab_size, config.dim])?, false)
+        (gpu.upload_f32(&data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
     };
     eprintln!("  loading output_norm...");
     let output_norm = up_f32(gguf, gpu, "output_norm.weight", &[config.dim])?;
@@ -642,7 +650,7 @@ pub fn load_weights(
 
     Ok(LlamaWeights {
         token_embd,
-        token_embd_is_q4k,
+        embd_format: embd_fmt,
         output_norm,
         output,
         layers,
@@ -667,10 +675,10 @@ pub fn forward(
 
     // Embedding lookup — GPU-side D2D copy of one row (8KB vs 262MB download)
     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    if weights.token_embd_is_q4k {
-        gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?;
-    } else {
-        gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?;
+    match weights.embd_format {
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
     }
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;

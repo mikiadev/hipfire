@@ -1,7 +1,7 @@
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.
 
 use crate::llama::{
-    f16_to_f32, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
+    f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
 use hip_bridge::HipResult;
 use memmap2::Mmap;
@@ -289,8 +289,17 @@ pub fn load_weights_hfq(
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {
     eprintln!("  loading token_embd...");
-    let token_embd = load_f16_tensor(hfq, gpu, "model.embed_tokens.weight",
-        &[config.vocab_size, config.dim])?;
+    let embd_info = hfq.tensor_data("model.embed_tokens.weight")
+        .expect("embed_tokens not found");
+    let (token_embd, token_embd_is_q4k) = if embd_info.0.quant_type == 3 {
+        // Q8F16: upload raw, use Q8 embedding lookup at inference
+        eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        // Store as "q4k=true" flag — we'll add proper Q8 dispatch below
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, true)
+    } else {
+        (load_f16_tensor(hfq, gpu, "model.embed_tokens.weight",
+            &[config.vocab_size, config.dim])?, false)
+    };
 
     eprintln!("  loading output_norm...");
     let output_norm = load_f16_tensor(hfq, gpu, "model.norm.weight", &[config.dim])?;
@@ -349,5 +358,6 @@ pub fn load_weights_hfq(
         layers.push(layer);
     }
 
-    Ok(LlamaWeights { token_embd, token_embd_is_q4k: false, output_norm, output, layers })
+    let embd_fmt = if token_embd_is_q4k { EmbeddingFormat::Q8_0 } else { EmbeddingFormat::F32 };
+    Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
 }

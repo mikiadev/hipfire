@@ -913,6 +913,32 @@ extern "C" __global__ void gemv_q4f16_g32(
 }
 "#;
 
+/// Q8_0 embedding lookup: dequantize one row from a Q8_0 table to F32.
+/// Block: 2 bytes f16 scale + 32 bytes int8 = 34 bytes per 32 elements.
+pub const EMBEDDING_Q8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void embedding_q8(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ output,
+    int token_id, int dim
+) {
+    const int tid = threadIdx.x;
+    const int blocks_per_row = dim / 32;
+    const int bytes_per_row = blocks_per_row * 34;
+    const unsigned char* row = table + (size_t)token_id * bytes_per_row;
+
+    for (int elem = tid; elem < dim; elem += blockDim.x) {
+        int block_idx = elem / 32;
+        int within = elem % 32;
+        const unsigned char* block = row + block_idx * 34;
+        float d = (float)*((const _Float16*)block);
+        signed char qval = (signed char)block[2 + within];
+        output[elem] = d * (float)qval;
+    }
+}
+"#;
+
 /// Q4_K embedding lookup: dequantize one row from a Q4_K table to F32.
 /// Avoids dequanting entire embedding to F32 (saves ~2GB for 150K+ vocabs).
 /// 256 threads, one block, strided across the row's Q4_K blocks.

@@ -325,18 +325,22 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
-    if name.contains("norm") || name.contains("embed") || name.contains("bias") {
+    if name.contains("norm") || name.contains("bias") {
         return false;
     }
+    // Quantize everything including embeddings (Q8 embedding saves ~2.3GB for 8B models)
     name.contains("weight")
 }
 
-/// For mixed quant: is this an attention weight (Q8) or FFN weight (Q4)?
-fn is_attention_weight(name: &str) -> bool {
+/// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
+/// Q8: attention weights, embeddings, lm_head (need occupancy)
+/// Q4: FFN weights (bulk of model, benefits from compression)
+fn is_q8_tensor(name: &str) -> bool {
     name.contains("self_attn") || name.contains("attn_q") || name.contains("attn_k")
         || name.contains("attn_v") || name.contains("attn_output")
         || name.contains("q_proj") || name.contains("k_proj")
         || name.contains("v_proj") || name.contains("o_proj")
+        || name.contains("embed") || name.contains("lm_head")
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -430,7 +434,7 @@ fn main() {
 
             // Choose quant format: Q8 for attn (occupancy), Q4 for FFN (compression)
             let this_q8 = if use_mixed {
-                is_attention_weight(name) || name.contains("lm_head")
+                is_q8_tensor(name)
             } else {
                 use_q8
             };
