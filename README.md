@@ -1,6 +1,6 @@
 # Hipfire: RDNA-Native ML Inference Engine
 
-Rust-native LLM inference engine for AMD RDNA GPUs. No Python in the hot path, no ROCm link-time dependency — just `dlopen`, raw HIP kernels, and 227 tok/s on a $200 GPU. **Faster than llama.cpp on every model tested.**
+Rust-native LLM inference engine for AMD RDNA GPUs. No Python in the hot path, no ROCm link-time dependency — just `dlopen`, raw HIP kernels, and **59.3 tok/s on Qwen3-8B** (1.34x llama.cpp) on a $200 GPU.
 
 ## The Finding: Q8 Beats Q4 on RDNA
 
@@ -30,22 +30,17 @@ Q8 is just byte loads. No nibble extraction, no bit manipulation. The dequant pa
 ## Performance
 
 All measurements on AMD RX 5700 XT (gfx1010, RDNA1, 8GB GDDR6, 448 GB/s peak).
+HFQ4-G256 weights + Q8_0 KV cache. llama.cpp build 7209 with custom ROCm build.
 
-```
-TinyLlama 1.1B:
-  HFQ Q8+Q4K mixed:     226 tok/s    (31x from 7.2 baseline)
-  GGUF Q8_0:             193 tok/s
-  llama.cpp Q8_0:         192 tok/s
+| Benchmark | hipfire | llama.cpp | Ratio |
+|-----------|---------|-----------|-------|
+| **Qwen3-8B short gen** | **59.3 tok/s** | 44.3 tok/s | **1.34x** |
+| **Qwen3-8B long gen** | **52.7 tok/s** | 42.8 tok/s | **1.23x** |
+| Qwen3-8B prefill | 108 tok/s | 189.2 tok/s | 0.57x |
+| **Qwen3-0.6B short gen** | **256.3 tok/s** | 193.6 tok/s | **1.32x** |
+| Qwen3-0.6B prefill | 1053 tok/s | 1534 tok/s | 0.69x |
 
-Qwen3 0.6B:
-  HFQ Q8+Q4K mixed:     227 tok/s    (beats llama.cpp's 218)
-  GGUF Q8_0:             128 tok/s
-
-Qwen3 8B:
-  HFQ Q8+Q4K mixed:      42 tok/s    (Q8 attn + Q4_K FFN, fits 8GB)
-  GGUF Q4_K_M:            15 tok/s
-  llama.cpp:              OOM
-```
+hipfire wins all generation benchmarks. See [docs/PERF_COMPARISON.md](docs/PERF_COMPARISON.md) for details.
 
 ## Architecture
 
@@ -58,9 +53,10 @@ hipfire/
 │   ├── rdna-compute/        # HIP kernel compilation, dispatch, tensor ops
 │   ├── engine/              # GGUF/HFQ model loading, LLaMA/Qwen3 forward pass
 │   └── hipfire-quantize/    # Standalone quantizer: safetensors -> .hfq
-├── docs/
-│   └── Q4_F16_SPEC.md      # Q4_F16 format spec (explored, not faster on RDNA1)
-└── findings/                # Phase research documentation
+├── bench/                   # Profiling scripts and result compiler
+└── docs/
+    ├── PERF_COMPARISON.md   # Head-to-head vs llama.cpp with methodology
+    └── HFQ_FAMILY.md        # HFQ quantization format family specification
 ```
 
 **Key design decisions:**
@@ -73,14 +69,10 @@ hipfire/
 
 | Model | Format | VRAM | tok/s | vs llama.cpp |
 |-------|--------|------|-------|-------------|
-| **TinyLlama 1.1B** | **HFQ Q8+Q4K** | **~0.8 GB** | **226** | **1.18x faster** |
-| TinyLlama 1.1B | GGUF Q8_0 | ~1.2 GB | 193 | parity |
-| **Qwen3 0.6B** | **HFQ Q8+Q4K** | **~0.7 GB** | **227** | **1.04x faster** |
-| Qwen3 0.6B | GGUF Q8_0 | ~0.6 GB | 128 | 0.59x |
-| **Qwen3 8B** | **HFQ Q8+Q4K** | **~6.0 GB** | **42** | **llama.cpp OOMs** |
-| Qwen3 8B | GGUF Q4_K_M | ~4.7 GB | 15 | llama.cpp OOMs |
+| **Qwen3-8B** | **HFQ4-G256** | **~4.4 GB** | **59.3** | **1.34x faster** |
+| **Qwen3-0.6B** | **HFQ4-G128** | **~0.4 GB** | **256.3** | **1.32x faster** |
 
-Architectures: LLaMA, Qwen3 (dense). Qwen3.5 (DeltaNet hybrid) is in progress.
+Architectures: LLaMA, Qwen3 (dense). Quantize from HuggingFace safetensors with `hipfire-quantize`.
 
 ## Quick Start
 
@@ -89,17 +81,18 @@ Architectures: LLaMA, Qwen3 (dense). Qwen3.5 (DeltaNet hybrid) is in progress.
 cd hipfire
 cargo build --release
 
-# Run with a GGUF model
-cargo run --release --example infer -- /path/to/model.gguf "Hello, world"
-
-# Quantize from HuggingFace safetensors to Q8_FP16
+# Quantize from HuggingFace safetensors to HFQ4
+# (auto-selects G128 for small models, G256 for 8B+)
 cargo run --release -p hipfire-quantize -- \
-  --input /path/to/model-dir \
-  --output model.hfq \
-  --format q8f16
+  --input ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/  \
+  --output models/qwen3-8b.hfq \
+  --format hfq4
 
-# Run with HFQ model
-cargo run --release --example infer_hfq -- model.hfq "Hello, world"
+# Run inference
+cargo run --release --example infer_hfq -- models/qwen3-8b.hfq "Hello"
+
+# Run with GGUF model (also supported)
+cargo run --release --example infer -- /path/to/model.gguf "Hello"
 ```
 
 ### Requirements
