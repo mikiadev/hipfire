@@ -442,6 +442,51 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+/// Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
+fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 63.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        let actual_len = end - start;
+        // Pack 4 values per 3 bytes: v0[5:0]|v1[1:0], v1[5:2]|v2[3:0], v2[5:4]|v3[5:0]
+        for i in (0..256).step_by(4) {
+            let q0 = if i < actual_len { ((group[i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q1 = if i + 1 < actual_len { ((group[i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q2 = if i + 2 < actual_len { ((group[i+2] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q3 = if i + 3 < actual_len { ((group[i+3] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q0 = q0.min(63);
+            let q1 = q1.min(63);
+            let q2 = q2.min(63);
+            let q3 = q3.min(63);
+
+            let byte_off = 8 + (i / 4) * 3;
+            output[out_off + byte_off]     = q0 | (q1 << 6);
+            output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
+            output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
+        }
+    }
+    output
+}
+
 /// Quantize F32 weights to HFQ4-G128: flat 4-bit with 128-weight groups.
 /// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights (0.5625 B/w).
 /// 14 VGPRs, 100% occupancy. Better quality for small K dimensions.
@@ -501,6 +546,7 @@ enum QuantType {
     Q8HFQ = 5,
     HFQ4G256 = 6,
     HFQ4G128 = 7,
+    HFQ6G256 = 8,
 }
 
 struct HfqTensor {
@@ -610,6 +656,8 @@ fn is_q8_tensor(name: &str) -> bool {
         || name.contains("q_proj") || name.contains("k_proj")
         || name.contains("v_proj") || name.contains("o_proj")
         || name.contains("embed") || name.contains("lm_head")
+        // Qwen3.5 DeltaNet attention
+        || name.contains("linear_attn")
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -706,6 +754,8 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4";
+    let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
+    let use_hfq6 = format == "hfq6" || format == "hfq6g256";
 
     // Resolve input: local path or HuggingFace model ID (e.g. "Qwen/Qwen3-8B")
     let input_dir = resolve_model_path(input_dir);
@@ -862,7 +912,32 @@ fn main() {
             // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
             let is_embed = name.contains("embed_tokens");
 
-            let (quantized, qt, gs, label) = if use_hfq4g256 && is_embed {
+            let (quantized, qt, gs, label) = if use_hfq_mixed {
+                // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
+                let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                if !is_ffn {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else {
+                    let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                    if k_dim % 256 == 0 {
+                        let q = quantize_hfq4g256(&f32_data);
+                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                    } else {
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                }
+            } else if use_hfq6 {
+                // HFQ6-G256: all weights 6-bit, embeddings Q8
+                if is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else {
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                }
+            } else if use_hfq4g256 && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
             } else if use_hfq4g256 {
@@ -898,7 +973,8 @@ fn main() {
             // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;
             let is_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
-            let skip_error = is_embed && !is_hfq4;
+            // Only compute detailed error for HFQ4 tensors — Q8/HFQ6 error is negligible
+            let skip_error = !is_hfq4;
             let n_blocks = if !skip_error { (n_elements + block_size - 1) / block_size } else { 0 };
             for b in 0..n_blocks {
                 let start = b * block_size;
