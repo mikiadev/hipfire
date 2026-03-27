@@ -5048,15 +5048,19 @@ extern "C" __global__ void attention_turbo2_kv(
     }
     __syncthreads();
 
-    // Softmax
-    if (tid == 0) {
-        float mx = -1e30f;
-        for (int t = 0; t < seq_len; t++) mx = fmaxf(mx, scores[t]);
-        float sm = 0.0f;
-        for (int t = 0; t < seq_len; t++) { float e = expf(scores[t] - mx); scores[t] = e; sm += e; }
-        float inv = 1.0f / sm;
-        for (int t = 0; t < seq_len; t++) scores[t] *= inv;
+    // Parallel softmax via warp shuffle
+    float lmx = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) lmx = fmaxf(lmx, scores[t]);
+    for (int off = 16; off > 0; off >>= 1) lmx = fmaxf(lmx, __shfl_xor(lmx, off));
+    float mx = lmx;
+    float lsm = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - mx); scores[t] = e; lsm += e;
     }
+    for (int off = 16; off > 0; off >>= 1) lsm += __shfl_xor(lsm, off);
+    __syncthreads();
+    float inv_sum = 1.0f / lsm;
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] *= inv_sum;
     __syncthreads();
 
     // V weighted sum — each thread owns 4 dims
