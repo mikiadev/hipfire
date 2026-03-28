@@ -2650,4 +2650,25 @@ impl Gpu {
         let shared_mem = ((seq_len_hint + head_dim) * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
+
+    /// Compute cross-entropy loss for a single token on GPU.
+    /// Returns -log(softmax(logits)[target]). Downloads 4 bytes instead of 600KB.
+    pub fn cross_entropy_loss(
+        &mut self, logits: &GpuTensor, target_buf: &DeviceBuffer, loss_buf: &GpuTensor,
+        vocab_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("cross_entropy_loss", kernels::CROSS_ENTROPY_LOSS_SRC, "cross_entropy_loss")?;
+        let func = &self.functions["cross_entropy_loss"];
+        let mut lp = logits.buf.as_ptr();
+        let mut tp = target_buf.as_ptr();
+        let mut op = loss_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void, &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void, &mut vs as *mut _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let shared_mem = (block_size * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [1, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
 }
