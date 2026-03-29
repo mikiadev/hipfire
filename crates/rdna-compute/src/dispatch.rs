@@ -36,6 +36,7 @@ pub enum DType {
     Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
     HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
     HFQ4G128,  // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
+    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~18 VGPRs)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     Raw,       // raw bytes, no element interpretation
 }
@@ -45,7 +46,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ6G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ2G256 | DType::HFQ6G256 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -640,6 +641,8 @@ impl Gpu {
             }
         }
     }
+
+    // HFQ2 GEMV dispatch already exists at line ~521 from the HFQ family
 
     /// Batched HFQ4-G256 GEMM: y[b][row] = A[row] · x[b] for all batch elements.
     /// x: [batch_size × K], y: [batch_size × M], both row-major.
