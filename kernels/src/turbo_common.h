@@ -117,6 +117,188 @@ __device__ void fwht_shfl_inverse(float& a, float& b, float& c, float& d,
     a *= s * signs1[d0]; b *= s * signs1[d0+1]; c *= s * signs1[d0+2]; d *= s * signs1[d0+3];
 }
 
+// ============================================================================
+// 256-element FWHT via __shfl_xor. Zero shared memory. Zero barriers.
+// Each thread owns 8 of 256 elements in registers (v0..v7).
+// 32 threads × 8 elements = 256.
+// log2(256) = 8 butterfly passes:
+//   Passes 1-3: register-local (strides 1, 2, 4 in element space)
+//   Passes 4-8: warp shuffle    (strides 8,16,32,64,128 in element space
+//                                = strides 1,2,4,8,16 in thread space)
+//
+// VGPR budget (RDNA, 32-lane wavefront):
+//   v0-v7:  8 VGPRs  (the 8 data elements)
+//   t:      1 VGPR   (butterfly temp, reused across all local passes)
+//   d0:     1 VGPR   (base index for sign table loads, computed once)
+//   s:      1 VGPR   (scale constant 1/sqrt(256), fused with signs2)
+//   p0-p7:  0 VGPRs  (shuffle results alias v0-v7 via compiler; see note)
+//   tid:    1 VGPR   (passed in, likely already live in caller)
+//   signs:  0 VGPRs  (loaded directly into multiply operand from global)
+//   -------
+//   Total: 12 VGPRs kernel-private + 8 data = 20 VGPRs worst case
+//
+// Note on shuffle passes: each __shfl_xor result (p0..p7) is consumed
+// immediately in the add/sub that overwrites v0..v7, so the compiler
+// can alias them. At most 1 extra VGPR for the shuffle temporary if
+// the compiler doesn't overlap. In practice expect 18-19 VGPRs on RDNA.
+// ============================================================================
+
+__device__ void fwht_shfl_forward_256(
+    float& v0, float& v1, float& v2, float& v3,
+    float& v4, float& v5, float& v6, float& v7,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int tid)
+{
+    const int d0 = tid * 8;
+
+    // Apply signs1 (randomize input for incoherence)
+    v0 *= signs1[d0];   v1 *= signs1[d0+1]; v2 *= signs1[d0+2]; v3 *= signs1[d0+3];
+    v4 *= signs1[d0+4]; v5 *= signs1[d0+5]; v6 *= signs1[d0+6]; v7 *= signs1[d0+7];
+
+    // --- Pass 1: stride 1 in element space ---
+    // Butterfly pairs: (0,1), (2,3), (4,5), (6,7)
+    float t;
+    t = v0; v0 = v0 + v1; v1 = t - v1;
+    t = v2; v2 = v2 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v5; v5 = t - v5;
+    t = v6; v6 = v6 + v7; v7 = t - v7;
+
+    // --- Pass 2: stride 2 in element space ---
+    // Butterfly pairs: (0,2), (1,3), (4,6), (5,7)
+    t = v0; v0 = v0 + v2; v2 = t - v2;
+    t = v1; v1 = v1 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v6; v6 = t - v6;
+    t = v5; v5 = v5 + v7; v7 = t - v7;
+
+    // --- Pass 3: stride 4 in element space ---
+    // Butterfly pairs: (0,4), (1,5), (2,6), (3,7)
+    t = v0; v0 = v0 + v4; v4 = t - v4;
+    t = v1; v1 = v1 + v5; v5 = t - v5;
+    t = v2; v2 = v2 + v6; v6 = t - v6;
+    t = v3; v3 = v3 + v7; v7 = t - v7;
+
+    // --- Passes 4-8: strides 8,16,32,64,128 in element space ---
+    // Element stride 8 with 8 elements/thread = thread stride 1, etc.
+    // Thread strides: 1, 2, 4, 8, 16
+    for (int ts = 1; ts <= 16; ts <<= 1) {
+        float p0 = __shfl_xor(v0, ts);
+        float p1 = __shfl_xor(v1, ts);
+        float p2 = __shfl_xor(v2, ts);
+        float p3 = __shfl_xor(v3, ts);
+        float p4 = __shfl_xor(v4, ts);
+        float p5 = __shfl_xor(v5, ts);
+        float p6 = __shfl_xor(v6, ts);
+        float p7 = __shfl_xor(v7, ts);
+        if (tid & ts) {
+            v0 = p0 - v0; v1 = p1 - v1; v2 = p2 - v2; v3 = p3 - v3;
+            v4 = p4 - v4; v5 = p5 - v5; v6 = p6 - v6; v7 = p7 - v7;
+        } else {
+            v0 = v0 + p0; v1 = v1 + p1; v2 = v2 + p2; v3 = v3 + p3;
+            v4 = v4 + p4; v5 = v5 + p5; v6 = v6 + p6; v7 = v7 + p7;
+        }
+    }
+
+    // Scale by 1/sqrt(256) = 1/16 = 0.0625 and apply signs2
+    const float s = 0.0625f;
+    v0 *= s * signs2[d0];   v1 *= s * signs2[d0+1]; v2 *= s * signs2[d0+2]; v3 *= s * signs2[d0+3];
+    v4 *= s * signs2[d0+4]; v5 *= s * signs2[d0+5]; v6 *= s * signs2[d0+6]; v7 *= s * signs2[d0+7];
+}
+
+// Inverse FWHT-256: signs2 -> shuffle passes -> local passes (reversed) -> scale -> signs1
+__device__ void fwht_shfl_inverse_256(
+    float& v0, float& v1, float& v2, float& v3,
+    float& v4, float& v5, float& v6, float& v7,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int tid)
+{
+    const int d0 = tid * 8;
+
+    // Apply signs2 (undo output randomization)
+    v0 *= signs2[d0];   v1 *= signs2[d0+1]; v2 *= signs2[d0+2]; v3 *= signs2[d0+3];
+    v4 *= signs2[d0+4]; v5 *= signs2[d0+5]; v6 *= signs2[d0+6]; v7 *= signs2[d0+7];
+
+    // --- Passes 4-8 (shuffle, same order as forward: WHT is self-inverse) ---
+    for (int ts = 1; ts <= 16; ts <<= 1) {
+        float p0 = __shfl_xor(v0, ts);
+        float p1 = __shfl_xor(v1, ts);
+        float p2 = __shfl_xor(v2, ts);
+        float p3 = __shfl_xor(v3, ts);
+        float p4 = __shfl_xor(v4, ts);
+        float p5 = __shfl_xor(v5, ts);
+        float p6 = __shfl_xor(v6, ts);
+        float p7 = __shfl_xor(v7, ts);
+        if (tid & ts) {
+            v0 = p0 - v0; v1 = p1 - v1; v2 = p2 - v2; v3 = p3 - v3;
+            v4 = p4 - v4; v5 = p5 - v5; v6 = p6 - v6; v7 = p7 - v7;
+        } else {
+            v0 = v0 + p0; v1 = v1 + p1; v2 = v2 + p2; v3 = v3 + p3;
+            v4 = v4 + p4; v5 = v5 + p5; v6 = v6 + p6; v7 = v7 + p7;
+        }
+    }
+
+    // --- Pass 3 (reverse): stride 4 --- pairs (0,4), (1,5), (2,6), (3,7)
+    float t;
+    t = v0; v0 = v0 + v4; v4 = t - v4;
+    t = v1; v1 = v1 + v5; v5 = t - v5;
+    t = v2; v2 = v2 + v6; v6 = t - v6;
+    t = v3; v3 = v3 + v7; v7 = t - v7;
+
+    // --- Pass 2 (reverse): stride 2 --- pairs (0,2), (1,3), (4,6), (5,7)
+    t = v0; v0 = v0 + v2; v2 = t - v2;
+    t = v1; v1 = v1 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v6; v6 = t - v6;
+    t = v5; v5 = v5 + v7; v7 = t - v7;
+
+    // --- Pass 1 (reverse): stride 1 --- pairs (0,1), (2,3), (4,5), (6,7)
+    t = v0; v0 = v0 + v1; v1 = t - v1;
+    t = v2; v2 = v2 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v5; v5 = t - v5;
+    t = v6; v6 = v6 + v7; v7 = t - v7;
+
+    // Scale by 1/sqrt(256) and apply signs1
+    const float s = 0.0625f;
+    v0 *= s * signs1[d0];   v1 *= s * signs1[d0+1]; v2 *= s * signs1[d0+2]; v3 *= s * signs1[d0+3];
+    v4 *= s * signs1[d0+4]; v5 *= s * signs1[d0+5]; v6 *= s * signs1[d0+6]; v7 *= s * signs1[d0+7];
+}
+
+// ============================================================================
+// Scalar reference FWHT-256 (for validation / non-turbo paths)
+// ============================================================================
+__device__ void fwht_forward_256(float* x,
+    const float* __restrict__ signs1, const float* __restrict__ signs2)
+{
+    for (int i = 0; i < 256; i++) x[i] *= signs1[i];
+    for (int stride = 1; stride < 256; stride <<= 1) {
+        for (int i = 0; i < 256; i += stride * 2) {
+            for (int j = 0; j < stride; j++) {
+                float a = x[i + j];
+                float b = x[i + j + stride];
+                x[i + j]          = a + b;
+                x[i + j + stride] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_256 = 0.0625f;
+    for (int i = 0; i < 256; i++) x[i] *= inv_sqrt_256 * signs2[i];
+}
+
+__device__ void fwht_inverse_256(float* x,
+    const float* __restrict__ signs1, const float* __restrict__ signs2)
+{
+    for (int i = 0; i < 256; i++) x[i] *= signs2[i];
+    for (int stride = 1; stride < 256; stride <<= 1) {
+        for (int i = 0; i < 256; i += stride * 2) {
+            for (int j = 0; j < stride; j++) {
+                float a = x[i + j];
+                float b = x[i + j + stride];
+                x[i + j]          = a + b;
+                x[i + j + stride] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_256 = 0.0625f;
+    for (int i = 0; i < 256; i++) x[i] *= inv_sqrt_256 * signs1[i];
+}
+
+
 // Branchless 2-bit quantize: returns index 0-3 (thresholds for N(0, 1/128))
 __device__ int turbo_quantize_2bit(float x) {
     return (x > -0.086744f) + (x > 0.0f) + (x > 0.086744f);
