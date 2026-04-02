@@ -981,6 +981,9 @@ pub fn forward_scratch_layers(
     let head_dim = config.head_dim;
     let kv_dim = n_kv_heads * head_dim;
 
+    // Graduated KV: check if we need to compress at this position
+    kv_cache.maybe_graduate(gpu, pos)?;
+
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
 

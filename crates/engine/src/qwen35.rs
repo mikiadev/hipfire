@@ -500,6 +500,9 @@ fn forward_from_x_gpu(
     let mut delta_layer_idx = 0usize;
     let debug_layers = std::env::var("DEBUG_LAYERS").is_ok();
 
+    // Graduated KV: check if we need to compress at this position
+    kv_cache.maybe_graduate(gpu, pos)?;
+
     if debug_layers && pos == 0 {
         let hid = gpu.download_f32(&x)?;
         let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -899,6 +902,9 @@ fn forward_scratch_layers(
     let hd = config.linear_key_head_dim;
 
     let mut delta_layer_idx = 0usize;
+
+    // Graduated KV: check if we need to compress at this position
+    kv_cache.maybe_graduate(gpu, pos)?;
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
