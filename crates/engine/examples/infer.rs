@@ -141,24 +141,23 @@ fn main() {
     eprintln!("Prompt: {} tokens{}", prompt_tokens.len(),
         if vl_mode { format!(" ({} visual + {} text)", n_visual_tokens, prompt_tokens.len() - n_visual_tokens) } else { String::new() });
 
-    // Scratch buffers
     let sc = llama::SamplingConfig::vl_thinking();
-    let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &text_config, sc.repeat_window)
-        .expect("failed to create scratch");
 
-    // Prefill
+    // Prefill using forward() path (correct numerics, alloc/free per token)
+    // TODO: debug forward_scratch() numerical divergence that causes 9B thinking degeneration
     let t_pf = Instant::now();
+    let mut logits = vec![0.0f32; text_config.vocab_size];
     let mut visual_idx = 0usize;
     for (pos, &token) in prompt_tokens.iter().enumerate() {
         if vl_mode && token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
             let vt = visual_tokens.as_ref().unwrap();
             let emb = &vt[visual_idx * text_config.dim..(visual_idx + 1) * text_config.dim];
-            qwen35::forward_scratch_embed(&mut gpu, &weights, &text_config, emb, pos, &mut kv_cache, &mut dn_state, &scratch)
-                .expect("forward_scratch_embed failed");
+            logits = qwen35::forward_with_embedding(&mut gpu, &weights, &text_config, emb, pos, &mut kv_cache, &mut dn_state)
+                .expect("forward_with_embedding failed");
             visual_idx += 1;
         } else {
-            qwen35::forward_scratch(&mut gpu, &weights, &text_config, token, pos, &mut kv_cache, &mut dn_state, &scratch)
-                .expect("forward_scratch failed");
+            logits = qwen35::forward(&mut gpu, &weights, &text_config, token, pos, &mut kv_cache, &mut dn_state)
+                .expect("forward failed");
         }
     }
     let prefill_ms = t_pf.elapsed().as_millis();
@@ -167,7 +166,8 @@ fn main() {
 
     // Thinking mode
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
-    let think_end_token = { let t = tokenizer.encode("</think>"); if t.len() == 1 { Some(t[0]) } else { None } };
+    let think_end_seq = tokenizer.encode("</think>");
+    let think_start_seq = tokenizer.encode("<think>");
     let max_gen = 2048;
     let max_think = 512;
 
@@ -176,8 +176,8 @@ fn main() {
     if !no_think {
         let think_tokens = tokenizer.encode("<think>\n");
         for (i, &t) in think_tokens.iter().enumerate() {
-            qwen35::forward_scratch(&mut gpu, &weights, &text_config, t, prompt_tokens.len() + i, &mut kv_cache, &mut dn_state, &scratch)
-                .expect("forward_scratch failed");
+            logits = qwen35::forward(&mut gpu, &weights, &text_config, t, prompt_tokens.len() + i, &mut kv_cache, &mut dn_state)
+                .expect("forward failed");
         }
         prefill_len = prompt_tokens.len() + think_tokens.len();
         in_thinking = true;
@@ -188,8 +188,6 @@ fn main() {
     }
 
     // First token
-    let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-    llama::apply_ngram_block(&mut logits, &prompt_tokens);
     let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
     let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
 
@@ -203,7 +201,13 @@ fn main() {
         token_history.push(next_token);
         if in_thinking { think_count += 1; }
 
-        if in_thinking && (think_end_token == Some(next_token) || think_count >= max_think) {
+        // Detect </think> as a token sequence (may be multi-token)
+        let think_ended = in_thinking && (think_count >= max_think || {
+            let gl = generated.len();
+            gl >= think_end_seq.len() && generated[gl - think_end_seq.len()..] == think_end_seq[..]
+        });
+
+        if think_ended {
             in_thinking = false;
             eprint!("</think>\n");
         } else {
@@ -219,11 +223,11 @@ fn main() {
         let pos = prefill_len + generated.len() - 1;
         let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
 
-        qwen35::forward_scratch(&mut gpu, &weights, &text_config, next_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch).expect("forward_scratch failed");
-
-        logits = gpu.download_f32(&scratch.logits).unwrap();
-        llama::apply_ngram_block(&mut logits, &token_history);
+        logits = qwen35::forward(&mut gpu, &weights, &text_config, next_token, pos,
+            &mut kv_cache, &mut dn_state).expect("forward failed");
+        if !in_thinking {
+            llama::apply_ngram_block(&mut logits, &token_history);
+        }
         llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
         next_token = llama::sample_top_p(&logits, temp, sc.top_p);
     }
