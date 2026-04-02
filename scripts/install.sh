@@ -1,6 +1,6 @@
 #!/bin/bash
 # hipfire installer — detects GPU, installs deps, downloads binary + kernels.
-# Usage: curl -L hipfire.schutt.dev/install | sh
+# Usage: curl -L https://raw.githubusercontent.com/autorocm/hipfire/alpha-builds/scripts/install.sh | sh
 set -euo pipefail
 
 HIPFIRE_DIR="$HOME/.hipfire"
