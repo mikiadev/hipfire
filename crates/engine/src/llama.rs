@@ -1775,6 +1775,10 @@ fn per_head_rmsnorm_cpu(data: &mut [f32], weight: &[f32], n_heads: usize, head_d
 
 /// GPU-resident KV cache for autoregressive generation.
 /// Pre-allocates [max_seq * n_kv_heads * head_dim] per layer on GPU.
+/// Current quantization level for graduated KV.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KvQuantLevel { Q8, Turbo4, Turbo2 }
+
 pub struct KvCache {
     pub k_gpu: Vec<GpuTensor>,   // [n_layers] key values (FP32 or int8)
     pub v_gpu: Vec<GpuTensor>,   // [n_layers] value values (FP32 or int8)
@@ -1793,6 +1797,16 @@ pub struct KvCache {
     pub turbo_adaptive: bool,    // true = first/last layers use FP32 KV
     pub turbo_signs1: Option<GpuTensor>,  // FWHT sign table 1 (128 × f32, ±1.0)
     pub turbo_signs2: Option<GpuTensor>,  // FWHT sign table 2 (128 × f32, ±1.0)
+    // Graduated KV state
+    pub graduated: bool,
+    pub grad_level: KvQuantLevel,
+    pub grad_threshold_turbo4: usize,  // position to switch Q8 → turbo4
+    pub grad_threshold_turbo2: usize,  // position to switch turbo4 → turbo2
+    // Pre-allocated turbo buffers (allocated at init, swapped in at threshold)
+    pub grad_turbo4_k: Vec<GpuTensor>,
+    pub grad_turbo4_v: Vec<GpuTensor>,
+    pub grad_turbo2_k: Vec<GpuTensor>,
+    pub grad_turbo2_v: Vec<GpuTensor>,
 }
 
 impl KvCache {
@@ -1811,7 +1825,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
@@ -1835,7 +1849,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
@@ -1855,7 +1869,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
@@ -1873,7 +1887,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
@@ -1891,7 +1905,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create HFQ4 KV cache with sign-flip decorrelation. Same format, better quality.
@@ -1910,7 +1924,7 @@ impl KvCache {
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
         eprintln!("KV cache: HFQ4+sign (72B/head, 7.1x vs fp32)");
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: true, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: true, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
@@ -1930,7 +1944,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.
@@ -1952,7 +1966,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None, graduated: false, grad_level: KvQuantLevel::Q8, grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX, grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![] })
     }
 
     /// Create TurboQuant KV cache. `bits` = 2, 3, or 4.
@@ -2016,6 +2030,9 @@ impl KvCache {
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
             quant_turbo: bits, turbo_adaptive: adaptive,
             turbo_signs1: Some(s1t), turbo_signs2: Some(s2t),
+            graduated: false, grad_level: KvQuantLevel::Q8,
+            grad_threshold_turbo4: usize::MAX, grad_threshold_turbo2: usize::MAX,
+            grad_turbo4_k: vec![], grad_turbo4_v: vec![], grad_turbo2_k: vec![], grad_turbo2_v: vec![],
         })
     }
 
@@ -2026,6 +2043,133 @@ impl KvCache {
             state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
             if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
         }).collect()
+    }
+
+    /// Create graduated KV cache: starts Q8, auto-downgrades to turbo4 then turbo2 as context grows.
+    /// Thresholds computed from available VRAM. Only for FullAttention layers.
+    pub fn new_gpu_graduated(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, vram_budget_bytes: usize,
+    ) -> HipResult<Self> {
+        assert_eq!(head_dim, 128, "graduated KV requires head_dim=128");
+
+        let blocks_per_head = head_dim / 32;
+        let q8_bytes_per_pos = n_kv_heads * blocks_per_head * 34 * 2; // K+V, Q8_0 format
+        let t4_bytes_per_head = 4 + head_dim / 2; // 68
+        let t4_bytes_per_pos = n_kv_heads * t4_bytes_per_head * 2; // K+V
+        let t2_bytes_per_head = 4 + head_dim / 4; // 36
+        let t2_bytes_per_pos = n_kv_heads * t2_bytes_per_head * 2; // K+V
+
+        // Compute thresholds: how many positions fit at each level
+        let per_layer_budget = vram_budget_bytes / n_layers;
+        let q8_max_pos = per_layer_budget / q8_bytes_per_pos;
+        // After converting to turbo4, Q8 space freed → more positions at turbo4 rate
+        let t4_max_pos = per_layer_budget / t4_bytes_per_pos;
+        let t2_max_pos = per_layer_budget / t2_bytes_per_pos;
+
+        let threshold_t4 = q8_max_pos.min(max_seq_len);
+        let threshold_t2 = t4_max_pos.min(max_seq_len);
+
+        // Allocate Q8 cache (initial) — sized for max_seq_len positions
+        let q8_cache_bytes = max_seq_len * n_kv_heads * blocks_per_head * 34;
+        let q8_elems = (q8_cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[q8_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[q8_elems], DType::F32)?);
+        }
+
+        // Pre-allocate turbo4 buffers
+        let t4_elems = (max_seq_len * n_kv_heads * t4_bytes_per_head + 3) / 4;
+        let mut t4_k = Vec::with_capacity(n_layers);
+        let mut t4_v = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            t4_k.push(gpu.zeros(&[t4_elems], DType::F32)?);
+            t4_v.push(gpu.zeros(&[t4_elems], DType::F32)?);
+        }
+
+        // Pre-allocate turbo2 buffers
+        let t2_elems = (max_seq_len * n_kv_heads * t2_bytes_per_head + 3) / 4;
+        let mut t2_k = Vec::with_capacity(n_layers);
+        let mut t2_v = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            t2_k.push(gpu.zeros(&[t2_elems], DType::F32)?);
+            t2_v.push(gpu.zeros(&[t2_elems], DType::F32)?);
+        }
+
+        // FWHT signs for turbo
+        let signs1 = Self::gen_fwht_signs(42, head_dim);
+        let signs2 = Self::gen_fwht_signs(1042, head_dim);
+        let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1t = gpu.upload_f32(&signs1, &[head_dim])?;
+        let s2t = gpu.upload_f32(&signs2, &[head_dim])?;
+
+        eprintln!("KV cache: graduated Q8→turbo4→turbo2 (thresholds: {}→{} positions)",
+            threshold_t4, threshold_t2);
+
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim: n_kv_heads * head_dim,
+            max_seq: max_seq_len, n_kv_heads, head_dim,
+            quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
+            quant_turbo: 0, turbo_adaptive: false,
+            turbo_signs1: Some(s1t), turbo_signs2: Some(s2t),
+            graduated: true, grad_level: KvQuantLevel::Q8,
+            grad_threshold_turbo4: threshold_t4, grad_threshold_turbo2: threshold_t2,
+            grad_turbo4_k: t4_k, grad_turbo4_v: t4_v,
+            grad_turbo2_k: t2_k, grad_turbo2_v: t2_v,
+        })
+    }
+
+    /// Check if graduated KV needs to transition at the current position.
+    /// Called from the forward loop. Returns true if a conversion happened.
+    pub fn maybe_graduate(&mut self, gpu: &mut Gpu, pos: usize) -> HipResult<bool> {
+        if !self.graduated { return Ok(false); }
+
+        if self.grad_level == KvQuantLevel::Q8 && pos >= self.grad_threshold_turbo4 {
+            eprintln!("  graduated KV: Q8 → turbo4 at pos {pos}");
+            let signs1 = self.turbo_signs1.as_ref().unwrap();
+            let signs2 = self.turbo_signs2.as_ref().unwrap();
+            for i in 0..self.k_gpu.len() {
+                gpu.kv_cache_convert_q8_to_turbo4(
+                    &self.k_gpu[i], &self.grad_turbo4_k[i],
+                    signs1, signs2, self.n_kv_heads, self.head_dim, pos,
+                )?;
+                gpu.kv_cache_convert_q8_to_turbo4(
+                    &self.v_gpu[i], &self.grad_turbo4_v[i],
+                    signs1, signs2, self.n_kv_heads, self.head_dim, pos,
+                )?;
+            }
+            // Swap active caches to turbo4
+            std::mem::swap(&mut self.k_gpu, &mut self.grad_turbo4_k);
+            std::mem::swap(&mut self.v_gpu, &mut self.grad_turbo4_v);
+            self.grad_level = KvQuantLevel::Turbo4;
+            self.quant_q8 = false;
+            self.quant_turbo = 4;
+            return Ok(true);
+        }
+
+        if self.grad_level == KvQuantLevel::Turbo4 && pos >= self.grad_threshold_turbo2 {
+            eprintln!("  graduated KV: turbo4 → turbo2 at pos {pos}");
+            for i in 0..self.k_gpu.len() {
+                gpu.kv_cache_convert_turbo4_to_turbo2(
+                    &self.k_gpu[i], &self.grad_turbo2_k[i],
+                    self.n_kv_heads, self.head_dim, pos,
+                )?;
+                gpu.kv_cache_convert_turbo4_to_turbo2(
+                    &self.v_gpu[i], &self.grad_turbo2_v[i],
+                    self.n_kv_heads, self.head_dim, pos,
+                )?;
+            }
+            std::mem::swap(&mut self.k_gpu, &mut self.grad_turbo2_k);
+            std::mem::swap(&mut self.v_gpu, &mut self.grad_turbo2_v);
+            self.grad_level = KvQuantLevel::Turbo2;
+            self.quant_turbo = 2;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     /// Store K, V at position `pos` in layer cache (CPU → GPU copy into cache slot).
@@ -2093,7 +2237,7 @@ impl SamplingConfig {
     }
     /// Simple greedy-ish sampling (no think/answer split).
     pub fn simple() -> Self {
-        Self { think_temp: 0.7, answer_temp: 0.7, top_p: 0.9, repeat_penalty: 1.1, repeat_window: 64 }
+        Self { think_temp: 0.7, answer_temp: 0.3, top_p: 0.9, repeat_penalty: 1.1, repeat_window: 64 }
     }
 }
 

@@ -551,5 +551,11 @@ pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_atten
 /// Bias-add: X[batch, n] += bias[n] (broadcast over batch dim)
 pub const BIAS_ADD_SRC: &str = include_str!("../../../kernels/src/bias_add.hip");
 
+/// Convert Q8_0 KV cache → turbo4 format. Grid: [n_kv_heads, convert_len]. Block: [32].
+pub const KV_CACHE_CONVERT_Q8_TO_TURBO4_SRC: &str = include_str!("../../../kernels/src/kv_cache_convert_q8_to_turbo4.hip");
+
+/// Convert turbo4 KV cache → turbo2 format. Grid: [n_kv_heads, convert_len]. Block: [32].
+pub const KV_CACHE_CONVERT_TURBO4_TO_TURBO2_SRC: &str = include_str!("../../../kernels/src/kv_cache_convert_turbo4_to_turbo2.hip");
+
 
 
