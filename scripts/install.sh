@@ -1,6 +1,6 @@
 #!/bin/bash
 # hipfire installer — detects GPU, installs deps, downloads binary + kernels.
-# Usage: curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.sh | bash
+# Usage: curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 set -euo pipefail
 
 HIPFIRE_DIR="$HOME/.hipfire"
@@ -8,7 +8,7 @@ BIN_DIR="$HIPFIRE_DIR/bin"
 MODELS_DIR="$HIPFIRE_DIR/models"
 SRC_DIR="$HIPFIRE_DIR/src"
 GITHUB_REPO="Kaden-Schutt/hipfire"
-GITHUB_BRANCH="alpha-builds"
+GITHUB_BRANCH="master"
 
 echo "=== hipfire installer ==="
 echo ""

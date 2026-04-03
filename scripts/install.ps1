@@ -1,5 +1,5 @@
 # hipfire installer for Windows — detects GPU, installs deps, downloads binary + kernels.
-# Usage: irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
 # ─── Paths ───────────────────────────────────────────────
@@ -11,7 +11,7 @@ $SrcDir      = "$HipfireDir\src"
 
 # ─── Constants ───────────────────────────────────────────
 $GithubRepo   = "Kaden-Schutt/hipfire"
-$GithubBranch = "alpha-builds"
+$GithubBranch = "master"
 
 Write-Host "=== hipfire installer ===" -ForegroundColor Cyan
 Write-Host ""

@@ -6,10 +6,10 @@ LLM inference engine for AMD RDNA GPUs. Written from scratch in Rust + HIP. **9x
 
 ```bash
 # Install (Linux, requires AMD GPU)
-curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.sh | bash
+curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 
 # Windows (PowerShell, requires AMD GPU)
-irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
 
 # Pull a model and run
 hipfire pull qwen3.5:9b

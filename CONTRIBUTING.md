@@ -23,10 +23,10 @@ Follow the quickstart in [README.md](README.md):
 
 ```bash
 # Linux
-curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.sh | bash
+curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
 ```
 
 ### 2. Run benchmarks
