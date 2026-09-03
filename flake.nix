@@ -17,10 +17,23 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
+        rocmLib = import ./nix/rocm.nix { inherit lib; };
+
+        # Default ROCm: nixpkgs rocmPackages (ROCm 7.x). This is the classic
+        # behaviour — the package and dev shell ship with nixpkgs ROCm unless
+        # overridden.
+        nixpkgsProvider = rocmLib.nixpkgs {
+          rocmPackages = pkgs.rocmPackages;
+        };
+
+        # TheRock ROCm 10 binary SDK (opt-in; gfx1151 = Strix Halo).
+        therockProvider = rocmLib.therock { inherit pkgs; };
+
         hipfire = pkgs.callPackage ./nix/package.nix {
           rocmSupport = true;
           src = lib.cleanSource ./.;
           cargoLockFile = ./Cargo.lock;
+          inherit (nixpkgsProvider) rocmPackages;
         };
 
         # Default to no precompiled kernels — daemon JIT-compiles on first
@@ -30,17 +43,40 @@
         # silent footgun where 5700-XT users build gfx1100 kernels.
         hipfire-kernels = pkgs.callPackage ./nix/kernels.nix {
           gpuTargets = [];
+          inherit (nixpkgsProvider) rocmPackages;
         };
       in
       {
         packages = {
           default = hipfire;
           inherit hipfire hipfire-kernels;
+
+          # TheRock ROCm 10 build of hipfire (gfx1151). Runtime + JIT both
+          # resolve to the TheRock SDK via the provider env.
+          hipfire-therock = pkgs.callPackage ./nix/package.nix {
+            rocmSupport = true;
+            src = lib.cleanSource ./.;
+            cargoLockFile = ./Cargo.lock;
+            rocm = therockProvider;
+          };
+          therock-sdk = therockProvider.sdk;
         };
 
-        devShells.default = pkgs.callPackage ./nix/dev-shell.nix {
-          rust-bin = pkgs.rust-bin;
-          rocmSupport = true;
+        devShells = {
+          default = pkgs.callPackage ./nix/dev-shell.nix {
+            rust-bin = pkgs.rust-bin;
+            rocmSupport = true;
+            inherit (nixpkgsProvider) rocmPackages;
+          };
+          # Development shell against TheRock ROCm 10: hipcc + rocminfo on
+          # PATH, ROCM_PATH/HIP_PATH/HIP_CLANG_PATH exported, and the SDK's
+          # lib dir on LD_LIBRARY_PATH so a locally-built daemon can dlopen
+          # libamdhip64 and JIT kernels through the Nix-aware clang wrapper.
+          therock = pkgs.callPackage ./nix/dev-shell.nix {
+            rust-bin = pkgs.rust-bin;
+            rocmSupport = true;
+            rocm = therockProvider;
+          };
         };
       }
     ) // {
