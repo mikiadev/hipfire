@@ -10,6 +10,7 @@ pub mod cdna;
 mod compiler;
 mod dispatch;
 pub mod embedding;
+pub mod escham;
 pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;

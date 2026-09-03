@@ -70,6 +70,8 @@ pub mod mtp_speculator;
 #[cfg(feature = "deltanet")]
 pub(crate) mod paro_moe;
 #[cfg(feature = "deltanet")]
+pub mod escham_decode;
+#[cfg(feature = "deltanet")]
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
 #[cfg(feature = "deltanet")]

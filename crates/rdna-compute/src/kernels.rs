@@ -6527,6 +6527,45 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.gfx12.hip");
 
+// ── Escha-W2 (ESCHAM code-quant MoE / dense) kernel sources ───────────────
+//
+// The production Escha decode path: trellis decode (`escham_moe_decode_trellis`),
+// the two blockwise-128 WHT fold passes + vector mul, and the grouped f16 FFN
+// engine. `esham_device_utils.hip` is spliced ahead of modules that include it.
+pub const ESCHAM_DEVICE_UTILS_SRC: &str =
+    include_str!("../../../kernels/src/escham/hip/esham_device_utils.hip");
+const ESCHAM_MOE_DECODE_TRELLIS_SRC_RAW: &str =
+    include_str!("../../../kernels/src/escham/hip/escham_moe_decode_trellis_kernel.hip");
+const ESCHAM_MOE_FOLD_SRC_RAW: &str =
+    include_str!("../../../kernels/src/escham/hip/escham_moe_fold_kernel.hip");
+const ESCHAM_MOE_GROUPED_SRC_RAW: &str =
+    include_str!("../../../kernels/src/escham/hip/escham_moe_grouped_kernels.hip");
+
+fn strip_esham_include(src: &str) -> String {
+    src.replace("#include \"esham_device_utils.hip\"\n", "")
+        .trim()
+        .to_string()
+}
+
+/// Trellis decode module (self-contained — no device-utils include inside).
+pub fn escham_moe_decode_trellis_src() -> String {
+    ESCHAM_MOE_DECODE_TRELLIS_SRC_RAW.to_string()
+}
+
+/// Fold (rows/cols WHT + mul) module — device-utils spliced ahead.
+pub fn escham_moe_fold_src() -> String {
+    format!(
+        "{}\n{}\n",
+        ESCHAM_DEVICE_UTILS_SRC,
+        strip_esham_include(ESCHAM_MOE_FOLD_SRC_RAW)
+    )
+}
+
+/// Grouped f16 FFN module (self-contained).
+pub fn escham_moe_grouped_src() -> String {
+    ESCHAM_MOE_GROUPED_SRC_RAW.to_string()
+}
+
 /// Native gfx942 wave64 MFMA grouped-GEMM for DeepSeek4 MQ2-Lloyd prefill.
 /// Chip-strict dispatch keeps CDNA operand/layout semantics out of RDNA paths.
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MFMA_GFX942_SRC: &str =
