@@ -2395,6 +2395,10 @@ fn scan_local_models(local: &[PathBuf], search: &str, mode: MatchMode) -> Vec<Pa
         .cloned()
         .collect()
 }
+pub(crate) fn is_dir_model(path: &std::path::Path) -> bool {
+    // A safetensors / ParoQuant / Escha model directory must contain config.json.
+    path.is_dir() && path.join("config.json").is_file()
+}
 pub(crate) fn find_model_path(
     paths: &Paths,
     registry: &RegistryV1,
@@ -2404,9 +2408,17 @@ pub(crate) fn find_model_path(
     if direct.is_file() {
         return fs::canonicalize(direct).ok();
     }
+    // Raw safetensors model directories (ParoQuant / Escha-W2 / HF exports).
+    if is_dir_model(&direct) {
+        return fs::canonicalize(direct).ok();
+    }
     if let Ok(catalog) = load_catalog(&paths.config) {
         if let Some((_, record)) = catalog.catalog.model(model) {
-            if let Some(path) = record.path.as_ref().filter(|path| path.is_file()) {
+            if let Some(path) = record
+                .path
+                .as_ref()
+                .filter(|path| path.is_file() || is_dir_model(path))
+            {
                 return fs::canonicalize(path).ok().or_else(|| Some(path.clone()));
             }
         }
@@ -2441,12 +2453,12 @@ pub(crate) fn find_model_path(
     }
     if let Some((_, entry)) = registry.model(model) {
         let path = paths.models.join(&entry.file);
-        if path.is_file() {
+        if path.is_file() || is_dir_model(&path) {
             return Some(path);
         }
     }
     let path = paths.models.join(model);
-    if path.is_file() {
+    if path.is_file() || is_dir_model(&path) {
         return Some(path);
     }
     let search = model.replace(':', "-").to_ascii_lowercase();

@@ -594,7 +594,48 @@ impl Tokenizer {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        Self::from_hf_json(&json_str).map(Some)
+        let mut tok = Self::from_hf_json(&json_str)?;
+        // Some exports (Escha-W2, older Qwen3.5) keep the added special
+        // tokens ONLY in the sibling tokenizer_config.json
+        // (`added_tokens_decoder`: "<|im_start|>" → 248045, "<|im_end|>" →
+        // 248046, "<think>"…). The tokenizer.json vocab ends at 248044, so
+        // without this the chat-template tokens are BPE-mangled into
+        // sub-word garbage and the model sees a corrupted prompt. Merge
+        // them into the special-token list (longest-first ordering is
+        // re-sorted afterwards).
+        if let Some(dir) = path.parent() {
+            let cfg_path = dir.join("tokenizer_config.json");
+            if let Ok(cfg_str) = std::fs::read_to_string(&cfg_path) {
+                if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                    if let Some(added) = cfg.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+                        let mut changed = false;
+                        for (id_str, entry) in added {
+                            if let (Ok(id), Some(content)) = (
+                                id_str.parse::<u32>(),
+                                entry.get("content").and_then(|v| v.as_str()),
+                            ) {
+                                let id_us = id as usize;
+                                if id_us >= tok.vocab.len() {
+                                    tok.vocab.resize(id_us + 1, String::new());
+                                }
+                                if tok.vocab[id_us].is_empty() {
+                                    tok.vocab[id_us] = content.to_string();
+                                }
+                                tok.token_to_id.insert(content.to_string(), id);
+                                if !tok.special_tokens.iter().any(|(s, i)| *i == id || s == content) {
+                                    tok.special_tokens.push((content.to_string(), id));
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if changed {
+                            tok.special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(tok))
     }
 
     pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, TokenizerError> {
