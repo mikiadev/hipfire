@@ -78,6 +78,50 @@ ancestor of this master).
 2. Dense loader + pipeline for /data/rocmfpx/Qwen3.8-27B-Escha-W2.
 3. Full-kernel decode + (later) prefill; throughput targets per handoff.
 
+## A4 status (MoE decode on the fresh tree — 2026-09-04)
+
+Commits: baseline bf1214ca → A1 scaffolding 944ff9d0 → match-sweep 0c487847 →
+loader 262109b4 → CLI/tokenizer b7a62c03 → forward arms e4f40d66 → int8
+augmentor + debug round ee47589c.
+
+**Works end-to-end:** model /data/rocmfpx/Escha-W2 loads (arch 6, quant
+eschamoe, 40 layers, all Escha arms), the daemon decodes at ~10 tok/s, and:
+- GPU trellis decode + fold vs host reference: rel ~1.4e-4, 0/8192 wrong
+  tiles (verified layers 0/5, experts 0/200/100, gate_up K2 + down K3).
+- Production single-expert FFN cache path (decode+fold → rout·s_in·rin scale
+  absorb → f16 → grouped f16 gemv) vs host: rel ~3e-4.
+- Residual x-norms stay in a stable band across all 40 layers; logits finite
+  and differentiated (top-5 gap ~3) at token 1.
+- shared-expert path, router softmax, grouped-8 pointers, batched silu/add:
+  structurally identical to beta's validated port.
+
+**Not yet coherent:** first-token logits are only weakly prompt-conditioned
+(the top token tends to a near-prior space/newline), and decode decays into a
+token attractor (". 2 . 2" with reasoning on; "0 0 0" / "1 1 1" with
+reasoning off) after ~3–5 tokens — the classic DeltaNet-recurrence divergence
+profile (works while recurrent state ≈ 0, collapses once the S-matrix update
+accumulates). Framework notes:
+- thinking default-on for Qwen (family_default) → `open_think` assistant
+  prefix; the daemon fail-closes with "open think span at end of generation"
+  whenever a run ends inside the think block. For coherence tests set
+  `hipfire config set reasoning.mode off`.
+- Prefill for Escha correctly takes the per-token `forward_scratch` fallback
+  (Escha layers are batched-prefill inadmissible by design on this tree).
+
+**Next debugging steps (in priority order):**
+1. Compare the Escha-MoE DeltaNet dims (linear_num_value_heads=32, conv 8192,
+   qkv 8192, kd 2048, vd 4096) against the A3B-HFQ config the fresh tree's
+   gated_delta_net kernels were validated on — check for a head-count or
+   HD-128/TILE_ROWS assumption mismatch.
+2. Isolate the DeltaNet arm: run the Escha model's layer-0 linear-attn forward
+   vs a numpy reference (beta's 19-token oracle) to pin where state diverges.
+3. Check the KV/state indexing for the hybrid (10 full-attn of 40 layers) —
+   kv_layer_idx/delta_layer_idx counters and `Mask` KV-layer layout must match
+   the Escha layer_types pattern (48/16 for dense; 30/10 for the MoE).
+4. If DeltaNet is fine, suspect the FFN's effect on state: the router D2H per
+   token is capture-hostile but correct in AR; verify the grouped-down output
+   feeds the *next* token's recurrent state only via the residual (it does).
+
 Open questions: s_in/s_out role (dense), config [6] meaning, whether Qwen3.5
 dense attention path on master can host an escha-coded wqkv/qkv with minimal
 surgery, and the split of "int8 dense attention kept f32" perf fix vs a real
