@@ -30,6 +30,11 @@ path = "examples/compare_decode.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "check_escha_ffn"
+path = "examples/check_escha_ffn.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "dump_escha_folded"
 path = "examples/dump_escha_folded.rs"
 required-features = ["deltanet"]

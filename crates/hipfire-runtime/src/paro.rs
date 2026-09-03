@@ -102,15 +102,38 @@ pub fn repack_awq_to_hfq4g128(
 /// (shisa-ai / some Qwen3.5 checkpoints) or the flat `model.*` layout.
 /// Returns the prefix string to prepend to all other tensor names.
 pub fn paro_text_prefix(source: &dyn ModelSource) -> HipResult<&'static str> {
-    if source
-        .tensor_info("model.language_model.embed_tokens.weight")
-        .is_some()
-    {
+    // Accept the int8-augmented embed (Escha-W2 / Qwen3.5-MoE export: the
+    // embed is `embed_tokens.weight_int8` + `weight_scale`, no `.weight`).
+    let has = |suffix: &str| {
+        source
+            .tensor_info(&format!("model.language_model.embed_tokens.{suffix}"))
+            .is_some()
+    };
+    if has("weight") || has("weight_int8") {
         Ok("model.language_model")
-    } else if source.tensor_info("model.embed_tokens.weight").is_some() {
-        Ok("model")
     } else {
-        Err(HipError::new(0, "ParoQuant: embed_tokens.weight not found under either model.language_model. or model. layout"))
+        let has_flat = |suffix: &str| {
+            source
+                .tensor_info(&format!("model.embed_tokens.{suffix}"))
+                .is_some()
+        };
+        if has_flat("weight") || has_flat("weight_int8") {
+            Ok("model")
+        } else {
+            eprintln!(
+                "[paro_text_prefix] DEBUG: has lm.weight={} lm.weight_int8={} flat.weight={} flat.weight_int8={} n_tensors_hint={}",
+                source
+                    .tensor_info("model.language_model.embed_tokens.weight")
+                    .is_some(),
+                source
+                    .tensor_info("model.language_model.embed_tokens.weight_int8")
+                    .is_some(),
+                source.tensor_info("model.embed_tokens.weight").is_some(),
+                source.tensor_info("model.embed_tokens.weight_int8").is_some(),
+                source.tensor_names().len(),
+            );
+            Err(HipError::new(0, "ParoQuant: embed_tokens.weight not found under either model.language_model. or model. layout"))
+        }
     }
 }
 
@@ -279,7 +302,12 @@ pub fn paro_load_f32(
         .tensor_data(&full)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
     // Handles F16/BF16/F32 (raw unquantized checkpoints are commonly BF16).
-    let v = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
+    let mut v = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
+    // Some exports store a tensor WIDER than the kernel consumes (e.g. the
+    // Qwen3.5-MoE conv1d ships 10240 channels but the depthwise conv reads
+    // 2*k_dim+v_dim = 8192). Truncate to the requested count so the upload
+    // cannot overflow the allocation.
+    v.truncate(n);
     gpu.upload_f32(&v, &[n])
 }
 

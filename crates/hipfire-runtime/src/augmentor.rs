@@ -124,13 +124,69 @@ impl WeightAugmentor for ParoAugmentor {
     }
 }
 
+// ── Int8Augmentor (Escha-W2 / Qwen3.5-MoE int8 dense export) ───────────────
+
+/// Loads `.weight_int8` + `.weight_scale` (per-row f16 scales) weights for the
+/// Escha-W2 code-quant export, where the dense projections (attention + shared
+/// expert) are int8. The scale is converted with its STORED dtype (F16 here);
+/// misreading it as BF16 zeroes every weight.
+pub struct Int8Augmentor;
+
+impl WeightAugmentor for Int8Augmentor {
+    fn name(&self) -> &'static str {
+        "int8"
+    }
+
+    fn is_active_for(&self, qc: &QuantConfig) -> bool {
+        qc.method == "escha" || qc.method == "eschamoe"
+    }
+
+    fn try_load(
+        &self,
+        source: &dyn ModelSource,
+        base_name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<Option<WeightTensor>> {
+        let int8_name = format!("{base_name}.weight_int8");
+        let scale_name = format!("{base_name}.weight_scale");
+        if source.tensor_info(&int8_name).is_none() || source.tensor_info(&scale_name).is_none() {
+            return Ok(None);
+        }
+        let (_, int8_data) = source.tensor_data(&int8_name).unwrap();
+        let (scale_info, scale_data) = source.tensor_data(&scale_name).unwrap();
+        let scales = crate::safetensors_source::source_bytes_to_f32_vec(&scale_info.dtype, scale_data);
+        let mut f32_data = vec![0.0f32; out_dim * in_dim];
+        for i in 0..(out_dim * in_dim) {
+            let q = int8_data[i] as i8 as f32;
+            // Per-row scale: w[r][c] = int8[r][c] * scale[r].
+            f32_data[i] = q * scales[i / in_dim];
+        }
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+        };
+        let buf = gpu.upload_raw(bytes, &[out_dim, in_dim])?;
+        Ok(Some(WeightTensor {
+            buf,
+            gpu_dtype: rdna_compute::DType::F32,
+            m: out_dim,
+            k: in_dim,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        }))
+    }
+}
+
 // ── Default registry ───────────────────────────────────────────────────────────
 
 static PARO: ParoAugmentor = ParoAugmentor;
+static INT8: Int8Augmentor = Int8Augmentor;
 
 /// Default augmentor set used by all arch crates. Extend per-arch by building
 /// a custom slice: `&[DEFAULT_AUGMENTORS, &[&MyAugmentor]].concat()`.
-pub static DEFAULT_AUGMENTORS: &[&dyn WeightAugmentor] = &[&PARO];
+pub static DEFAULT_AUGMENTORS: &[&dyn WeightAugmentor] = &[&PARO, &INT8];
 
 #[cfg(test)]
 mod tests {

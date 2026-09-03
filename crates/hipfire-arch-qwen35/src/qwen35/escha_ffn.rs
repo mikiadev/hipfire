@@ -28,7 +28,7 @@ use rdna_compute::GpuTensor;
 /// f32 weight [out_p, in_p] (row-major), ready for the grouped gemv. The
 /// per-projection scale absorption + fp16 conversion happen in the caller.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_and_fold_expert_gpu(
+pub fn decode_and_fold_expert_gpu(
     gpu: &mut Gpu,
     codes_view: &GpuTensor,
     k: usize,
@@ -72,7 +72,7 @@ pub(crate) fn decode_and_fold_expert_gpu(
 /// `x_norm` is the post-RMSNorm hidden state; the routed + shared expert
 /// output is added into `x_residual` in place.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn escham_moe_ffn_decode(
+pub fn escham_moe_ffn_decode(
     gpu: &mut Gpu,
     ffn: &EschaMoeFfnWeights,
     x_norm: &GpuTensor,
@@ -100,6 +100,7 @@ pub(crate) fn escham_moe_ffn_decode(
     }
     let logits_host = gpu.download_f32(&router_logits)?;
     gpu.free_tensor(router_logits)?;
+
 
     let topk: Vec<(usize, f32)> = {
         let mut idx: Vec<usize> = (0..n_exp).collect();
@@ -260,6 +261,7 @@ pub(crate) fn escham_moe_ffn_decode(
 
     // Single residual add after routed + shared.
     gpu.add_f32(x_residual, &expert_out, x_residual)?;
+
 
     gpu.free_tensor(expert_out)?;
     gpu.free_tensor(gate_up_out)?;
