@@ -10,6 +10,7 @@ use super::batch::PrefillBatchScratch;
 use super::config::LayerType;
 use super::config::MropeCtx;
 use super::config::Qwen35Config;
+use super::escha_ffn::escham_moe_ffn_decode;
 use super::prefill::dump_hidden_localize;
 use super::prefill::routed_codebook_pair_batched_supported;
 use super::prefill::trace_finite_if_enabled;
@@ -1541,6 +1542,7 @@ pub fn forward_scratch(
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
+        && !config.is_escham_moe
         && (config.num_experts == 0 || allow_moe);
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
@@ -2320,6 +2322,175 @@ fn forward_scratch_layers(
                 kv_layer_idx += 1;
             }
 
+            (LayerWeights::DeltaNetEschaMoe(layer), LayerType::LinearAttention) => {
+                // ── DeltaNetMoe QKVZA via pipeline ──
+                qkvza_via_execute_steps(
+                    gpu,
+                    &ctx,
+                    &layer.wqkv,
+                    &layer.wz,
+                    &layer.w_beta,
+                    &layer.w_alpha,
+                    &layer.attn_norm,
+                    &s.x,
+                    &s.tmp,
+                    &s.x_rot,
+                    &s.dn_qkv,
+                    &s.dn_z,
+                    &s.dn_beta,
+                    &s.dn_alpha,
+                    config.norm_eps,
+                )?;
+
+                // Find GDN call location by dumping after common operations
+                gpu.fused_sigmoid_alpha_gate_f32(
+                    &s.dn_beta,
+                    &s.dn_alpha,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
+                )?;
+                gpu.conv1d_silu_split_f32(
+                    &s.dn_q_raw,
+                    &s.dn_k_raw,
+                    &s.dn_v,
+                    &s.dn_qkv,
+                    &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx],
+                    k_dim,
+                    v_dim,
+                )?;
+                gpu.fused_qk_l2_norm_scale_f32(
+                    &s.dn_q_raw,
+                    &s.dn_k_raw,
+                    config.linear_num_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                )?;
+                if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    gpu.repeat_interleave_qk_f32(
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        &s.dn_q,
+                        &s.dn_k,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
+                    )?;
+                } else {
+                    gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                }
+
+                // DIAG: dump GDN inputs (per-token)
+                if layer_idx == 0 {
+                    let qk_dim = n_v_heads * config.linear_key_head_dim;
+                    dump_hidden_localize(gpu, &s.dn_q, 1, pos, qk_dim, 0, "q_p");
+                    dump_hidden_localize(gpu, &s.dn_k, 1, pos, qk_dim, 0, "k_p");
+                    dump_hidden_localize(gpu, &s.dn_v, 1, pos, v_dim, 0, "v_p");
+                    dump_hidden_localize(gpu, &s.dn_alpha, 1, pos, n_v_heads, 0, "alpha_p");
+                    dump_hidden_localize(gpu, &s.dn_beta, 1, pos, n_v_heads, 0, "beta_p");
+                }
+
+                match dn_state.quant {
+                    StateQuant::FP32 => gpu.gated_delta_net_f32(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                        dn_state.ef_residual(delta_layer_idx),
+                    )?,
+                    StateQuant::Q4 => gpu.gated_delta_net_q4(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
+                }
+                // DIAG: dump GDN attention output (per-token)
+                if layer_idx == 0 {
+                    dump_hidden_localize(
+                        gpu,
+                        &s.dn_attn_out,
+                        1,
+                        pos,
+                        n_v_heads * config.linear_value_head_dim,
+                        0,
+                        "gdn_p",
+                    );
+                }
+
+                gpu.gated_norm_f32(
+                    &s.dn_attn_out,
+                    &s.dn_z,
+                    &layer.norm_weight,
+                    &s.dn_normed,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                )?;
+                {
+                    let wr = layer.wo.dispatch_ref();
+                    execute_steps(
+                        gpu,
+                        &ctx,
+                        &[Step::GemvResidual {
+                            w: &wr,
+                            input: GemvInput::Raw(&s.dn_normed),
+                            residual: &s.x,
+                            out: &s.x,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
+
+                // ── MoE FFN ──
+                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                escham_moe_ffn_decode(gpu, &layer.ffn, &s.tmp, &s.x, config, layer_idx)?;
+                // DIAG: dump MoE router logits (per-token)
+                if layer_idx == 0 {
+                    if let Some(ref rl) = s.moe_router_logits {
+                        dump_hidden_localize(gpu, rl, 1, pos, config.num_experts, 0, "router_p");
+                    }
+                }
+
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
+
+                delta_layer_idx += 1;
+            }
+
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
                 // ── DeltaNetMoe QKVZA via pipeline ──
                 qkvza_via_execute_steps(
@@ -2486,6 +2657,138 @@ fn forward_scratch_layers(
                 }
 
                 delta_layer_idx += 1;
+            }
+
+            (LayerWeights::FullAttnEschaMoe(layer), LayerType::FullAttention) => {
+                qkv_via_execute_steps(
+                    gpu,
+                    &ctx,
+                    &layer.wq,
+                    &layer.wk,
+                    &layer.wv,
+                    &layer.attn_norm,
+                    &s.x,
+                    &s.tmp,
+                    &s.x_rot,
+                    &s.fa_q_full,
+                    &s.fa_k,
+                    &s.fa_v,
+                    config.norm_eps,
+                )?;
+
+                gpu.deinterleave_f32(
+                    &s.fa_q_full,
+                    &s.fa_q,
+                    &s.fa_gate,
+                    config.n_heads,
+                    config.head_dim,
+                )?;
+                gpu.rmsnorm_batched(
+                    &s.fa_q,
+                    &layer.q_norm,
+                    &s.fa_q,
+                    config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
+                gpu.rmsnorm_batched(
+                    &s.fa_k,
+                    &layer.k_norm,
+                    &s.fa_k,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
+
+                if hipfire_runtime::triattn::tap_enabled() {
+                    triattn_tap(gpu, layer_idx, s, config)?;
+                }
+
+                if kv_cache.compact_offset > 0 {
+                    let abs = (pos + kv_cache.compact_offset) as i32;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
+                }
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                // VL (image tokens present) → 3D mrope; everything else keeps
+                // the original 1D kernel and its dispatch identity.
+                match mrope {
+                    Some(mc) => {
+                        debug_assert_eq!(
+                            mc.section, config.mrope_section,
+                            "MropeCtx section disagrees with the loaded config \
+                             (build it with MropeCtx::new)",
+                        );
+                        // `pos_buf3` is filled ONCE per token by
+                        // `forward_scratch_mrope` / `..._embed_mrope`, exactly
+                        // like `pos_buf` — the value is layer-invariant, and a
+                        // per-layer re-upload would add a blocking 12-byte H2D
+                        // per full-attention layer for no benefit.
+                        gpu.rope_mrope_halfsplit_f32(
+                            &s.fa_q,
+                            &s.fa_k,
+                            &s.pos_buf3,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            n_rot,
+                            config.rope_theta,
+                            mc.section,
+                        )?
+                    }
+                    None => gpu.rope_partial_interleaved_f32(
+                        &s.fa_q,
+                        &s.fa_k,
+                        &s.pos_buf,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                    )?,
+                }
+                if kv_cache.compact_offset > 0 {
+                    let phys = pos as i32;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
+                }
+
+                let fused_epilogue = kv_cache_attention_dispatch(
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                )?;
+
+                if !fused_epilogue {
+                    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                }
+                {
+                    let wr = layer.wo.dispatch_ref();
+                    let input = if fused_epilogue {
+                        GemvInput::Prerotated(&s.fa_attn_out)
+                    } else {
+                        GemvInput::Raw(&s.fa_attn_out)
+                    };
+                    execute_steps(
+                        gpu,
+                        &ctx,
+                        &[Step::GemvResidual {
+                            w: &wr,
+                            input,
+                            residual: &s.x,
+                            out: &s.x,
+                        }],
+                    )
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
+
+                // ── MoE FFN ──
+                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                escham_moe_ffn_decode(gpu, &layer.ffn, &s.tmp, &s.x, config, layer_idx)?;
+
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
+
+                kv_layer_idx += 1;
             }
 
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
