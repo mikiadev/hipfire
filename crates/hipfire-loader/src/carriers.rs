@@ -620,16 +620,30 @@ impl Carrier for Qwen35Carrier {
                     physical_cap: Some(ctx.max_seq),
                 };
 
-                let mut paro_source =
-                    hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
-                        .map_err(|e| format!("ParoSource::new: {e:?}"))?;
                 let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
-                let weights = hipfire_arch_qwen35::qwen35::load_weights(
-                    &mut paro_source,
-                    std::slice::from_mut(ctx.gpu),
-                    &paro_layout,
-                )
-                .map_err(|e| format!("load_weights: {e:?}"))?;
+                let weights = if config.is_escham_moe {
+                    // Escha-W2 code-quant MoE dir → EschaSource (trellis/3INST
+                    // routed experts + int8 dense).
+                    let mut escha_source =
+                        hipfire_arch_qwen35::qwen35::EschaSource::new(&source, &config)
+                            .map_err(|e| format!("EschaSource::new: {e:?}"))?;
+                    hipfire_arch_qwen35::qwen35::load_weights(
+                        &mut escha_source,
+                        std::slice::from_mut(ctx.gpu),
+                        &paro_layout,
+                    )
+                    .map_err(|e| format!("load_weights (Escha): {e:?}"))?
+                } else {
+                    let mut paro_source =
+                        hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
+                            .map_err(|e| format!("ParoSource::new: {e:?}"))?;
+                    hipfire_arch_qwen35::qwen35::load_weights(
+                        &mut paro_source,
+                        std::slice::from_mut(ctx.gpu),
+                        &paro_layout,
+                    )
+                    .map_err(|e| format!("load_weights: {e:?}"))?
+                };
                 hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
                 // Staged GPU free on every post-weight error (VMM arenas via free_gpu).

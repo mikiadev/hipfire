@@ -11,6 +11,7 @@
 pub mod batch;
 pub mod config;
 pub mod ep_batch;
+pub mod escha_load;
 pub mod forward;
 pub mod load;
 pub mod prefill;
@@ -38,6 +39,7 @@ pub use forward::{
     prepare_scratch_inputs, shard_all_moe_layers, shard_moe_experts, Qwen35Scratch,
     Qwen35ScratchSet,
 };
+pub use escha_load::{load_weights_from_safetensors, EschaSource};
 pub use load::{
     load_weights, load_weights_dense_tp_rank, load_weights_ep_rank, preflight_weights_dense_tp,
     set_ep_expert_shard, EpShardGuard, HfqSource, Layout, ParoSource,
@@ -55,8 +57,9 @@ pub(crate) use prefill::{
     run_plain_gemm_key, run_residual_gemm_key,
 };
 pub use weights::{
-    mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, ExpertWeights,
-    FullAttnLayerWeights, FullAttnMoeLayerWeights, GpuTensorDescriptor, LayerWeights,
+    mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetEschaMoeLayerWeights,
+    DeltaNetState, EschaMoeFfnWeights, ExpertWeights, FullAttnLayerWeights,
+    FullAttnMoeLayerWeights, FullAttnEschaMoeLayerWeights, GpuTensorDescriptor, LayerWeights,
     MoeFfnWeights, MoeParoSidecars, ParoDescriptor, Qwen35EpConfigFingerprint, Qwen35EpShardInfo,
     Qwen35HfqSourceIdentity, Qwen35LayerSeal, Qwen35LocalExpertDescriptor, Qwen35MoeFfnSeal,
     Qwen35RankSeal, Qwen35Weights, SharedExpertWeights, StateQuant, WeightTensorDescriptor,

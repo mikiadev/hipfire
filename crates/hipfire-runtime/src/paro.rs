@@ -210,6 +210,35 @@ pub fn paro_load_wt(
     if source.tensor_info(&format!("{fp}.qweight")).is_some() {
         return load_paro_weight(source, gpu, &fp, m, k, gs, kr);
     }
+    // Escha-W2 / Qwen3.5-MoE int8 dense export: weight_int8 (+ per-row f16
+    // weight_scale) replaces the raw weight for dense projections (attention,
+    // shared expert). Dequantize on host to F32 with the scale's STORED dtype —
+    // this export stores F16 scales; misreading them as BF16 zeroes everything.
+    let int8_name = format!("{fp}.weight_int8");
+    let scale_name = format!("{fp}.weight_scale");
+    if source.tensor_info(&int8_name).is_some() && source.tensor_info(&scale_name).is_some() {
+        let (_, int8_data) = source.tensor_data(&int8_name).unwrap();
+        let (scale_info, scale_data) = source.tensor_data(&scale_name).unwrap();
+        let scales = crate::safetensors_source::source_bytes_to_f32_vec(&scale_info.dtype, scale_data);
+        let mut f32_data = vec![0.0f32; m * k];
+        for i in 0..(m * k) {
+            let q = int8_data[i] as i8 as f32;
+            let s = scales[i / k];
+            f32_data[i] = q * s;
+        }
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
+        let buf = gpu.upload_raw(bytes, &[m, k])?;
+        return Ok(WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        });
+    }
     load_fp16_weight_from_source(source, gpu, &format!("{fp}.weight"), m, k)
 }
 

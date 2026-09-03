@@ -2688,7 +2688,13 @@ impl WeightSource for ParoSource<'_> {
                 li as u16,
             )
         };
-        crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
+        // ParoSource never loads an Escha model (quant_method == "paroquant");
+        // this arm is only consulted when config.is_escham_moe, which is false
+        // here. Error if somehow reached.
+        let moe_escha = |_: &mut ParoBackend, _: &Qwen35Config, _: usize| -> HipResult<crate::qwen35::weights::EschaMoeFfnWeights> {
+            Err(HipError::new(0, "ParoSource cannot load Escha code-quant MoE FFN"))
+        };
+        crate::layer_driver::load_layer(&mut b, c, layer_idx, moe, moe_escha)
     }
 }
 
@@ -2738,7 +2744,11 @@ fn load_layer_into(
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
         load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
     };
-    crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)
+    // HFQ never loads an Escha model (Escha loads are safetensors-dir only).
+    let moe_escha = |_: &mut HfqBackend, _: &Qwen35Config, _: usize| -> HipResult<crate::qwen35::weights::EschaMoeFfnWeights> {
+        Err(HipError::new(0, "HFQ cannot load Escha code-quant MoE FFN"))
+    };
+    crate::layer_driver::load_layer(&mut b, config, layer_idx, moe, moe_escha)
 }
 
 #[derive(Clone, Copy)]
