@@ -1963,7 +1963,22 @@ fn forward_scratch_layers(
     // channel for the (t,h,w) buffer, so routing a VL request through it would
     // silently reinstate sequential positions. VL therefore always takes the
     // hand arms below, which DO branch on `mrope`.
-    if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() {
+    // ESCHAM skip: the lowered path maps DeltaNetEschaMoe/FullAttnEschaMoe to
+    // DeltaNetMoe/FullAttnMoe variants, but its dispatch handlers only match
+    // the non-Escha discriminants — Escha layers would fall through to the
+    // `_` fallback and error. The hand-written arms below handle Escha (the
+    // FFN runs through the escham trellis/grouped kernels instead of
+    // moe_ffn_dispatch). Route Escha models through the hand path.
+    let has_escham = weights
+        .layers
+        .iter()
+        .any(|lw| {
+            matches!(
+                lw,
+                LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_)
+            )
+        });
+    if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() && !has_escham {
         return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
     }
 
@@ -4679,8 +4694,8 @@ pub(crate) fn variant_of(layer: &LayerWeights) -> Q35Variant {
     match layer {
         LayerWeights::DeltaNet(_) => Q35Variant::DeltaNet,
         LayerWeights::FullAttn(_) => Q35Variant::FullAttn,
-        LayerWeights::DeltaNetMoe(_) => Q35Variant::DeltaNetMoe,
-        LayerWeights::FullAttnMoe(_) => Q35Variant::FullAttnMoe,
+        LayerWeights::DeltaNetMoe(_) | LayerWeights::DeltaNetEschaMoe(_) => Q35Variant::DeltaNetMoe,
+        LayerWeights::FullAttnMoe(_) | LayerWeights::FullAttnEschaMoe(_) => Q35Variant::FullAttnMoe,
     }
 }
 
@@ -5059,6 +5074,27 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         (&l.wo, input)
                     }
                     LayerWeights::DeltaNetMoe(l) => {
+                        let input = if gated_norm_mq_rotate_enabled(
+                            gpu,
+                            self.config,
+                            self.n_v_heads,
+                            &l.wo,
+                        ) {
+                            GemvInput::Prerotated(&s.x_rot)
+                        } else {
+                            GemvInput::Raw(&s.dn_normed)
+                        };
+                        (&l.wo, input)
+                    }
+                    LayerWeights::FullAttnEschaMoe(l) => {
+                        let input = if self.fa_output_prerotated {
+                            GemvInput::Prerotated(&s.fa_attn_out)
+                        } else {
+                            GemvInput::Raw(&s.fa_attn_out)
+                        };
+                        (&l.wo, input)
+                    }
+                    LayerWeights::DeltaNetEschaMoe(l) => {
                         let input = if gated_norm_mq_rotate_enabled(
                             gpu,
                             self.config,
@@ -5897,6 +5933,8 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
                 && mq4(&l.wv)
         }
         LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => false,
+        // Escha code-quant MoE: not MQ4 — never eligible for the MQ4 path.
+        LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => false,
     })
 }
 
@@ -5931,6 +5969,8 @@ fn forward_scratch_layers_lowered(
             let attn_norm = match layer {
                 LayerWeights::DeltaNetMoe(l) => &l.attn_norm,
                 LayerWeights::FullAttnMoe(l) => &l.attn_norm,
+                LayerWeights::DeltaNetEschaMoe(l) => &l.attn_norm,
+                LayerWeights::FullAttnEschaMoe(l) => &l.attn_norm,
                 LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => {
                     unreachable!("moe_combine_next_rms_enabled admits only all-MoE models")
                 }

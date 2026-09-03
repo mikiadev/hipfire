@@ -645,6 +645,13 @@ pub fn validate_ep_batch_compatibility(
                         ));
                     }
                 }
+                // Escha code-quant MoE never runs EP (loads are single-GPU).
+                LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => {
+                    return Err(HipError::new(
+                        0,
+                        "EP batch: Escha code-quant MoE not supported",
+                    ))
+                }
             }
         }
     }
@@ -4195,6 +4202,8 @@ pub fn forward_prefill_batch_multi(
                     && is_batchable_la(l.w_down.gpu_dtype, arch0)
             }
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => moe_topk_ok,
+            // Escha layers never take the batched EP path.
+            LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => false,
         });
 
     if !eligible {

@@ -144,6 +144,16 @@ pub struct Qwen35Config {
     /// `modeling_qwen3_5_moe.py`). DeepSeek-v1 uses false.
     pub norm_topk_prob: bool,
 
+    // ── Escha-W2 (ESCHAM code-quant) ────────────────────────────────────
+    /// True when `quantization_config.quant_method == "eschamoe"` — Escha-W2
+    /// code-quant routed experts (Qwen3.6-35B-A3B-Escha-W2 etc.). Drives the
+    /// MoE FFN loader + forward arms to the ESCHAM trellis/3INST decode path.
+    pub is_escham_moe: bool,
+    /// True when `quantization_config.quant_method == "escha"` — Escha-W2
+    /// code-quant dense projections (Qwen3.8-27B-Escha-W2 etc.). Drives the
+    /// dense loader + forward to the ESCHAM dense decode path.
+    pub is_escha_dense: bool,
+
     // Per-layer type dispatch
     pub layer_types: Vec<LayerType>,
 
@@ -895,6 +905,15 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 
     let has_shared_expert = raw.shared_expert_intermediate_size > 0;
 
+    // Escha-W2 code-quant detection. The quantization_config node lives at the
+    // TOP level of both Escha exports (never nested under text_config).
+    let qm = config
+        .get("quantization_config")
+        .and_then(|q| q.get("quant_method"))
+        .and_then(|q| q.as_str());
+    let is_escham_moe = qm == Some("eschamoe");
+    let is_escha_dense = qm == Some("escha");
+
     let mut config = Qwen35Config {
         dim,
         n_layers: raw.num_hidden_layers,
@@ -922,6 +941,8 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         shared_expert_intermediate_size: raw.shared_expert_intermediate_size,
         has_shared_expert,
         norm_topk_prob: raw.norm_topk_prob,
+        is_escham_moe,
+        is_escha_dense,
         // MAD-93 v0.1: defaults off; runtime opts in (e.g. via CLI flag in
         // a follow-up commit). When false, no behavior change vs main.
         paged_experts: false,

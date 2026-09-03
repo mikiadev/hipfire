@@ -396,6 +396,7 @@ fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
             .iter()
             .all(|weight| weight.gpu_dtype == DType::MQ4G256V2),
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
+            LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => false,
         })
 }
 
@@ -674,6 +675,27 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                     || is_mq3_any(l.wo.gpu_dtype)
                     || moe_ffn_has_mq3_structural(&l.ffn)
                     || moe_ffn_has_mq3_experts_uniform(&l.ffn)
+                {
+                    mq3_in_moe = true;
+                }
+            }
+            LayerWeights::DeltaNetEschaMoe(l) => {
+                // Escha experts are int16 trellis codes — no MQ3/MQ3-Lloyd
+                // experts. Only the dense attention projections can carry MQ3.
+                if is_mq3_any(l.wqkv.gpu_dtype)
+                    || is_mq3_any(l.wz.gpu_dtype)
+                    || is_mq3_any(l.w_beta.gpu_dtype)
+                    || is_mq3_any(l.w_alpha.gpu_dtype)
+                    || is_mq3_any(l.wo.gpu_dtype)
+                {
+                    mq3_in_moe = true;
+                }
+            }
+            LayerWeights::FullAttnEschaMoe(l) => {
+                if is_mq3_any(l.wq.gpu_dtype)
+                    || is_mq3_any(l.wk.gpu_dtype)
+                    || is_mq3_any(l.wv.gpu_dtype)
+                    || is_mq3_any(l.wo.gpu_dtype)
                 {
                     mq3_in_moe = true;
                 }
@@ -1911,6 +1933,12 @@ pub fn qwen35_layer_batch_admissible(
             }
             Ok(())
         }
+        // Escha code-quant MoE is never batched-prefill admissible on this tree
+        // (routed experts are int16 trellis codes, not batchable quant weights).
+        // The decode path runs per-token through the escham FFN engine.
+        LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => Err(
+            HipError::new(0, "Escha code-quant MoE layers are not batched-prefill admissible"),
+        ),
     }
 }
 

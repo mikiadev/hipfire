@@ -347,6 +347,83 @@ pub struct FullAttnMoeLayerWeights {
     pub ffn: MoeFfnWeights,
 }
 
+// ─── Escha-W2 code-quant MoE (ESCHAM) FFN weights ──────────────────────
+//
+// Escha-W2 leaves routed expert projections in an int16 EXL3-trellis code with
+// fp16 rin/rout rotations (scale OUTSIDE the blockwise-128 WHT). At runtime the
+// trellis decode + fold is done lazily per expert (GPU) and cached as folded
+// fp16; the FFN runs the active experts through grouped f16 gemvs.
+
+/// One Escha-W2 MoE layer's FFN block.
+pub struct EschaMoeFfnWeights {
+    /// Router (dense f16 [num_experts, hidden]) — same role as `MoeFfnWeights.router`.
+    pub router: WeightTensor,
+    /// Shared-expert gate vector ([1, hidden]) — dense f16.
+    pub shared_expert_gate: WeightTensor,
+    /// Shared expert (dense int8-dequantized at load) gate/up/down.
+    pub shared_expert: SharedExpertWeights,
+    /// Per-expert int16 code tensors for the fused gate||up projection.
+    pub gate_up_codes: Vec<GpuTensor>,
+    /// Per-expert int16 code tensors for the down projection.
+    pub down_codes: Vec<GpuTensor>,
+    /// Per-expert fp16 input rotation for gate_up ([n_exp, dim]).
+    pub gate_up_rin: Vec<GpuTensor>,
+    /// Per-expert fp16 input rotation for down ([n_exp, mi]).
+    pub down_rin: Vec<GpuTensor>,
+    /// Per-expert fp16 output rotation for gate_up ([n_exp, mi*2]).
+    pub gate_up_rout: Vec<GpuTensor>,
+    /// Per-expert fp16 output rotation for down ([n_exp, dim]).
+    pub down_rout: Vec<GpuTensor>,
+    /// Combined per-expert input scale `s_in . rin` for gate_up — F32 on GPU,
+    /// pre-multiplied on host at load. Applied to the GEMV input.
+    pub gate_up_in_scale: GpuTensor,
+    /// Combined per-expert input scale `s_in . rin` for down — F32 on GPU.
+    pub down_in_scale: GpuTensor,
+    /// Host fp32 copies (used by the reference decode + tests).
+    pub gate_up_rin_f32_host: Vec<f32>,
+    pub down_rin_f32_host: Vec<f32>,
+    pub gate_up_rout_f32_host: Vec<f32>,
+    pub down_rout_f32_host: Vec<f32>,
+    /// Dense dims.
+    pub gate_up_in: usize,
+    pub down_in: usize,
+    pub num_experts: usize,
+    pub moe_intermediate_size: usize,
+    /// Lazily-populated per-expert caches of the decoded + T128-folded fp16
+    /// weights (gate_up [mi*2, dim], down [dim, mi]).
+    pub folded_gate_up_cache: std::cell::RefCell<Vec<Option<GpuTensor>>>,
+    pub folded_down_cache: std::cell::RefCell<Vec<Option<GpuTensor>>>,
+}
+
+/// DeltaNet (linear-attention) layer with an Escha code-quant MoE FFN.
+pub struct DeltaNetEschaMoeLayerWeights {
+    pub attn_norm: GpuTensor,
+    pub wqkv: WeightTensor,
+    pub wz: WeightTensor,
+    pub w_alpha: WeightTensor,
+    pub w_beta: WeightTensor,
+    pub a_log: GpuTensor,
+    pub dt_bias: GpuTensor,
+    pub conv_weight: GpuTensor,
+    pub norm_weight: GpuTensor,
+    pub wo: WeightTensor,
+    pub ffn_norm: GpuTensor,
+    pub ffn: EschaMoeFfnWeights,
+}
+
+/// Full-attention layer with an Escha code-quant MoE FFN.
+pub struct FullAttnEschaMoeLayerWeights {
+    pub attn_norm: GpuTensor,
+    pub wq: WeightTensor,
+    pub wk: WeightTensor,
+    pub wv: WeightTensor,
+    pub wo: WeightTensor,
+    pub q_norm: GpuTensor,
+    pub k_norm: GpuTensor,
+    pub ffn_norm: GpuTensor,
+    pub ffn: EschaMoeFfnWeights,
+}
+
 pub enum LayerWeights {
     DeltaNet(DeltaNetLayerWeights),
     FullAttn(FullAttnLayerWeights),
@@ -356,6 +433,10 @@ pub enum LayerWeights {
     // compile-time hint to handle the new case.
     DeltaNetMoe(DeltaNetMoeLayerWeights),
     FullAttnMoe(FullAttnMoeLayerWeights),
+    // Escha-W2 (ESCHAM) code-quant MoE: attention identical to the MoE arms,
+    // FFN routed experts are int16 trellis codes (decode+fold on GPU).
+    DeltaNetEschaMoe(DeltaNetEschaMoeLayerWeights),
+    FullAttnEschaMoe(FullAttnEschaMoeLayerWeights),
 }
 /// Immutable source identity captured before any EP GPU allocation.
 /// Exact equality over canonical path, platform file identity (dev, ino),
@@ -684,6 +765,9 @@ impl Qwen35RankSeal {
             let ffn = match layer {
                 LayerWeights::DeltaNetMoe(weights) => Some(&weights.ffn),
                 LayerWeights::FullAttnMoe(weights) => Some(&weights.ffn),
+                // Escha code-quant FFNs have no per-expert `WeightTensor`s to
+                // describe — the EP rank seal is unreachable for them anyway
+                // (Escha loads are single-GPU). Treated as non-MoE here.
                 _ => None,
             };
             let Some(ffn) = ffn else {
@@ -832,6 +916,65 @@ impl Qwen35RankSeal {
                             .as_ref()
                             .map(|b| b.to_vec()),
                         num_local_experts: w.ffn.experts.len(),
+                    },
+                },
+                LayerWeights::DeltaNetEschaMoe(w) => Qwen35LayerSeal::DeltaNetMoe {
+                    attn_norm: GpuTensorDescriptor::from_tensor(&w.attn_norm),
+                    wqkv: WeightTensorDescriptor::from_weight(&w.wqkv),
+                    wz: WeightTensorDescriptor::from_weight(&w.wz),
+                    w_alpha: WeightTensorDescriptor::from_weight(&w.w_alpha),
+                    w_beta: WeightTensorDescriptor::from_weight(&w.w_beta),
+                    a_log: GpuTensorDescriptor::from_tensor(&w.a_log),
+                    dt_bias: GpuTensorDescriptor::from_tensor(&w.dt_bias),
+                    conv_weight: GpuTensorDescriptor::from_tensor(&w.conv_weight),
+                    norm_weight: GpuTensorDescriptor::from_tensor(&w.norm_weight),
+                    wo: WeightTensorDescriptor::from_weight(&w.wo),
+                    ffn_norm: GpuTensorDescriptor::from_tensor(&w.ffn_norm),
+                    // Escha FFN has a router + shared expert; describe those
+                    // (never reached by EP attestation — single-GPU only).
+                    moe: Qwen35MoeFfnSeal {
+                        router: WeightTensorDescriptor::from_weight(&w.ffn.router),
+                        shared_gate: WeightTensorDescriptor::from_weight(&w.ffn.shared_expert.gate),
+                        shared_up: WeightTensorDescriptor::from_weight(&w.ffn.shared_expert.up),
+                        shared_down: WeightTensorDescriptor::from_weight(&w.ffn.shared_expert.down),
+                        shared_expert_gate: WeightTensorDescriptor::from_weight(
+                            &w.ffn.shared_expert_gate,
+                        ),
+                        expert_gate_up_ptrs: GpuTensorDescriptor::from_tensor(&w.ffn.gate_up_in_scale),
+                        expert_down_ptrs: GpuTensorDescriptor::from_tensor(&w.ffn.down_in_scale),
+                        expert_down_awq_ptrs: None,
+                        expert_dtype_tags: None,
+                        layer_idx: 0,
+                        has_packed_owners: false,
+                        global_expert_dtypes: None,
+                        num_local_experts: w.ffn.num_experts,
+                    },
+                },
+                LayerWeights::FullAttnEschaMoe(w) => Qwen35LayerSeal::FullAttnMoe {
+                    attn_norm: GpuTensorDescriptor::from_tensor(&w.attn_norm),
+                    wq: WeightTensorDescriptor::from_weight(&w.wq),
+                    wk: WeightTensorDescriptor::from_weight(&w.wk),
+                    wv: WeightTensorDescriptor::from_weight(&w.wv),
+                    wo: WeightTensorDescriptor::from_weight(&w.wo),
+                    q_norm: GpuTensorDescriptor::from_tensor(&w.q_norm),
+                    k_norm: GpuTensorDescriptor::from_tensor(&w.k_norm),
+                    ffn_norm: GpuTensorDescriptor::from_tensor(&w.ffn_norm),
+                    moe: Qwen35MoeFfnSeal {
+                        router: WeightTensorDescriptor::from_weight(&w.ffn.router),
+                        shared_gate: WeightTensorDescriptor::from_weight(&w.ffn.shared_expert.gate),
+                        shared_up: WeightTensorDescriptor::from_weight(&w.ffn.shared_expert.up),
+                        shared_down: WeightTensorDescriptor::from_weight(&w.ffn.shared_expert.down),
+                        shared_expert_gate: WeightTensorDescriptor::from_weight(
+                            &w.ffn.shared_expert_gate,
+                        ),
+                        expert_gate_up_ptrs: GpuTensorDescriptor::from_tensor(&w.ffn.gate_up_in_scale),
+                        expert_down_ptrs: GpuTensorDescriptor::from_tensor(&w.ffn.down_in_scale),
+                        expert_down_awq_ptrs: None,
+                        expert_dtype_tags: None,
+                        layer_idx: 0,
+                        has_packed_owners: false,
+                        global_expert_dtypes: None,
+                        num_local_experts: w.ffn.num_experts,
                     },
                 },
             })
@@ -1178,6 +1321,31 @@ impl Qwen35Weights {
                     let _ = gpu.free_tensor(l.ffn_norm);
                     free_moe_ffn(gpu, l.ffn);
                 }
+                LayerWeights::DeltaNetEschaMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wqkv.free_all(gpu);
+                    l.wz.free_all(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    l.wo.free_all(gpu);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_escha_moe_ffn(gpu, l.ffn);
+                }
+                LayerWeights::FullAttnEschaMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wq.free_all(gpu);
+                    l.wk.free_all(gpu);
+                    l.wv.free_all(gpu);
+                    l.wo.free_all(gpu);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_escha_moe_ffn(gpu, l.ffn);
+                }
             }
         }
         // MAD-93 v0.1: in paged mode, the pager owns expert weight allocations
@@ -1262,6 +1430,31 @@ impl Qwen35Weights {
                     let _ = gpu.free_tensor(l.ffn_norm);
                     free_moe_ffn(gpu, l.ffn);
                 }
+                LayerWeights::DeltaNetEschaMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wqkv.free_all(gpu);
+                    l.wz.free_all(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    l.wo.free_all(gpu);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_escha_moe_ffn(gpu, l.ffn);
+                }
+                LayerWeights::FullAttnEschaMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wq.free_all(gpu);
+                    l.wk.free_all(gpu);
+                    l.wv.free_all(gpu);
+                    l.wo.free_all(gpu);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_escha_moe_ffn(gpu, l.ffn);
+                }
             }
         }
     }
@@ -1333,6 +1526,21 @@ impl MmqScreenable for Qwen35Weights {
                         screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
                     }
                 }
+                LayerWeights::DeltaNetEschaMoe(weights) => {
+                    for weight in [
+                        &weights.wqkv, &weights.wz, &weights.w_alpha, &weights.w_beta,
+                        &weights.wo, &weights.ffn.router,
+                    ] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+                LayerWeights::FullAttnEschaMoe(weights) => {
+                    for weight in [
+                        &weights.wq, &weights.wk, &weights.wv, &weights.wo, &weights.ffn.router,
+                    ] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
             }
         }
         (safe, unsafe_count)
@@ -1384,6 +1592,42 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     }
     for d in ffn.ep_dummy_buffers {
         let _ = gpu.free_tensor(d);
+    }
+}
+
+/// Free an Escha-W2 code-quant MoE FFN block (router/shared expert are dense;
+/// per-expert codes/rin/rout are owned GPU tensors; caches are drained).
+fn free_escha_moe_ffn(gpu: &mut Gpu, ffn: EschaMoeFfnWeights) {
+    ffn.router.free_all(gpu);
+    ffn.shared_expert_gate.free_all(gpu);
+    ffn.shared_expert.gate.free_all(gpu);
+    ffn.shared_expert.up.free_all(gpu);
+    ffn.shared_expert.down.free_all(gpu);
+    for t in ffn.gate_up_codes {
+        gpu.free_tensor(t).ok();
+    }
+    for t in ffn.down_codes {
+        gpu.free_tensor(t).ok();
+    }
+    for t in ffn.gate_up_rin {
+        gpu.free_tensor(t).ok();
+    }
+    for t in ffn.down_rin {
+        gpu.free_tensor(t).ok();
+    }
+    for t in ffn.gate_up_rout {
+        gpu.free_tensor(t).ok();
+    }
+    for t in ffn.down_rout {
+        gpu.free_tensor(t).ok();
+    }
+    let _ = gpu.free_tensor(ffn.gate_up_in_scale);
+    let _ = gpu.free_tensor(ffn.down_in_scale);
+    for t in ffn.folded_gate_up_cache.into_inner().into_iter().flatten() {
+        gpu.free_tensor(t).ok();
+    }
+    for t in ffn.folded_down_cache.into_inner().into_iter().flatten() {
+        gpu.free_tensor(t).ok();
     }
 }
 
