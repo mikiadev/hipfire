@@ -152,6 +152,10 @@ fn main() {
                 qwen35::LayerWeights::FullAttn(_) => eprint!("F"),
                 qwen35::LayerWeights::DeltaNetMoe(_) => eprint!("d"),
                 qwen35::LayerWeights::FullAttnMoe(_) => eprint!("f"),
+                qwen35::LayerWeights::DeltaNetEschaMoe(_) => eprint!("E"),
+                qwen35::LayerWeights::FullAttnEschaMoe(_) => eprint!("e"),
+                qwen35::LayerWeights::DeltaNetEscha(_) => eprint!("X"),
+                qwen35::LayerWeights::FullAttnEscha(_) => eprint!("x"),
             }
         }
         eprintln!("\nWeight loading: OK");

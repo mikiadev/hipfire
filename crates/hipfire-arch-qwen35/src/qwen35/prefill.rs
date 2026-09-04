@@ -397,6 +397,7 @@ fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
             .all(|weight| weight.gpu_dtype == DType::MQ4G256V2),
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
             LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => false,
+            LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => false,
         })
 }
 
@@ -700,6 +701,9 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                     mq3_in_moe = true;
                 }
             }
+            // Escha code-quant dense: all projections are int16 trellis codes —
+            // no WeightTensors, no MQ3/MQ3-Lloyd anywhere.
+            LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => {}
         }
     }
     // ANTIBLEED admit-vs-select fix: this guard rejects MQ3-in-dense when the
@@ -1939,6 +1943,13 @@ pub fn qwen35_layer_batch_admissible(
         LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => Err(
             HipError::new(0, "Escha code-quant MoE layers are not batched-prefill admissible"),
         ),
+        // Escha code-quant dense layers likewise run per-token decode-gemm
+        // (no batched decode kernels yet). Batched prefill drops to the
+        // per-token forward_scratch fallback.
+        LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => Err(HipError::new(
+            0,
+            "Escha code-quant dense layers are not batched-prefill admissible",
+        )),
     }
 }
 

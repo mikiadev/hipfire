@@ -71,22 +71,30 @@ fn main() {
 
     eprintln!("\n=== LOAD SUCCEEDED ===");
     eprintln!("Loaded {} layers:", weights.layers.len());
-    let mut counts = (0, 0, 0, 0);
+    let mut counts = (0usize, 0, 0, 0, 0, 0, 0, 0);
     for layer in &weights.layers {
         match layer {
             LayerWeights::DeltaNet(_) => counts.0 += 1,
             LayerWeights::FullAttn(_) => counts.1 += 1,
             LayerWeights::DeltaNetMoe(_) => counts.2 += 1,
             LayerWeights::FullAttnMoe(_) => counts.3 += 1,
+            LayerWeights::DeltaNetEschaMoe(_) => counts.4 += 1,
+            LayerWeights::FullAttnEschaMoe(_) => counts.5 += 1,
+            LayerWeights::DeltaNetEscha(_) => counts.6 += 1,
+            LayerWeights::FullAttnEscha(_) => counts.7 += 1,
         }
     }
     eprintln!("  DeltaNet (dense)    = {}", counts.0);
     eprintln!("  FullAttn (dense)    = {}", counts.1);
     eprintln!("  DeltaNet + MoE      = {}", counts.2);
     eprintln!("  FullAttn + MoE      = {}", counts.3);
+    eprintln!("  DeltaNet + EschaMoE = {}", counts.4);
+    eprintln!("  FullAttn + EschaMoE = {}", counts.5);
+    eprintln!("  DeltaNet + Escha    = {}", counts.6);
+    eprintln!("  FullAttn + Escha    = {}", counts.7);
     eprintln!(
         "\nAll {} expert tensors loaded successfully across {} MoE layers.",
-        config.num_experts * (counts.2 + counts.3) * 2,
-        counts.2 + counts.3
+        config.num_experts * (counts.2 + counts.3 + counts.4 + counts.5) * 2,
+        counts.2 + counts.3 + counts.4 + counts.5
     );
 }

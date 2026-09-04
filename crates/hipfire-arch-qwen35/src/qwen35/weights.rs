@@ -395,6 +395,84 @@ pub struct EschaMoeFfnWeights {
     pub folded_down_cache: std::cell::RefCell<Vec<Option<GpuTensor>>>,
 }
 
+// ─── Escha-W2 code-quant dense (ESCHA) weights ──────────────────────────
+//
+// Qwen3.8-27B-Escha-W2 keeps EVERY linear projection (attention + FFN alike)
+// in the int16 EXL3-trellis code with per-channel f16 rin/rout rotations and
+// f32 s_in/s_out scales. No projection is ever materialized to fp16/fp32:
+// the decode-gemm kernels decode the 16×16 tiles in-kernel per token.
+//
+// Scale math (matching higgs `escha_ref.reconstruct`, variant "both_outside",
+// and llama.cpp's dense `escha_rotate_in_dense` / `escha_finalize_dense`):
+//
+//   W[out,in] = (H_out( H_in( decode(code) ) ) . r_out.s_out)[out] ... [in]
+//   y = (rout . s_out) ⊙ H_out( (H_in( x . rin . s_in )) @ decode(code) )
+//
+// So the loader folds `in_scale = rin . s_in` (pre-input-WHT activation
+// scale) and `out_scale = rout . s_out` (post-output-WHT scale) into two f32
+// vectors per projection; the kernel applies them around the two blockwise-128
+// Sylvester-Hadamard passes. Bias tensors exist in the export but are NOT
+// applied — llama.cpp's ESCHA_APPLY_BIAS=0 matches escha's own runtime
+// (quality-neutral by their measurement) and we mirror that reference.
+
+/// One Escha-coded dense projection (attention q/k/v/o, linear-attn
+/// qkv/z/out, or FFN gate/up/down). The weight stays compressed on GPU.
+pub struct EschaDenseProjWeights {
+    /// Int16 trellis codes, `[in/16, out/16, 16*K]` (bitwise F16 tensor,
+    /// 2 bytes/element — same trick as the MoE code upload).
+    pub code: GpuTensor,
+    /// `[in]` f32 = `rin . s_in` — pre-input-WHT activation scale.
+    pub in_scale: GpuTensor,
+    /// `[out]` f32 = `rout . s_out` — post-output-WHT output scale.
+    pub out_scale: GpuTensor,
+    /// Logical feature dims (no padding: dense projections are 16/128-aligned).
+    pub in_p: usize,
+    pub out_p: usize,
+    /// Trellis bit-width parameter (2 or 3).
+    pub k: u8,
+}
+
+impl EschaDenseProjWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.code);
+        let _ = gpu.free_tensor(self.in_scale);
+        let _ = gpu.free_tensor(self.out_scale);
+    }
+}
+
+/// DeltaNet (linear-attention) layer whose projections are all Escha-coded.
+pub struct DeltaNetEschaLayerWeights {
+    pub attn_norm: GpuTensor,
+    pub qkv: EschaDenseProjWeights, // linear_attn.in_proj_qkv: dim -> k*2+v
+    pub z: EschaDenseProjWeights,   // linear_attn.in_proj_z: dim -> v
+    pub w_alpha: WeightTensor,      // linear_attn.in_proj_a: dense f16
+    pub w_beta: WeightTensor,       // linear_attn.in_proj_b: dense f16
+    pub a_log: GpuTensor,
+    pub dt_bias: GpuTensor,
+    pub conv_weight: GpuTensor,
+    pub norm_weight: GpuTensor,
+    pub wo: EschaDenseProjWeights, // linear_attn.out_proj: v -> dim
+    pub ffn_norm: GpuTensor,
+    pub w_gate: EschaDenseProjWeights, // mlp.gate_proj (K=2)
+    pub w_up: EschaDenseProjWeights,   // mlp.up_proj (K=3)
+    pub w_down: EschaDenseProjWeights, // mlp.down_proj (K=3)
+}
+
+/// Full-attention (gated) layer whose projections are all Escha-coded.
+pub struct FullAttnEschaLayerWeights {
+    pub attn_norm: GpuTensor,
+    pub wq: EschaDenseProjWeights, // self_attn.q_proj (query+gate)
+    pub wk: EschaDenseProjWeights,
+    pub wv: EschaDenseProjWeights,
+    pub wo: EschaDenseProjWeights,
+    pub q_norm: GpuTensor,
+    pub k_norm: GpuTensor,
+    pub ffn_norm: GpuTensor,
+    pub w_gate: EschaDenseProjWeights, // mlp.gate_proj (K=2)
+    pub w_up: EschaDenseProjWeights,   // mlp.up_proj (K=3)
+    pub w_down: EschaDenseProjWeights, // mlp.down_proj (K=3)
+}
+
 /// DeltaNet (linear-attention) layer with an Escha code-quant MoE FFN.
 pub struct DeltaNetEschaMoeLayerWeights {
     pub attn_norm: GpuTensor,
@@ -437,6 +515,10 @@ pub enum LayerWeights {
     // FFN routed experts are int16 trellis codes (decode+fold on GPU).
     DeltaNetEschaMoe(DeltaNetEschaMoeLayerWeights),
     FullAttnEschaMoe(FullAttnEschaMoeLayerWeights),
+    // Escha-W2 (ESCHA) code-quant DENSE: every linear projection is an int16
+    // trellis code, decoded in-kernel per token (Qwen3.8-27B-Escha-W2 etc.).
+    DeltaNetEscha(DeltaNetEschaLayerWeights),
+    FullAttnEscha(FullAttnEschaLayerWeights),
 }
 /// Immutable source identity captured before any EP GPU allocation.
 /// Exact equality over canonical path, platform file identity (dev, ino),
@@ -738,6 +820,63 @@ pub enum Qwen35LayerSeal {
         ffn_norm: GpuTensorDescriptor,
         moe: Qwen35MoeFfnSeal,
     },
+    /// Escha-W2 code-quant dense DeltaNet layer. Seal is EP-only; Escha dense
+    /// is single-GPU and never EP-attested, so the seal carries shape/dtype of
+    /// the coded projections for completeness.
+    DeltaNetEscha {
+        attn_norm: GpuTensorDescriptor,
+        qkv: EschaDenseProjSeal,
+        z: EschaDenseProjSeal,
+        w_alpha: WeightTensorDescriptor,
+        w_beta: WeightTensorDescriptor,
+        a_log: GpuTensorDescriptor,
+        dt_bias: GpuTensorDescriptor,
+        conv_weight: GpuTensorDescriptor,
+        norm_weight: GpuTensorDescriptor,
+        wo: EschaDenseProjSeal,
+        ffn_norm: GpuTensorDescriptor,
+        w_gate: EschaDenseProjSeal,
+        w_up: EschaDenseProjSeal,
+        w_down: EschaDenseProjSeal,
+    },
+    /// Escha-W2 code-quant dense FullAttention layer.
+    FullAttnEscha {
+        attn_norm: GpuTensorDescriptor,
+        wq: EschaDenseProjSeal,
+        wk: EschaDenseProjSeal,
+        wv: EschaDenseProjSeal,
+        wo: EschaDenseProjSeal,
+        q_norm: GpuTensorDescriptor,
+        k_norm: GpuTensorDescriptor,
+        ffn_norm: GpuTensorDescriptor,
+        w_gate: EschaDenseProjSeal,
+        w_up: EschaDenseProjSeal,
+        w_down: EschaDenseProjSeal,
+    },
+}
+
+/// Device-pointer-free seal of one Escha-coded dense projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EschaDenseProjSeal {
+    pub code: GpuTensorDescriptor,
+    pub in_scale: GpuTensorDescriptor,
+    pub out_scale: GpuTensorDescriptor,
+    pub in_p: usize,
+    pub out_p: usize,
+    pub k: u8,
+}
+
+impl EschaDenseProjSeal {
+    pub fn from_proj(p: &EschaDenseProjWeights) -> Self {
+        Self {
+            code: GpuTensorDescriptor::from_tensor(&p.code),
+            in_scale: GpuTensorDescriptor::from_tensor(&p.in_scale),
+            out_scale: GpuTensorDescriptor::from_tensor(&p.out_scale),
+            in_p: p.in_p,
+            out_p: p.out_p,
+            k: p.k,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -976,6 +1115,35 @@ impl Qwen35RankSeal {
                         global_expert_dtypes: None,
                         num_local_experts: w.ffn.num_experts,
                     },
+                },
+                LayerWeights::DeltaNetEscha(w) => Qwen35LayerSeal::DeltaNetEscha {
+                    attn_norm: GpuTensorDescriptor::from_tensor(&w.attn_norm),
+                    qkv: EschaDenseProjSeal::from_proj(&w.qkv),
+                    z: EschaDenseProjSeal::from_proj(&w.z),
+                    w_alpha: WeightTensorDescriptor::from_weight(&w.w_alpha),
+                    w_beta: WeightTensorDescriptor::from_weight(&w.w_beta),
+                    a_log: GpuTensorDescriptor::from_tensor(&w.a_log),
+                    dt_bias: GpuTensorDescriptor::from_tensor(&w.dt_bias),
+                    conv_weight: GpuTensorDescriptor::from_tensor(&w.conv_weight),
+                    norm_weight: GpuTensorDescriptor::from_tensor(&w.norm_weight),
+                    wo: EschaDenseProjSeal::from_proj(&w.wo),
+                    ffn_norm: GpuTensorDescriptor::from_tensor(&w.ffn_norm),
+                    w_gate: EschaDenseProjSeal::from_proj(&w.w_gate),
+                    w_up: EschaDenseProjSeal::from_proj(&w.w_up),
+                    w_down: EschaDenseProjSeal::from_proj(&w.w_down),
+                },
+                LayerWeights::FullAttnEscha(w) => Qwen35LayerSeal::FullAttnEscha {
+                    attn_norm: GpuTensorDescriptor::from_tensor(&w.attn_norm),
+                    wq: EschaDenseProjSeal::from_proj(&w.wq),
+                    wk: EschaDenseProjSeal::from_proj(&w.wk),
+                    wv: EschaDenseProjSeal::from_proj(&w.wv),
+                    wo: EschaDenseProjSeal::from_proj(&w.wo),
+                    q_norm: GpuTensorDescriptor::from_tensor(&w.q_norm),
+                    k_norm: GpuTensorDescriptor::from_tensor(&w.k_norm),
+                    ffn_norm: GpuTensorDescriptor::from_tensor(&w.ffn_norm),
+                    w_gate: EschaDenseProjSeal::from_proj(&w.w_gate),
+                    w_up: EschaDenseProjSeal::from_proj(&w.w_up),
+                    w_down: EschaDenseProjSeal::from_proj(&w.w_down),
                 },
             })
             .collect();
@@ -1346,6 +1514,35 @@ impl Qwen35Weights {
                     let _ = gpu.free_tensor(l.ffn_norm);
                     free_escha_moe_ffn(gpu, l.ffn);
                 }
+                LayerWeights::DeltaNetEscha(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.qkv.free_gpu(gpu);
+                    l.z.free_gpu(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    l.wo.free_gpu(gpu);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    l.w_gate.free_gpu(gpu);
+                    l.w_up.free_gpu(gpu);
+                    l.w_down.free_gpu(gpu);
+                }
+                LayerWeights::FullAttnEscha(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wq.free_gpu(gpu);
+                    l.wk.free_gpu(gpu);
+                    l.wv.free_gpu(gpu);
+                    l.wo.free_gpu(gpu);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    l.w_gate.free_gpu(gpu);
+                    l.w_up.free_gpu(gpu);
+                    l.w_down.free_gpu(gpu);
+                }
             }
         }
         // MAD-93 v0.1: in paged mode, the pager owns expert weight allocations
@@ -1455,6 +1652,35 @@ impl Qwen35Weights {
                     let _ = gpu.free_tensor(l.ffn_norm);
                     free_escha_moe_ffn(gpu, l.ffn);
                 }
+                LayerWeights::DeltaNetEscha(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.qkv.free_gpu(gpu);
+                    l.z.free_gpu(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    l.wo.free_gpu(gpu);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    l.w_gate.free_gpu(gpu);
+                    l.w_up.free_gpu(gpu);
+                    l.w_down.free_gpu(gpu);
+                }
+                LayerWeights::FullAttnEscha(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wq.free_gpu(gpu);
+                    l.wk.free_gpu(gpu);
+                    l.wv.free_gpu(gpu);
+                    l.wo.free_gpu(gpu);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    l.w_gate.free_gpu(gpu);
+                    l.w_up.free_gpu(gpu);
+                    l.w_down.free_gpu(gpu);
+                }
             }
         }
     }
@@ -1541,6 +1767,16 @@ impl MmqScreenable for Qwen35Weights {
                         screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
                     }
                 }
+                // Escha-coded dense layers hold only w_alpha/w_beta (and
+                // possibly the router in EschaMoE) as WeightTensors; every
+                // coded projection is code/scale GpuTensors that are never
+                // MQ4 — screen the two dense small projections if present.
+                LayerWeights::DeltaNetEscha(weights) => {
+                    for weight in [&weights.w_alpha, &weights.w_beta] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+                LayerWeights::FullAttnEscha(_weights) => {}
             }
         }
         (safe, unsafe_count)

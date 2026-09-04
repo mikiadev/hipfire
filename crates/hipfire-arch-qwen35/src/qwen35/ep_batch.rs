@@ -652,6 +652,13 @@ pub fn validate_ep_batch_compatibility(
                         "EP batch: Escha code-quant MoE not supported",
                     ))
                 }
+                // Escha code-quant dense never runs EP either.
+                LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => {
+                    return Err(HipError::new(
+                        0,
+                        "EP batch: Escha code-quant dense not supported",
+                    ))
+                }
             }
         }
     }
@@ -4204,6 +4211,7 @@ pub fn forward_prefill_batch_multi(
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => moe_topk_ok,
             // Escha layers never take the batched EP path.
             LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => false,
+            LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => false,
         });
 
     if !eligible {

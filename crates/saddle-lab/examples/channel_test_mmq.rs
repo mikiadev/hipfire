@@ -375,6 +375,29 @@ fn get_weight_for_site<'a>(
             "residual" => Some(&l.wo),
             _ => None,
         },
+        // Escha-coded layers expose no WeightTensors for the FFN/attention
+        // projections (code/scale GpuTensors) — not comparable via this tool.
+        LayerWeights::DeltaNetEschaMoe(l) => match site_name {
+            "qkvza.qkv" => Some(&l.wqkv),
+            "qkvza.z" => Some(&l.wz),
+            "qkvza.beta" => Some(&l.w_beta),
+            "qkvza.alpha" => Some(&l.w_alpha),
+            "residual" => Some(&l.wo),
+            _ => None,
+        },
+        LayerWeights::FullAttnEschaMoe(l) => match site_name {
+            "qkv.q" => Some(&l.wq),
+            "qkv.k" => Some(&l.wk),
+            "qkv.v" => Some(&l.wv),
+            "residual" => Some(&l.wo),
+            _ => None,
+        },
+        LayerWeights::DeltaNetEscha(l) => match site_name {
+            "qkvza.beta" => Some(&l.w_beta),
+            "qkvza.alpha" => Some(&l.w_alpha),
+            _ => None,
+        },
+        LayerWeights::FullAttnEscha(_) => None,
     }
 }
 
@@ -408,6 +431,10 @@ fn sites_for_layer(layer: &hipfire_arch_qwen35::qwen35::LayerWeights) -> &'stati
             "residual",
         ],
         LayerWeights::FullAttnMoe(_) => &["qkv.q", "qkv.k", "qkv.v", "residual"],
+        LayerWeights::DeltaNetEschaMoe(_) => &["qkvza.qkv", "qkvza.z", "residual"],
+        LayerWeights::FullAttnEschaMoe(_) => &["qkv.q", "qkv.k", "qkv.v", "residual"],
+        LayerWeights::DeltaNetEscha(_) => &["qkvza.beta", "qkvza.alpha"],
+        LayerWeights::FullAttnEscha(_) => &[],
     }
 }
 

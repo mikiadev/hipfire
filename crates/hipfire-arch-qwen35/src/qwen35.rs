@@ -58,10 +58,11 @@ pub(crate) use prefill::{
     run_plain_gemm_key, run_residual_gemm_key,
 };
 pub use weights::{
-    mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetEschaMoeLayerWeights,
-    DeltaNetState, EschaMoeFfnWeights, ExpertWeights, FullAttnLayerWeights,
-    FullAttnMoeLayerWeights, FullAttnEschaMoeLayerWeights, GpuTensorDescriptor, LayerWeights,
-    MoeFfnWeights, MoeParoSidecars, ParoDescriptor, Qwen35EpConfigFingerprint, Qwen35EpShardInfo,
+    mixed_expert_tag, DeltaNetEschaLayerWeights, DeltaNetLayerWeights, DeltaNetMoeLayerWeights,
+    DeltaNetEschaMoeLayerWeights, DeltaNetState, EschaDenseProjSeal, EschaDenseProjWeights,
+    EschaMoeFfnWeights, ExpertWeights, FullAttnEschaLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
+    FullAttnEschaMoeLayerWeights, GpuTensorDescriptor, LayerWeights, MoeFfnWeights,
+    MoeParoSidecars, ParoDescriptor, Qwen35EpConfigFingerprint, Qwen35EpShardInfo,
     Qwen35HfqSourceIdentity, Qwen35LayerSeal, Qwen35LocalExpertDescriptor, Qwen35MoeFfnSeal,
     Qwen35RankSeal, Qwen35Weights, SharedExpertWeights, StateQuant, WeightTensorDescriptor,
 };

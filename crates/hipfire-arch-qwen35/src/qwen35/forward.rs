@@ -1970,14 +1970,19 @@ fn forward_scratch_layers(
     // the non-Escha discriminants — Escha layers would fall through to the
     // `_` fallback and error. The hand-written arms below handle Escha (the
     // FFN runs through the escham trellis/grouped kernels instead of
-    // moe_ffn_dispatch). Route Escha models through the hand path.
+    // moe_ffn_dispatch). Route Escha models through the hand path. Escha
+    // code-quant DENSE layers likewise have no lowered-path programs (their
+    // projections are code/scale GpuTensors, not WeightTensors).
     let has_escham = weights
         .layers
         .iter()
         .any(|lw| {
             matches!(
                 lw,
-                LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_)
+                LayerWeights::DeltaNetEschaMoe(_)
+                    | LayerWeights::FullAttnEschaMoe(_)
+                    | LayerWeights::DeltaNetEscha(_)
+                    | LayerWeights::FullAttnEscha(_)
             )
         });
     if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() && !has_escham {
@@ -4995,8 +5000,8 @@ pub(crate) enum Q35Variant {
 
 pub(crate) fn variant_of(layer: &LayerWeights) -> Q35Variant {
     match layer {
-        LayerWeights::DeltaNet(_) => Q35Variant::DeltaNet,
-        LayerWeights::FullAttn(_) => Q35Variant::FullAttn,
+        LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetEscha(_) => Q35Variant::DeltaNet,
+        LayerWeights::FullAttn(_) | LayerWeights::FullAttnEscha(_) => Q35Variant::FullAttn,
         LayerWeights::DeltaNetMoe(_) | LayerWeights::DeltaNetEschaMoe(_) => Q35Variant::DeltaNetMoe,
         LayerWeights::FullAttnMoe(_) | LayerWeights::FullAttnEschaMoe(_) => Q35Variant::FullAttnMoe,
     }
@@ -5409,6 +5414,15 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                             GemvInput::Raw(&s.dn_normed)
                         };
                         (&l.wo, input)
+                    }
+                    // Escha dense layers never run the lowered executor (the
+                    // hand path handles them); their coded projections are not
+                    // WeightTensors. Refuse loudly rather than mis-decode.
+                    LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => {
+                        return Err(HipError::new(
+                            0,
+                            "RESID_WO on Escha code-quant dense layer (lowered path unsupported)",
+                        ));
                     }
                 };
                 let wr = wo.dispatch_ref();
@@ -6238,6 +6252,8 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
         LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => false,
         // Escha code-quant MoE: not MQ4 — never eligible for the MQ4 path.
         LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => false,
+        // Escha code-quant dense: not MQ4 either.
+        LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => false,
     })
 }
 
@@ -6275,6 +6291,9 @@ fn forward_scratch_layers_lowered(
                 LayerWeights::DeltaNetEschaMoe(l) => &l.attn_norm,
                 LayerWeights::FullAttnEschaMoe(l) => &l.attn_norm,
                 LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => {
+                    unreachable!("moe_combine_next_rms_enabled admits only all-MoE models")
+                }
+                LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => {
                     unreachable!("moe_combine_next_rms_enabled admits only all-MoE models")
                 }
             };

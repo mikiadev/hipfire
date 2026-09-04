@@ -83,6 +83,10 @@ fn main() {
             qwen35::LayerWeights::FullAttn(l) => &l.attn_norm,
             qwen35::LayerWeights::DeltaNetMoe(l) => &l.attn_norm,
             qwen35::LayerWeights::FullAttnMoe(l) => &l.attn_norm,
+            qwen35::LayerWeights::DeltaNetEschaMoe(l) => &l.attn_norm,
+            qwen35::LayerWeights::FullAttnEschaMoe(l) => &l.attn_norm,
+            qwen35::LayerWeights::DeltaNetEscha(l) => &l.attn_norm,
+            qwen35::LayerWeights::FullAttnEscha(l) => &l.attn_norm,
         };
         let attr = gpus.devices[dev_idx]
             .hip
