@@ -609,22 +609,23 @@ impl<'a> EschaSource<'a> {
                     wk: self.escha_load_dense_proj(gpu, &p, "self_attn.k_proj", dim, kv_dim)?,
                     wv: self.escha_load_dense_proj(gpu, &p, "self_attn.v_proj", dim, kv_dim)?,
                     wo: self.escha_load_dense_proj(gpu, &p, "self_attn.o_proj", o_in, dim)?,
-                    // q/k norms are stored as TRUE gamma in the dense export
-                    // (raw mean ~0.23), NOT as gamma-1 offsets like the layer
-                    // norms — so load them with bias 0.0.
+                    // q/k norms: the GGUF reference conversion adds +1 to every
+                    // norm EXCEPT linear_attn.norm (conversion/qwen.py), so the
+                    // reference runtime runs q/k with (raw + 1) — gamma-1
+                    // storage like the layer norms. Load with bias 1.0.
                     q_norm: paro_load_norm(
                         self.source,
                         gpu,
                         &format!("{p}.self_attn.q_norm.weight"),
                         &[config.head_dim],
-                        0.0,
+                        1.0,
                     )?,
                     k_norm: paro_load_norm(
                         self.source,
                         gpu,
                         &format!("{p}.self_attn.k_norm.weight"),
                         &[config.head_dim],
-                        0.0,
+                        1.0,
                     )?,
                     ffn_norm,
                     w_gate,
