@@ -467,7 +467,7 @@ pub fn escha_dense_decode_proj_batch(
     // Rotate: u = T128(x . in_scale)
     let u = gpu.alloc_tensor(&[n_rows * ic], DType::F32)?;
     rdna_compute::escha_dense::escha_dense_rotate_in_dense(
-        gpu, &proj.in_scale, x_batch, &u, n_rows,
+        gpu, &proj.in_scale, x_batch, &u, n_rows, ic,
     )?;
 
     // Matmul: partial = u @ decode(code)

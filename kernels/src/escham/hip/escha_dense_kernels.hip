@@ -271,7 +271,7 @@ extern "C" __global__ void escha_dense_finalize_kernel(
 
 // u[row] = T128(x[row] * in_scale) -- batched, chunked (IC up to 17408).
 // One block per row, 256 threads.
-__global__ void escha_dense_rotate_in_dense_kernel(
+extern "C" __global__ void escha_dense_rotate_in_dense_kernel(
     const float* __restrict__ in_scale, // [IC]
     const float* __restrict__ x,        // [n_rows, IC]
     float* __restrict__ u,              // [n_rows, IC]
@@ -301,7 +301,7 @@ __global__ void escha_dense_rotate_in_dense_kernel(
 // partial[slice][row][c] = sum over this slice's input tiles of u . decode(code)
 // R rows per block. Decoded weights go to shared memory for reuse across rows.
 // R is a runtime parameter (1 for gen, 64 for prefill).
-__global__ void escha_dense_matmul_prefill_kernel(
+extern "C" __global__ void escha_dense_matmul_prefill_kernel(
     const int16_t* __restrict__ code,    // [in/16, out/16, 16*K] i16
     const float* __restrict__ u,         // [n_rows, IC]
     float* __restrict__ partial,         // [n_slices * n_rows * OC]

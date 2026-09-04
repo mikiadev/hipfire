@@ -223,6 +223,7 @@ pub fn escha_dense_rotate_in_dense(
     x: &GpuTensor,
     u: &GpuTensor,
     n_rows: usize,
+    ic: usize,
 ) -> HipResult<()> {
     gpu.bind_thread()?;
     gpu.ensure_kernel(
@@ -233,14 +234,14 @@ pub fn escha_dense_rotate_in_dense(
     let sp = in_scale.buf.as_ptr();
     let xp = x.buf.as_ptr();
     let up = u.buf.as_ptr();
-    let ic = u.shape.last().copied().unwrap_or(x.numel() / n_rows.max(1)) as i32;
+    let ic_i = ic as i32;
     let n_rows_i = n_rows as i32;
 
     let mut params: Vec<*mut c_void> = vec![
         &sp as *const _ as *mut c_void,
         &xp as *const _ as *mut c_void,
         &up as *const _ as *mut c_void,
-        &ic as *const _ as *mut c_void,
+        &ic_i as *const _ as *mut c_void,
         &n_rows_i as *const _ as *mut c_void,
     ];
     gpu.launch_maybe_blob(
@@ -254,7 +255,7 @@ pub fn escha_dense_rotate_in_dense(
             b.push_ptr(sp);
             b.push_ptr(xp);
             b.push_ptr(up);
-            b.push_i32(ic);
+            b.push_i32(ic_i);
             b.push_i32(n_rows_i);
             b
         },
