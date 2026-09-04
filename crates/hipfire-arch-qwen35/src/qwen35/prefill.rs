@@ -1943,13 +1943,55 @@ pub fn qwen35_layer_batch_admissible(
         LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => Err(
             HipError::new(0, "Escha code-quant MoE layers are not batched-prefill admissible"),
         ),
-        // Escha code-quant dense layers likewise run per-token decode-gemm
-        // (no batched decode kernels yet). Batched prefill drops to the
-        // per-token forward_scratch fallback.
-        LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => Err(HipError::new(
-            0,
-            "Escha code-quant dense layers are not batched-prefill admissible",
-        )),
+        // Escha code-quant dense layers now have batched prefill support
+        // (rotate_in_dense + matmul_prefill + finalize_dense kernels).
+        // They are batchable when the batched flag is on and the model has
+        // DeltaNet layers (the LA/FA shape checks below apply).
+        LayerWeights::DeltaNetEscha(l) => {
+            // Shape checks mirror the DeltaNet arm above
+            if l.attn_norm.shape != vec![dim] {
+                return Err(HipError::new(0, "DeltaNetEscha attn_norm shape mismatch"));
+            }
+            if l.a_log.shape != vec![config.linear_num_value_heads] {
+                return Err(HipError::new(0, "DeltaNetEscha a_log shape mismatch"));
+            }
+            if l.dt_bias.shape != vec![config.linear_num_value_heads] {
+                return Err(HipError::new(0, "DeltaNetEscha dt_bias shape mismatch"));
+            }
+            if l.conv_weight.shape != vec![conv_elems] {
+                return Err(HipError::new(0, "DeltaNetEscha conv_weight shape mismatch"));
+            }
+            if l.norm_weight.shape != vec![config.linear_value_head_dim] {
+                return Err(HipError::new(0, "DeltaNetEscha norm_weight shape mismatch"));
+            }
+            if l.ffn_norm.shape != vec![dim] {
+                return Err(HipError::new(0, "DeltaNetEscha ffn_norm shape mismatch"));
+            }
+            // w_alpha / w_beta are WeightTensors (dense f16), not Escha-coded
+            if l.w_alpha.m != config.linear_num_value_heads || l.w_alpha.k != dim {
+                return Err(HipError::new(0, "DeltaNetEscha w_alpha shape mismatch"));
+            }
+            if l.w_beta.m != config.linear_num_value_heads || l.w_beta.k != dim {
+                return Err(HipError::new(0, "DeltaNetEscha w_beta shape mismatch"));
+            }
+            Ok(())
+        }
+        LayerWeights::FullAttnEscha(l) => {
+            // Shape checks mirror the FullAttn arm above
+            if l.attn_norm.shape != vec![dim] {
+                return Err(HipError::new(0, "FullAttnEscha attn_norm shape mismatch"));
+            }
+            if l.q_norm.shape != vec![config.head_dim] {
+                return Err(HipError::new(0, "FullAttnEscha q_norm shape mismatch"));
+            }
+            if l.k_norm.shape != vec![config.head_dim] {
+                return Err(HipError::new(0, "FullAttnEscha k_norm shape mismatch"));
+            }
+            if l.ffn_norm.shape != vec![dim] {
+                return Err(HipError::new(0, "FullAttnEscha ffn_norm shape mismatch"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2493,7 +2535,7 @@ pub fn prefill_batch_pbs_eligible(
     let has_dn = weights
         .layers
         .iter()
-        .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),));
+        .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_) | LayerWeights::DeltaNetEscha(_),));
     let all_layers_ok = weights.layers.iter().all(|lw| {
         if matches!(
             lw,
