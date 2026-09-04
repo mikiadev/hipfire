@@ -3012,9 +3012,9 @@ fn forward_scratch_layers(
                 mx = mx.max(l as f64);
             }
             eprintln!(
-                "[escha-dense] pos {pos} logits: n={} mean={mean:.4} range=[{mn:.2},{mx:.2}] top5={:?}",
+                "[escha-dense] pos {pos} logits: n={} mean={mean:.4} range=[{mn:.2},{mx:.2}] top30={:?}",
                 logits.len(),
-                &idx[..5.min(idx.len())]
+                &idx[..30.min(idx.len())]
             );
         }
     }

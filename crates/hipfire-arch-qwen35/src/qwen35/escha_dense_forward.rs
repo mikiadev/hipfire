@@ -32,8 +32,10 @@ fn entry_probe(gpu: &Gpu, layer_idx: usize, s: &Qwen35Scratch, kind: &str) {
     if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_none() {
         return;
     }
-    if layer_idx % 16 != 0 && layer_idx != 63 {
-        return;
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE_ALL").is_none() {
+        if layer_idx % 16 != 0 && layer_idx != 63 {
+            return;
+        }
     }
     if let Ok(v) = gpu.download_f32(&s.x) {
         let (mut mn, mut mx, mut rms) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
