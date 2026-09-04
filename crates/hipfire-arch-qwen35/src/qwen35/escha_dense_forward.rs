@@ -460,8 +460,16 @@ pub fn escha_dense_decode_proj_batch(
     let oc = proj.out_p;
     let k = proj.k as i32;
     let nit = ic / 16;
-    let r = if n_rows <= 1 { 1 } else { 64 };
-    let n_slices = rdna_compute::escha_dense::escha_dense_n_slices_prefill(nit, oc, n_rows);
+    // R = rows per block. The kernel accumulates R rows in a block; choosing
+    // R = min(n_rows, 64) avoids wasted work when n_rows < 64 (the old R=64
+    // default did 64x the accumulator work for n_rows=4). R must be a power
+    // of 2 for the Hadamard-friendly tiling, and <= 64 (kernel acc[64] size).
+    let r = if n_rows <= 1 {
+        1
+    } else {
+        n_rows.next_power_of_two().min(64) as i32
+    };
+    let n_slices = rdna_compute::escha_dense::escha_dense_n_slices_prefill(nit, oc, n_rows, r);
     debug_assert!(n_slices >= 1);
 
     // Rotate: u = T128(x . in_scale)

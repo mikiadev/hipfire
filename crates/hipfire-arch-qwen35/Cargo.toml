@@ -58,3 +58,8 @@ required-features = ["deltanet"]
 name = "qwen_dense_tp2_parity"
 path = "examples/qwen_dense_tp2_parity.rs"
 required-features = ["deltanet"]
+
+[[example]]
+name = "profile_escha_dense_prefill"
+path = "examples/profile_escha_dense_prefill.rs"
+required-features = ["deltanet"]

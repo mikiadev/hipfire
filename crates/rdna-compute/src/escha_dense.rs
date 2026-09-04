@@ -388,14 +388,20 @@ pub fn escha_dense_finalize_dense(
     )
 }
 
-/// Choose the IC-slice count for prefill: target ~512 blocks at batch 1,
-/// but long prompts already have plenty of rows.
-pub fn escha_dense_n_slices_prefill(nit: usize, oc: usize, n_rows: usize) -> usize {
+/// Choose the IC-slice count for prefill. The matmul kernel's per-block work
+/// scales as (nit / n_slices) * R (R rows accumulated per block), so to keep
+/// per-block work bounded as n_rows grows, n_slices must grow with R.
+/// Grid = [ceil(n_rows/R), OC/128, n_slices]. Target: per-block work ≈ constant.
+pub fn escha_dense_n_slices_prefill(nit: usize, oc: usize, n_rows: usize, r: i32) -> usize {
     let n_ocb = (oc / 128).max(1);
-    let n_rb = (n_rows + 63) / 64; // R=64
-    let target = 512;
-    let mut n_slices = target / n_rb.max(1) / n_ocb.max(1);
-    n_slices = n_slices.max(1).min(nit);
+    let n_rb = (n_rows as i32 + r - 1) / r.max(1);
+    // Keep per-block work ≈ constant: each block handles (nit/n_slices) tiles * R rows.
+    // Target total blocks ≈ 512-1024 for the whole grid.
+    let target_blocks = if n_rows <= 4 { 1024 } else { 512 };
+    let mut n_slices = target_blocks / n_rb.max(1) as usize / n_ocb.max(1);
+    // Scale n_slices with R to keep per-block work bounded: more rows per block =
+    // more FMAs per block, so we need more slices to compensate.
+    n_slices = n_slices.max((r as usize).max(1)).min(nit);
     // Ensure nit is divisible by n_slices
     while n_slices < nit && nit % n_slices != 0 {
         n_slices += 1;
