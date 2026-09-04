@@ -150,20 +150,38 @@ accumulates). Framework notes:
   (Escha layers are batched-prefill inadmissible by design on this tree).
 
 **Next debugging steps (in priority order):**
-1. Compare the Escha-MoE DeltaNet dims (linear_num_value_heads=32, conv 8192,
-   qkv 8192, kd 2048, vd 4096) against the A3B-HFQ config the fresh tree's
-   gated_delta_net kernels were validated on — check for a head-count or
-   HD-128/TILE_ROWS assumption mismatch.
-2. Isolate the DeltaNet arm: run the Escha model's layer-0 linear-attn forward
-   vs a numpy reference (beta's 19-token oracle) to pin where state diverges.
-3. Check the KV/state indexing for the hybrid (10 full-attn of 40 layers) —
-   kv_layer_idx/delta_layer_idx counters and `Mask` KV-layer layout must match
-   the Escha layer_types pattern (48/16 for dense; 30/10 for the MoE).
-4. If DeltaNet is fine, suspect the FFN's effect on state: the router D2H per
-   token is capture-hostile but correct in AR; verify the grouped-down output
-   feeds the *next* token's recurrent state only via the residual (it does).
+1. ✅ RESOLVED (b967a721): the routed-FFN cache fill passed the whole stacked
+   per-expert input scale to escham_apply_rowcol_scales_f32, so every expert
+   was folded with expert 0's s_in·rin. Fix: slice per-expert
+   `sub_offset(exp_idx*in_p, in_p)` like beta. MoE decode is now coherent.
 
 Open questions: s_in/s_out role (dense), config [6] meaning, whether Qwen3.5
 dense attention path on master can host an escha-coded wqkv/qkv with minimal
 surgery, and the split of "int8 dense attention kept f32" perf fix vs a real
 fp16/int8 gemv path.
+
+## A5 — MoE coherent on the fresh tree (2026-09-04, commit b967a721)
+
+Root cause of the A4 decode collapse: per-expert input-scale slicing in the
+routed-FFN cache fill (escha_ffn.rs ~144) — the WHOLE stacked
+`gate_up_in_scale [n_exp, dim]` / `down_in_scale [n_exp, mi]` was handed to
+`escham_apply_rowcol_scales_f32`, whose kernel reads `in_scale[j], j < in_p`,
+so every expert ≠ 0 was folded with expert 0's s_in·rin. The export's rin/s_in
+are genuinely per-expert (rel diff vs e0 ≈1.3 e1 / ≈1.5 e200). Fixed by
+binding per-expert sub_offset slices before the absorb (mirrors beta
+qwen35.rs:14887/14913). The single-expert verification examples never caught
+it because they fed already-sliced host uploads.
+
+Verified coherent on gfx1151 (ROCm 10 / therock), reasoning off
+(`hipfire config set reasoning.mode off`), temp 0:
+- "The capital of France is" → "The capital of France is **Paris**." (9 tok,
+  finish stop) — token ids byte-identical to the HFQ A3B control
+  (`qwen3.6-35b-a3b.mq4r`): 760,6511,314,9338,369,2972,57590,159034,248046.
+- Japan → Tokyo (fluent 40-token continuation); ocean haiku (proper form,
+  stop); `def is_prime(n):` → clean ```python fence (40 tok).
+- ~4–7 tok/s at temp 0 on Strix Halo gfx1151 (decode-bandwidth-bound, per
+  the handoff's analysis).
+Control: HFQ A3B MoE (qwen3.6-35b-a3b.mq4r) decodes perfectly on this tree
+— the shared DeltaNet/attention/MoE + framework path is exonerated.
+bin md5 (this milestone): hipfire be74e7222dc28905940dd2d5bbd736d8,
+daemon d901b59967c77cafc564747c71449cc1.
