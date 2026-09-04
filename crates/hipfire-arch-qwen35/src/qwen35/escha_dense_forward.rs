@@ -202,6 +202,10 @@ pub fn deltanet_escha_layer_forward(
     stats(gpu, "post LA residual", &s.x);
 
     // ── FFN (gate/up/down coded) ──
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FFN").ok().as_deref() == Some("1") {
+        // B1 debug: skip the FFN contribution entirely.
+        return Ok(());
+    }
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
     decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
     decode_into(gpu, &layer.w_up, &s.tmp, &s.up)?;
