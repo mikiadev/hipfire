@@ -550,3 +550,18 @@ path can rejoin graph capture.
 Dense multi-token decode gate: PASSED for prose/poetry/factual prompts.
 Remaining perf note: decode ~1.6-2.3 tok/s (per-token decode-gemm, direct
 path); M3 (prefill/throughput + capture-safe decode scratch) is next.
+
+## B5 — dense multi-token coherence PASSED (2026-09-04, fix 5bb373af)
+
+Root cause of the dense multi-token decay was AR hipGraph capture/replay
+engaging on the escha-dense model: `use_graph` excluded `is_escham_moe` but
+not `is_escha_dense`, and the per-projection decode (escha_dense_decode_proj)
+allocs pool scratch per call (capture-unsafe) → replay diverged at decode
+token ~3. Fixed with `&& !config.is_escha_dense` in the use_graph predicate.
+Verified coherent on gfx1151 (temp 0, reasoning off): self-intro 36-tok prose,
+sky-blue Rayleigh explanation, river haiku, France→Paris. MoE unregressed;
+HFQ-dense 27B control coherent on both graph settings. Perf checkpoint:
+docs/perf-checkpoints/2026-09-04-escha-w2-dense-qwen38-27b-gfx1151.md.
+Dense decode ~1.6-2.5 tok/s (unoptimized per-token decode-gemm).
+M3 (follow-up): hoist decode scratch to Qwen35Scratch so escha dense can
+rejoin graph capture; batched/WMMA prefill; throughput.
