@@ -6540,6 +6540,10 @@ const ESCHAM_MOE_FOLD_SRC_RAW: &str =
     include_str!("../../../kernels/src/escham/hip/escham_moe_fold_kernel.hip");
 const ESCHAM_MOE_GROUPED_SRC_RAW: &str =
     include_str!("../../../kernels/src/escham/hip/escham_moe_grouped_kernels.hip");
+/// Escha-W2 code-quant DENSE decode kernels (Qwen3.8-27B-Escha-W2):
+/// rotate-in (T128 of x.in_scale), in-kernel decode-gemm, finalize (WHT+scale).
+const ESCHA_DENSE_SRC_RAW: &str =
+    include_str!("../../../kernels/src/escham/hip/escha_dense_kernels.hip");
 
 fn strip_esham_include(src: &str) -> String {
     src.replace("#include \"esham_device_utils.hip\"\n", "")
@@ -6564,6 +6568,11 @@ pub fn escham_moe_fold_src() -> String {
 /// Grouped f16 FFN module (self-contained).
 pub fn escham_moe_grouped_src() -> String {
     ESCHAM_MOE_GROUPED_SRC_RAW.to_string()
+}
+
+/// Escha code-quant dense decode module (self-contained).
+pub fn escha_dense_src() -> String {
+    ESCHA_DENSE_SRC_RAW.to_string()
 }
 
 /// Native gfx942 wave64 MFMA grouped-GEMM for DeepSeek4 MQ2-Lloyd prefill.
