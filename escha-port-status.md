@@ -236,3 +236,32 @@ Next-debug candidates (unresolved):
   true gamma; greedy argmax is final-norm-scale-invariant.
 - KV/attention path or a subtle integration detail between decode outputs and
   the conv/state kernels (all shared with the coherent MoE arms).
+
+## B1b — debug round 2 evidence (2026-09-04, commit ab574ebc5)
+
+Excluded as causes (all A/B tested on "Tokyo is the capital of", n=8, temp 0):
+- DeltaNet state quant: Q8 vs FP32 → byte-identical garbage.
+- KV mode: only q8 valid on the qwen35-dir site; the coherent MoE control runs
+  the same q8 flash path with the same head_dim=256 and decodes correctly.
+- Embed dequant: L0 input embed rms ~0.012-0.015 (sane), occasional exact-0
+  entries (int8 quantization) but no structural error.
+- Norm magnitudes: post-rmsnorm is unit-rms with a heavy tail (max ~20-40 is
+  expected RMSNorm behavior for sparse large embed entries); decode inputs are
+  properly scaled. Layer-0 decode output magnitudes are consistent with the
+  verified per-projection math.
+- Per-projection decode: fold-side == activation-side == GPU to rel 2e-4;
+  examples/pin_funnel.rs proves the funnel pairing on real tiles (K2/K3).
+
+Confirmed symptom: decode-position logits ARE prompt-dependent and contain real
+top-k words (e.g. pos 12 top 57590 after "Paris"), but greedy output echoes the
+prompt prefix ("Tokyo is the capital of" → "Tokyoyo巴尔onos…", "The capital of
+France is" → "The capital ―ouravist…") then decays — the classic
+recurrent-state divergence profile (same as MoE A4 pre-fix). Since every
+projection is exact and all surrounding kernels are shared with the coherent
+MoE + HFQ controls, the remaining suspect is a narrow integration/layout bug in
+the DeltaNetEscha/FullAttnEscha arms (attention input placement, FA gate/
+deinterleave subtlety, or conv/state ordering) rather than the decode math.
+
+Suggested next step (not yet run): materialize one dense projection to a folded
+f32 WeightTensor at load and route the PLAIN DeltaNet/FullAttn arm over it —
+decodes coherent → bug in the escha arm; still broken → kernel interaction.
