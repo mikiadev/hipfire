@@ -340,3 +340,36 @@ Phase B status: M1 LOADS; M2 kernels EXACT + arms run with several correct
 deterministic short completions; coherent-decode GATE for the full model is the
 remaining M2 item (narrow integration bug, candidates documented above);
 M3 (prefill/throughput) not started.
+
+## B1f — LA-path decay isolated via control runs (2026-09-04, commit 6637ae2a1)
+
+New decisive evidence:
+- MoE control generates 40 COHERENT tokens on "Say hello and then introduce
+  yourself" ("Hello! I am Qwen, a large language model…") — the framework's
+  decode-KV path is fully exonerated.
+- Dense model on the SAME prompt: "Hello!" then a ~10-token repeating attractor
+  ("…ollеш暇ragenessarortableheimer浒ovitify…") — decays at decode token 2+.
+- HIPFIRE_ESCHA_DENSE_NO_ATTN (FA passthrough) does NOT change the decay →
+  the corrupting path is the DeltaNet (LA) layers, NOT FA/KV.
+- Hidden-state norms are healthy through the stack (L0 embed rms 0.012 → L63
+  rms ~5-7, no NaN/blowup). Per-token recall works ("Repeat: zebra"→"ze",
+  "The word to repeat is: mountain"→"mount", "Say hello"→"Hello!") — prompt
+  conditioning and first-token generation are correct.
+- The repeating attractor (short periodic garbage) with correct 1-2 token
+  starts and healthy norms = periodic single-point corruption recirculated by
+  the recurrence, not state divergence or scale error.
+
+Remaining suspect: a per-layer/per-head single-point error in the LA path that
+only shows once the recurrence reuses outputs across ≥3 decode steps (the first
+2 tokens read prefill state; token 3+ reads the corrupt self-written state).
+Candidates: one coded LA projection with a subtly wrong decode under real
+(non-random) inputs, or a conv/gdn state-tensor interaction specific to the
+48-v-head / 5120-dim shape.
+
+Next experiments (not yet run):
+1. Per-projection GPU check with a REAL dn_normed/dn_qkv captured from the
+   running model (example plumbing) instead of random x.
+2. Reduce LA layers to a handful (config n_layers subset) to find the first
+   corrupt layer.
+3. Compare the gated_delta_net_q8 kernel's state handling for 48 v-heads
+   against the 32-v-head MoE shape.
