@@ -2955,7 +2955,7 @@ fn forward_scratch_layers(
                     }
                 }
                 super::escha_dense_forward::deltanet_escha_layer_forward(
-                    gpu, layer, config, pos, delta_layer_idx, kv_cache, dn_state, s,
+                    gpu, layer, config, pos, layer_idx, delta_layer_idx, kv_cache, dn_state, s,
                 )?;
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {

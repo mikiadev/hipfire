@@ -27,6 +27,25 @@ use super::weights::FullAttnEschaLayerWeights;
 /// Decode one projection whose output is `[out_p]` into `dst` (caller scratch
 /// sized `>= out_p`), allocating only the transient decode temporaries.
 #[allow(clippy::too_many_arguments)]
+/// Entry probe: print input hidden range for sparse layers (env-gated).
+fn entry_probe(gpu: &Gpu, layer_idx: usize, s: &Qwen35Scratch, kind: &str) {
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_none() {
+        return;
+    }
+    if layer_idx % 16 != 0 && layer_idx != 63 {
+        return;
+    }
+    if let Ok(v) = gpu.download_f32(&s.x) {
+        let (mut mn, mut mx, mut rms) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+        for &x in &v {
+            mn = mn.min(x);
+            mx = mx.max(x);
+            rms += (x as f64) * (x as f64) / v.len() as f64;
+        }
+        eprintln!("[escha-dense] {kind} L{layer_idx} x: range=[{mn:.3e},{mx:.3e}] rms={:.3e}", rms.sqrt());
+    }
+}
+
 fn decode_into(
     gpu: &mut Gpu,
     proj: &super::weights::EschaDenseProjWeights,
@@ -43,6 +62,7 @@ pub fn deltanet_escha_layer_forward(
     layer: &DeltaNetEschaLayerWeights,
     config: &Qwen35Config,
     pos: usize,
+    layer_idx: usize,
     delta_layer_idx: usize,
     kv_cache: &mut hipfire_runtime::llama::KvCache,
     dn_state: &mut super::weights::DeltaNetState,
@@ -52,6 +72,8 @@ pub fn deltanet_escha_layer_forward(
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
+
+    entry_probe(gpu, layer_idx, s, "LA");
 
     // ── attention input norm + coded projections ──
     // normed x → s.tmp (decode input is the raw normed activation).
@@ -145,32 +167,40 @@ pub fn deltanet_escha_layer_forward(
         gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
     }
     match dn_state.quant {
-        super::weights::StateQuant::FP32 => gpu.gated_delta_net_f32(
-            &s.dn_q,
-            &s.dn_k,
-            &s.dn_v,
-            &s.dn_alpha,
-            &s.dn_beta,
-            &dn_state.s_matrices[delta_layer_idx],
-            &s.dn_attn_out,
-            1,
-            n_v_heads,
-            config.linear_value_head_dim,
-        )?,
-        super::weights::StateQuant::Q8 => gpu.gated_delta_net_q8(
-            &s.dn_q,
-            &s.dn_k,
-            &s.dn_v,
-            &s.dn_alpha,
-            &s.dn_beta,
-            &dn_state.s_matrices[delta_layer_idx],
-            &dn_state.s_scales[delta_layer_idx],
-            &s.dn_attn_out,
-            1,
-            n_v_heads,
-            config.linear_value_head_dim,
-            dn_state.ef_residual(delta_layer_idx),
-        )?,
+        super::weights::StateQuant::FP32 => {
+            let r = gpu.gated_delta_net_f32(
+                &s.dn_q,
+                &s.dn_k,
+                &s.dn_v,
+                &s.dn_alpha,
+                &s.dn_beta,
+                &dn_state.s_matrices[delta_layer_idx],
+                &s.dn_attn_out,
+                1,
+                n_v_heads,
+                config.linear_value_head_dim,
+            );
+            state_probe(gpu, dn_state, delta_layer_idx, "post-gdn-f32");
+            r?
+        }
+        super::weights::StateQuant::Q8 => {
+            let r = gpu.gated_delta_net_q8(
+                &s.dn_q,
+                &s.dn_k,
+                &s.dn_v,
+                &s.dn_alpha,
+                &s.dn_beta,
+                &dn_state.s_matrices[delta_layer_idx],
+                &dn_state.s_scales[delta_layer_idx],
+                &s.dn_attn_out,
+                1,
+                n_v_heads,
+                config.linear_value_head_dim,
+                dn_state.ef_residual(delta_layer_idx),
+            );
+            state_probe(gpu, dn_state, delta_layer_idx, "post-gdn-q8");
+            r?
+        }
         super::weights::StateQuant::Q4 => gpu.gated_delta_net_q4(
             &s.dn_q,
             &s.dn_k,
@@ -231,6 +261,7 @@ pub fn fullattn_escha_layer_forward(
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
+    entry_probe(gpu, layer_idx, s, "FA");
     if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_ATTN").ok().as_deref() == Some("1") {
         // B1 debug: full-attention passthrough (only FFN acts).
         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
@@ -340,5 +371,49 @@ fn stats(gpu: &Gpu, label: &str, t: &GpuTensor) {
             else { n += 1; mn = mn.min(v); mx = mx.max(v); }
         }
         eprintln!("[escha-dense] {label}: n={n} nan={nn} inf={ninf} range=[{mn:.4e},{mx:.4e}] first3={:?}", &vals[..3.min(vals.len())]);
+    }
+}
+
+/// Probe the DeltaNet recurrent state (S-matrix + conv state) magnitudes after
+/// a gated-delta-net update for one layer. Gated on HIPFIRE_ESCHA_DENSE_TRACE.
+fn state_probe(
+    gpu: &Gpu,
+    dn_state: &super::weights::DeltaNetState,
+    delta_layer_idx: usize,
+    label: &str,
+) {
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_none() {
+        return;
+    }
+    // NOTE: Q8 S-matrices are BYTE buffers (shape = byte count), so they cannot
+    // be downloaded as f32; only probe the FP32 S-matrix.
+    if dn_state.quant == super::weights::StateQuant::FP32 {
+        if let Some(t) = dn_state.s_matrices.get(delta_layer_idx) {
+            if let Ok(v) = gpu.download_f32(t) {
+                let mut s = 0.0f64;
+                let mut mx = 0.0f64;
+                for &x in &v {
+                    s += (x as f64) * (x as f64);
+                    mx = mx.max((x as f64).abs());
+                }
+                eprintln!(
+                    "[escha-dense] {label} S[{delta_layer_idx}]: rms={:.4e} absmax={:.4e}",
+                    (s / v.len() as f64).sqrt(),
+                    mx
+                );
+            }
+        }
+    }
+    if let Some(t) = dn_state.conv_states.get(delta_layer_idx) {
+        if let Ok(v) = gpu.download_f32(t) {
+            let mut s = 0.0f64;
+            for &x in &v {
+                s += (x as f64) * (x as f64);
+            }
+            eprintln!(
+                "[escha-dense] {label} conv[{delta_layer_idx}]: rms={:.4e}",
+                (s / v.len() as f64).sqrt()
+            );
+        }
     }
 }
