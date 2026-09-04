@@ -185,3 +185,54 @@ Control: HFQ A3B MoE (qwen3.6-35b-a3b.mq4r) decodes perfectly on this tree
 — the shared DeltaNet/attention/MoE + framework path is exonerated.
 bin md5 (this milestone): hipfire be74e7222dc28905940dd2d5bbd736d8,
 daemon d901b59967c77cafc564747c71449cc1.
+
+## B1 — Dense loader + kernels + forward arms land; decode deterministic but incoherent (2026-09-04)
+
+Commits on feat/escha-w2 (dense Phase B):
+- 039f9023 LayerWeights DeltaNetEscha/FullAttnEscha + seal/free/screen/sweep
+- 642b0856 DenseEschaSource coded-projection loader + carrier routing
+  (quant_method=escha → EschaSource), embed/lm_head int8, per-proj upload of
+  code + in_scale=rin.s_in + out_scale=rout.s_out (f32 folds; s_in/s_out MUST
+  apply for exactness), escha_config sanity
+- 43bf070b dense decode kernels (escha_dense_kernels.hip: rotate-in T128 /
+  in-kernel decode-gemm / finalize) + rdna-compute dispatch + engine
+- 73eebd14 exact funnel pairing fix (see below)
+- b9328ad7 forward arms (DeltaNetEscha/FullAttnEscha) + kv dispatch wo:Option
+- 13b5e664 debug instrumentation (env-gated)
+
+Verified on /data/rocmfpx/Qwen3.8-27B-Escha-W2 (gfx1151):
+- Model LOADS (64 layers, all coded projections, escha_config+shape checks).
+- Per-projection decode is numerically EXACT: host trellis reference ==
+  activation-side == fold-side reconstruction == GPU, rel ~2e-4 on every
+  class (linear qkv/z/out, mlp gate K2/up K3/down K3, self_attn q/k/v/o;
+  layers 0/3/40). examples/pin_funnel.rs + check_escha_dense.rs.
+- Decode runs deterministically (no NaN, no faults after the kv-layer-index
+  fix); ~1-2 tok/s decode (per-token decode-gemm, expected at this stage).
+
+Funnel pairing discovery (73eebd14): llama.cpp's dense kernel uses an
+overlapping-uint2 payload trick that does NOT match the safetensors layout of
+this export. Empirically (real model tiles, both K): the exact codebook index
+of weight (r,c) is funnel(hi = payload word w0-1, lo = word w0) >> (sp&31),
+low 16 bits, w0 = (NW - (sp>>5)) mod NW, with a PLAIN word array. This is
+decode_tiles-verified. (llama.cpp's GGUF presumably stores the code transposed,
+so its pairing differs.)
+
+Not yet coherent: decode echoes recent prompt tokens then decays to garbage
+("Tokyo is the capital of" → "Tokyoyo巴尔onos…"; MoE control on the same
+prompt → "**Japan"). Decode-position logits ARE prompt-dependent and contain
+real word tokens in the top-k, but greedy picks collapse after 1-2 tokens —
+the DeltaNet recurrent-state divergence profile (same signature as the MoE A4
+failure pre-fix). Per-projection math is exonerated (fold==activation==GPU).
+
+Next-debug candidates (unresolved):
+- DeltaNet state quant (Q8) vs dims — try FP32 state for 5120-dim LA.
+- Small-dense attention tensor convention (alpha/beta/A_log/dt_bias/conv1d/
+  norm weights) vs the EschaLabs reference runtime (transform.py /
+  gptoss_experts.py found under /home/mika/test-2/escha — authoritative
+  forward: y = s_out ⊙ T128(T128(x·s_in·rin) @ w_bare)·rout, matching hipfire
+  folds; bias optionally added, escha runtime APPLIES bias, llama.cpp does not).
+- Whether the export's norms are (gamma-1) needing +1 (hipfire convention,
+  MoE-proven) — both exports store layer norms ~N(0,0.03) and final norm as
+  true gamma; greedy argmax is final-norm-scale-invariant.
+- KV/attention path or a subtle integration detail between decode outputs and
+  the conv/state kernels (all shared with the coherent MoE arms).
