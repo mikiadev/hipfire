@@ -373,3 +373,17 @@ Next experiments (not yet run):
    corrupt layer.
 3. Compare the gated_delta_net_q8 kernel's state handling for 48 v-heads
    against the 32-v-head MoE shape.
+
+## B1g — direction matrix (2026-09-04, commit 193b22c40)
+
+Working (deterministic): "The capital of France is"→Paris; "Paris is the
+capital of"→France; "Tokyo is the capital of"→Japan; "Berlin is the capital
+of"→Germany. All are [City]→country OR the France city answer.
+Failing: "The capital of Japan is"→"The capital christmas…"; "The capital of
+Germany is"→miscue; "Japan is the capital of"→miscue.
+Token-by-token: failures ECHO the prompt start ("The capital") then decay —
+the model isn't conditioning on the mid-prompt country token for city answers,
+while France succeeds. All country/city names are single BPE tokens (verified),
+so this is not tokenization. Characterized but not root-caused: a
+token/context-specific LA-path conditioning gap (DeltaNet state loses some
+tokens' context; FA excluded by passthrough; kernels/norms/decode proven).
