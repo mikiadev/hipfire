@@ -57,6 +57,81 @@ fn decode_into(
     escha_dense_decode_proj(gpu, proj, x, dst)
 }
 
+/// Live-decode audit (HIPFIRE_ESCHA_DENSE_AUDIT=1): compare the GPU in-kernel
+/// decode of `proj` against the host reference on THIS token's REAL input `x`.
+/// The static oracle uses random x; this checks real structured activations at
+/// every decode position. Reports max_abs/rel to stderr. Audits at every layer
+/// divisible by 16 unless HIPFIRE_ESCHA_DENSE_AUDIT_LAYER overrides to one layer.
+#[allow(clippy::too_many_arguments)]
+fn audit_decode(
+    gpu: &Gpu,
+    proj: &super::weights::EschaDenseProjWeights,
+    x: &GpuTensor,
+    got: &GpuTensor,
+    layer_idx: usize,
+    pos: usize,
+    label: &str,
+) {
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_AUDIT").is_none() {
+        return;
+    }
+    let layer_filter = hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_AUDIT_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    if !layer_filter.map(|lf| lf == layer_idx).unwrap_or(layer_idx % 16 == 0) {
+        return;
+    }
+    let pos_filter = hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_AUDIT_POS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(pf) = pos_filter {
+        if pf != pos {
+            return;
+        }
+    }
+    use super::escha_dense_decode::escha_dense_decode_proj_host;
+    let (x_h, in_scale, out_scale) = match (
+        gpu.download_f32(x),
+        gpu.download_f32(&proj.in_scale),
+        gpu.download_f32(&proj.out_scale),
+    ) {
+        (Ok(x), Ok(i), Ok(o)) => (x, i, o),
+        _ => return,
+    };
+    let n_bytes = proj.code.buf.size();
+    let mut code_bytes = vec![0u8; n_bytes];
+    if gpu.hip.memcpy_dtoh(&mut code_bytes, &proj.code.buf).is_err() {
+        return;
+    }
+    let code_i16: Vec<i16> = code_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let got_v = gpu.download_f32(got).unwrap_or_default();
+    let want = escha_dense_decode_proj_host(
+        &code_i16,
+        proj.k as usize,
+        proj.in_p,
+        proj.out_p,
+        &in_scale,
+        &out_scale,
+        &x_h,
+    );
+    if got_v.len() != want.len() || got_v.is_empty() {
+        return;
+    }
+    let mut max_abs = 0.0f32;
+    let mut scale = 0.0f32;
+    for i in 0..got_v.len() {
+        max_abs = max_abs.max((got_v[i] - want[i]).abs());
+        scale = scale.max(want[i].abs());
+    }
+    eprintln!(
+        "[escha-dense-audit] L{layer_idx} pos {pos} {label} live-decode: max_abs={max_abs:.5} rel={:.5}",
+        max_abs / (scale + 1e-9)
+    );
+}
+
 /// DeltaNet (linear-attention) Escha dense layer forward.
 #[allow(clippy::too_many_arguments)]
 pub fn deltanet_escha_layer_forward(
@@ -83,6 +158,8 @@ pub fn deltanet_escha_layer_forward(
     stats(gpu, "post rmsnorm (decode input)", &s.tmp);
     decode_into(gpu, &layer.qkv, &s.tmp, &s.dn_qkv)?;
     decode_into(gpu, &layer.z, &s.tmp, &s.dn_z)?;
+    audit_decode(gpu, &layer.qkv, &s.tmp, &s.dn_qkv, layer_idx, pos, "qkv");
+    audit_decode(gpu, &layer.z, &s.tmp, &s.dn_z, layer_idx, pos, "z");
     stats(gpu, "post qkv/z decode", &s.dn_qkv);
     stats(gpu, "post z decode", &s.dn_z);
     // beta / alpha stay dense f16 gemvs of the normed input.
@@ -234,6 +311,7 @@ pub fn deltanet_escha_layer_forward(
 
     // ── wo coded projection + residual ──
     decode_into(gpu, &layer.wo, &s.dn_normed, &s.o)?;
+    audit_decode(gpu, &layer.wo, &s.dn_normed, &s.o, layer_idx, pos, "wo");
     stats(gpu, "post wo decode", &s.o);
     stats(gpu, "pre-add x (LA)", &s.x);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
@@ -247,8 +325,11 @@ pub fn deltanet_escha_layer_forward(
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
     decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
     decode_into(gpu, &layer.w_up, &s.tmp, &s.up)?;
+    audit_decode(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, layer_idx, pos, "gate");
+    audit_decode(gpu, &layer.w_up, &s.tmp, &s.up, layer_idx, pos, "up");
     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
     decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
+    audit_decode(gpu, &layer.w_down, &s.ffn_hidden, &s.o, layer_idx, pos, "down");
     stats(gpu, "post down decode", &s.o);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
     stats(gpu, "post FFN residual", &s.x);

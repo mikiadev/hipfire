@@ -112,6 +112,63 @@ read sites may remain).
 
 ---
 
+## B6 — long-horizon decay re-diagnosis (2026-09-04, fresh session)
+
+User reports: "Why is the sky blue?" on the dense 27B produces a coherent
+Rayleigh start then collapses into a "* Blue: Blue. Blue. Blue…" verbatim
+attractor, and reasoning is not visible. Model exonerated by the user (coherent
+to 256K ctx on CUDA 3090/4090/5090 AND llama.cpp-escha on 7900 XTX, "quality
+comparable to Q8").
+
+**Reproduced + characterized:**
+- B5's four gate prompts still pass EXACTLY as claimed (France→"Paris",
+  self-intro, haiku, sky ≤50 tok). The B5 gate horizon (≤50 tok) was simply too
+  short — the decay starts at ~60–150 generated tokens.
+- Deterministic at temp 0 AND at temp 0.3/0.8 with repeat penalty up to 1.15:
+  the escha-dense hidden state settles into a stable-but-wrong fixed point
+  (verbatim self-echo) past the horizon. Story prompt ("robot Spark") starts
+  beautifully coherent, decays into stream-of-consciousness echo by ~tok 100.
+- Prompt memory is PERFECT (recalls "code word = zebra" at 10/50/120 tokens
+  back) — not a context/KV/prefill problem.
+- Reasoning DOES run with a budget (think-cap force-closes correctly) but the
+  THINK stream itself decays into the same verbatim echo ("especially nitrogen
+  and nitrogen? Actually molecules of nitrogen and nitrogen?…"). The think
+  stream was invisible because `hipfire run`'s generate callback only printed
+  `type:"token"` events and dropped `type:"reasoning"` — FIXED (run now shows
+  reasoning and reports it in --json).
+
+**Excluded with evidence (this session):**
+- Per-projection in-kernel decode == host == llama funnel formula, BIT-EXACT on
+  real tiles (all 256/256, K2+K3, deep layers) AND live-decode audit on real
+  activations ≤ rel 2e-4 at every position through the collapse (new env-gated
+  audit: HIPFIRE_ESCHA_DENSE_AUDIT[_LAYER][_POS]).
+- DeltaNet state FP32 == Q8 byte-identical text (state quant not involved).
+- Controls coherent on the same tree at the SAME shape: MoE escha 2-bit
+  (attention int8) → 800 tok; HFQ-dense qwen3.6-27b.mq4r (plain MQ4, identical
+  5120/64L/24H/4KV/16kH/48vH/128hd) → 800 tok story coherent. Shared kernels
+  at this shape exonerated.
+- Bias NOT applied (matches llama build_escha_mm comment: EschaLabs "ignoring
+  them is what reproduces the results published here"); s_in/s_out fold correct.
+- FA passthrough still decays (LA implicated); FA removed entirely so not a
+  clean isolation. Structure mirrors llama qwen35.cpp graph op-for-op.
+- Embed/lm_head int8 scale sanity: 304/248320 rare-token rows carry extreme
+  scales (32–16320 vs ~1e-3) — benign-looking but NOT yet ruled out.
+
+**OPEN (the actual remaining bug):** long-horizon-only coherence decay in the
+escha-dense 2-bit path. Every per-token mechanism is proven exact; the decay is
+a temporal-accumulation property that NO coherent control exercises (no control
+runs 2-bit ATTENTION q/k/v/o at 5120-dim/64L). Highest-value next experiments:
+1. Golden token stream from the EschaLabs sglang/escha reference runtime on the
+   same model (needs torch+wheel setup; ~28G free disk on /home may be tight) —
+   compare token-level where hipfire first diverges.
+2. Materialize the dense projections to folded fp16 WeightTensors at load and
+   route through the PLAIN DeltaNet/FullAttn arms (the "decisive never-run" B3
+   experiment) — distinguishes arm wiring from decoded-value issues.
+3. Bisect by layer-count: reduce effective LA depth (config surgery) to see if
+   decay horizon scales with recurrence depth.
+
+---
+
 ## Next steps (M3 / follow-up, in order)
 
 1. **Hoist dense decode scratch**: the per-projection decode
@@ -143,4 +200,4 @@ portable codebook spelling is exact under HIP.
 
 ---
 
-*Last updated 2026-09-04 (B5 dense milestone).*
+*Last updated 2026-09-04 (B6 long-horizon decay re-diagnosis).*

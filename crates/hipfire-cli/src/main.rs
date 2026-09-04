@@ -2056,16 +2056,29 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     )?;
 
     let mut content = String::new();
+    let mut reasoning = String::new();
     let stream = !args.no_stream && !args.json;
     let done = engine.generate(&request, |event| {
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
-            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                content.push_str(text);
-                if stream {
-                    print!("{text}");
-                    std::io::stdout().flush()?;
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("token") => {
+                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                    content.push_str(text);
+                    if stream {
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
                 }
             }
+            Some("reasoning") => {
+                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                    reasoning.push_str(text);
+                    if stream {
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     })?;
@@ -2074,12 +2087,16 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             "{}",
             serde_json::to_string(&serde_json::json!({
                 "content": content,
+                "reasoning": reasoning,
                 "tokens": done.get("tokens").and_then(serde_json::Value::as_u64),
                 "tok_s": done.get("tok_s").and_then(serde_json::Value::as_f64),
                 "finish_reason": done.get("finish_reason"),
             }))?
         );
     } else if args.no_stream {
+        if !reasoning.is_empty() {
+            println!("<reasoning>\n{reasoning}\n</reasoning>");
+        }
         println!("{content}");
     } else {
         println!();
@@ -2545,6 +2562,10 @@ pub(crate) fn load_params(
             "hardware.deepseek4_compute_placement",
         )?,
         "kv_mode": kv_mode,
+        "state_quant": std::env::var("HIPFIRE_STATE_QUANT")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "".to_string()),
         "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
