@@ -19,7 +19,10 @@
 
 use super::config::Qwen35Config;
 use super::load::Layout;
+use super::weights::DeltaNetEschaLayerWeights;
+use super::weights::EschaDenseProjWeights;
 use super::weights::EschaMoeFfnWeights;
+use super::weights::FullAttnEschaLayerWeights;
 use super::weights::LayerWeights;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
@@ -31,6 +34,7 @@ use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::paro::load_fp16_weight_from_source;
+use hipfire_runtime::paro::paro_load_norm;
 use hipfire_runtime::paro::paro_load_wt;
 use hipfire_runtime::safetensors_source::source_bytes_to_f32_vec;
 use hipfire_runtime::weight_backend::ParoBackend;
@@ -48,7 +52,7 @@ pub fn load_weights_from_safetensors(
 ) -> Result<Qwen35Weights, String> {
     let devices: &mut [Gpu] = std::slice::from_mut(gpu);
     let layout = Layout::single(config.n_layers);
-    if config.is_escham_moe {
+    if config.is_escham_moe || config.is_escha_dense {
         let mut escha = EschaSource::new(source, config).map_err(|e| e.to_string())?;
         crate::qwen35::load::load_weights(&mut escha, devices, &layout).map_err(|e| e.to_string())
     } else {
@@ -57,7 +61,9 @@ pub fn load_weights_from_safetensors(
     }
 }
 
-/// WeightSource adapter for Escha code-quant MoE safetensors models. Holds the
+/// WeightSource adapter for Escha code-quant safetensors models: both the
+/// ESCHAM MoE export (`quant_method == "eschamoe"`, Escha-W2) and the ESCHA
+/// dense export (`quant_method == "escha"`, Qwen3.8-27B-Escha-W2). Holds the
 /// source + text-tower prefix + config directly (mirrors `ParoSource`'s own
 /// fields; those are private and only readable from `load.rs`).
 pub struct EschaSource<'a> {
@@ -359,6 +365,257 @@ impl<'a> EschaSource<'a> {
             down_in_scale,
         ))
     }
+
+    // ── Escha code-quant DENSE layer loading (quant_method == "escha") ──
+    //
+    // Qwen3.8-27B-Escha-W2 keeps every linear projection (attention + FFN) in
+    // the int16 trellis code. Per projection the export ships:
+    //   escha_code   I16 [in/16, out/16, 16*K]   (K=2 q/k/v/o/qkv/z/gate; K=3 up/down)
+    //   escha_rin    F16 [in]
+    //   escha_rout   F16 [out]
+    //   escha_s_in   F32 [in]      (≈1, applied: MUST fold for exactness)
+    //   escha_s_out  F32 [out]     (≈1)
+    //   escha_config I32 [6] = [16, K, 2, 1, in, out]
+    //   bias         F16 [out]     (bias-correction; NOT applied — ESCHA_APPLY_BIAS 0)
+    // Small dense tensors (in_proj_a/b, A_log, conv1d, norms) stay raw F16 and
+    // use the paro raw/norm loaders; embed/lm_head are int8 + per-row f16 scale.
+
+    /// Upload one Escha-coded dense projection from `{mp}.{p}.{rel}.escha_*`.
+    fn escha_load_dense_proj(
+        &self,
+        gpu: &mut Gpu,
+        p: &str,
+        rel: &str,
+        expected_in: usize,
+        expected_out: usize,
+    ) -> HipResult<EschaDenseProjWeights> {
+        let base = format!("{}.{p}.{rel}", self.mp);
+        let code_name = format!("{base}.escha_code");
+        let rin_name = format!("{base}.escha_rin");
+        let rout_name = format!("{base}.escha_rout");
+        let sin_name = format!("{base}.escha_s_in");
+        let sout_name = format!("{base}.escha_s_out");
+        let cfg_name = format!("{base}.escha_config");
+
+        let (code_info, code_data) = self
+            .source
+            .tensor_data(&code_name)
+            .ok_or_else(|| HipError::new(0, &format!("escha_code not found: {code_name}")))?;
+        let code_shape = code_info.shape.clone();
+        if code_shape.len() != 3 {
+            return Err(HipError::new(
+                0,
+                &format!("{code_name}: expected [in/16, out/16, 16*K], got {code_shape:?}"),
+            ));
+        }
+        let (ti, tout, _last) = (code_shape[0] as usize, code_shape[1] as usize, code_shape[2]);
+        let in_p = ti * 16;
+        let out_p = tout * 16;
+        let k = (code_shape[2] / 16) as u8;
+        if in_p != expected_in || out_p != expected_out {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "{code_name}: shape [{in_p}->{out_p}] != expected [{expected_in}->{expected_out}]"
+                ),
+            ));
+        }
+        // escha_config sanity: [16, K, 2, 1, in, out]
+        if let Some((cfg_info, cfg_data)) = self.source.tensor_data(&cfg_name) {
+            let cfg = source_bytes_to_f32_vec(&cfg_info.dtype, cfg_data);
+            if cfg.len() >= 6 {
+                let (tile, ck, _v, _e, cin, cout) = (
+                    cfg[0] as i32, cfg[1] as i32, cfg[2] as i32, cfg[3] as i32,
+                    cfg[4] as i32, cfg[5] as i32,
+                );
+                if tile != 16 || ck as u8 != k || cin as usize != expected_in
+                    || cout as usize != expected_out
+                {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "{code_name}: escha_config [{tile},{ck},..,{cin},{cout}] inconsistent \
+                             with code shape (K={k}, {in_p}x{out_p})"
+                        ),
+                    ));
+                }
+            }
+        }
+        // in_scale = rin (f16) . s_in (f32), out_scale = rout . s_out.
+        let (rin_info, rin_data) = self.source.tensor_data(&rin_name).ok_or_else(|| {
+            HipError::new(0, &format!("escha_rin not found: {rin_name}"))
+        })?;
+        let (rout_info, rout_data) = self.source.tensor_data(&rout_name).ok_or_else(|| {
+            HipError::new(0, &format!("escha_rout not found: {rout_name}"))
+        })?;
+        let rin: Vec<f32> = source_bytes_to_f32_vec(&rin_info.dtype, rin_data);
+        let rout: Vec<f32> = source_bytes_to_f32_vec(&rout_info.dtype, rout_data);
+        if rin.len() != in_p || rout.len() != out_p {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "{code_name}: rin {} rout {} vs in_p {in_p} out_p {out_p}",
+                    rin.len(),
+                    rout.len()
+                ),
+            ));
+        }
+        let sin: Vec<f32> = match self.source.tensor_data(&sin_name) {
+            Some((si, sd)) => source_bytes_to_f32_vec(&si.dtype, sd),
+            None => vec![1.0f32; in_p],
+        };
+        let sout: Vec<f32> = match self.source.tensor_data(&sout_name) {
+            Some((so, sod)) => source_bytes_to_f32_vec(&so.dtype, sod),
+            None => vec![1.0f32; out_p],
+        };
+        if sin.len() != in_p || sout.len() != out_p {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "{code_name}: s_in {} s_out {} vs in_p {in_p} out_p {out_p}",
+                    sin.len(),
+                    sout.len()
+                ),
+            ));
+        }
+        let in_scale_f32: Vec<f32> = rin.iter().zip(sin.iter()).map(|(&r, &s)| r * s).collect();
+        let out_scale_f32: Vec<f32> = rout.iter().zip(sout.iter()).map(|(&r, &s)| r * s).collect();
+
+        // Code upload (bitwise F16 = i16 2-byte elements), typed F16 like the MoE path.
+        let code_elems = code_data.len() / 2;
+        let buf = gpu.hip.malloc(code_data.len())?;
+        gpu.hip.memcpy_htod(&buf, code_data)?;
+        let code = GpuTensor {
+            buf,
+            shape: vec![code_elems],
+            dtype: DType::F16,
+        };
+        let in_scale = gpu.upload_f32(&in_scale_f32, &[in_p])?;
+        let out_scale = gpu.upload_f32(&out_scale_f32, &[out_p])?;
+        Ok(EschaDenseProjWeights {
+            code,
+            in_scale,
+            out_scale,
+            in_p,
+            out_p,
+            k,
+        })
+    }
+
+    /// Load one dense (non-MoE) Qwen3.5 Escha layer. Handles both DeltaNet
+    /// (linear attention) and FullAttention layers by `config.layer_types`.
+    pub fn escha_load_dense_layer(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        config: &Qwen35Config,
+    ) -> HipResult<LayerWeights> {
+        let p = format!("layers.{layer_idx}");
+        let dim = config.dim;
+        let hidden = config.hidden_dim;
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkv_dim = k_dim * 2 + v_dim;
+        let q_out = config.n_heads * config.head_dim * 2; // q + gate fused
+        let kv_dim = config.n_kv_heads * config.head_dim;
+        let o_in = config.n_heads * config.head_dim;
+
+        // Small dense tensors via paro loaders (mp-prefixed, plain F16).
+        // Closures take `gpu` as an argument so they do not hold a long-lived
+        // mutable borrow across the whole layer body.
+        let load_norm = |rel: &str, gpu: &mut Gpu| {
+            paro_load_norm(self.source, gpu, &format!("{p}.{rel}"), &[dim], 1.0)
+        };
+        let load_f16_wt = |rel: &str, m: usize, k: usize, gpu: &mut Gpu| {
+            let base = format!("{}.{p}.{rel}", self.mp);
+            load_fp16_weight_from_source(self.source, gpu, &format!("{base}.weight"), m, k)
+        };
+        let load_f16_vec = |rel: &str, n: usize, gpu: &mut Gpu| {
+            // paro_load_f32 reads {mp}.{name} and handles F16/BF16/F32.
+            hipfire_runtime::paro::paro_load_f32(self.source, gpu, &format!("{p}.{rel}"), n)
+        };
+
+        let attn_norm = load_norm("input_layernorm.weight", gpu)?;
+        let ffn_norm = load_norm("post_attention_layernorm.weight", gpu)?;
+
+        let ffn = |this: &Self,
+                   gpu: &mut Gpu|
+         -> HipResult<(EschaDenseProjWeights, EschaDenseProjWeights, EschaDenseProjWeights)> {
+            Ok((
+                this.escha_load_dense_proj(gpu, &p, "mlp.gate_proj", dim, hidden)?,
+                this.escha_load_dense_proj(gpu, &p, "mlp.up_proj", dim, hidden)?,
+                this.escha_load_dense_proj(gpu, &p, "mlp.down_proj", hidden, dim)?,
+            ))
+        };
+
+        match config.layer_types[layer_idx] {
+            super::config::LayerType::LinearAttention => {
+                let (w_gate, w_up, w_down) = ffn(self, gpu)?;
+                Ok(LayerWeights::DeltaNetEscha(DeltaNetEschaLayerWeights {
+                    attn_norm,
+                    qkv: self.escha_load_dense_proj(gpu, &p, "linear_attn.in_proj_qkv", dim, qkv_dim)?,
+                    z: self.escha_load_dense_proj(gpu, &p, "linear_attn.in_proj_z", dim, v_dim)?,
+                    w_alpha: load_f16_wt(
+                        "linear_attn.in_proj_a",
+                        config.linear_num_value_heads,
+                        dim,
+                        gpu,
+                    )?,
+                    w_beta: load_f16_wt(
+                        "linear_attn.in_proj_b",
+                        config.linear_num_value_heads,
+                        dim,
+                        gpu,
+                    )?,
+                    a_log: load_f16_vec("linear_attn.A_log", config.linear_num_value_heads, gpu)?,
+                    dt_bias: load_f16_vec("linear_attn.dt_bias", config.linear_num_value_heads, gpu)?,
+                    conv_weight: load_f16_vec(
+                        "linear_attn.conv1d.weight",
+                        qkv_dim * config.conv_kernel_dim,
+                        gpu,
+                    )?,
+                    norm_weight: load_f16_vec(
+                        "linear_attn.norm.weight",
+                        config.linear_value_head_dim,
+                        gpu,
+                    )?,
+                    wo: self.escha_load_dense_proj(gpu, &p, "linear_attn.out_proj", v_dim, dim)?,
+                    ffn_norm,
+                    w_gate,
+                    w_up,
+                    w_down,
+                }))
+            }
+            super::config::LayerType::FullAttention => {
+                let (w_gate, w_up, w_down) = ffn(self, gpu)?;
+                Ok(LayerWeights::FullAttnEscha(FullAttnEschaLayerWeights {
+                    attn_norm,
+                    wq: self.escha_load_dense_proj(gpu, &p, "self_attn.q_proj", dim, q_out)?,
+                    wk: self.escha_load_dense_proj(gpu, &p, "self_attn.k_proj", dim, kv_dim)?,
+                    wv: self.escha_load_dense_proj(gpu, &p, "self_attn.v_proj", dim, kv_dim)?,
+                    wo: self.escha_load_dense_proj(gpu, &p, "self_attn.o_proj", o_in, dim)?,
+                    q_norm: paro_load_norm(
+                        self.source,
+                        gpu,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        &[config.head_dim],
+                        1.0,
+                    )?,
+                    k_norm: paro_load_norm(
+                        self.source,
+                        gpu,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        &[config.head_dim],
+                        1.0,
+                    )?,
+                    ffn_norm,
+                    w_gate,
+                    w_up,
+                    w_down,
+                }))
+            }
+        }
+    }
 }
 
 impl WeightSource for EschaSource<'_> {
@@ -379,7 +636,7 @@ impl WeightSource for EschaSource<'_> {
     }
 
     fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
-        if self.is_escham_moe {
+        if self.is_escham_moe || self.c.is_escha_dense {
             // Escha embed_tokens is int8 + per-row f16 scale.
             let int8_name = format!("{}.embed_tokens.weight_int8", self.mp);
             let scale_name = format!("{}.embed_tokens.weight_scale", self.mp);
@@ -430,7 +687,7 @@ impl WeightSource for EschaSource<'_> {
         embd_fmt: EmbeddingFormat,
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)> {
-        if self.is_escham_moe {
+        if self.is_escham_moe || self.c.is_escha_dense {
             // Escha lm_head is int8 + per-row f16 scale.
             if let Some((_, int8_data)) = self.source.tensor_data("lm_head.weight_int8") {
                 let (_, scale_data) = self
@@ -519,6 +776,13 @@ impl WeightSource for EschaSource<'_> {
 
     fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
         let config = self.c;
+        if config.is_escha_dense {
+            eprintln!(
+                "  loading layer {layer_idx}/{} ({:?}, Escha-dense)...",
+                config.n_layers, config.layer_types[layer_idx]
+            );
+            return self.escha_load_dense_layer(gpu, layer_idx, config);
+        }
         eprintln!(
             "  loading layer {layer_idx}/{} ({:?}, Escha)...",
             config.n_layers, config.layer_types[layer_idx]

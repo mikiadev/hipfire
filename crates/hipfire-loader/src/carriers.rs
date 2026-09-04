@@ -621,9 +621,9 @@ impl Carrier for Qwen35Carrier {
                 };
 
                 let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
-                let weights = if config.is_escham_moe {
-                    // Escha-W2 code-quant MoE dir → EschaSource (trellis/3INST
-                    // routed experts + int8 dense).
+                let weights = if config.is_escham_moe || config.is_escha_dense {
+                    // Escha-W2 code-quant dir (MoE `eschamoe` or dense `escha`)
+                    // → EschaSource (trellis/3INST decode on GPU).
                     let mut escha_source =
                         hipfire_arch_qwen35::qwen35::EschaSource::new(&source, &config)
                             .map_err(|e| format!("EschaSource::new: {e:?}"))?;
