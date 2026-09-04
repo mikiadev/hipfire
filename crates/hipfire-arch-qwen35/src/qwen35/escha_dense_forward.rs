@@ -133,6 +133,8 @@ pub fn deltanet_escha_layer_forward(
         &layer.a_log,
         n_v_heads,
     )?;
+    small_probe(gpu, "alpha", &s.dn_alpha);
+    small_probe(gpu, "beta", &s.dn_beta);
     gpu.conv1d_silu_split_f32(
         &s.dn_q_raw,
         &s.dn_k_raw,
@@ -415,5 +417,20 @@ fn state_probe(
                 (s / v.len() as f64).sqrt()
             );
         }
+    }
+}
+
+/// Probe a small per-head vector (alpha/beta gates) — env-gated.
+fn small_probe(gpu: &Gpu, label: &str, t: &GpuTensor) {
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_none() {
+        return;
+    }
+    if let Ok(v) = gpu.download_f32(t) {
+        let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &x in &v {
+            mn = mn.min(x);
+            mx = mx.max(x);
+        }
+        eprintln!("[escha-dense] {label}: n={} range=[{mn:.3e},{mx:.3e}] first4={:?}", v.len(), &v[..4.min(v.len())]);
     }
 }

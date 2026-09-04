@@ -413,3 +413,24 @@ b) conventions feeding it, OR how q/k/v land in the recurrence for dim 5120.
 Next: capture q/k/v/alpha/beta from a live LA layer and compare against the
 same tensors through the coherent MoE (32-v-head) arm — the first kernel whose
 state behavior diverges is the bug.
+
+## B1i — final characterization: output depends only on the LAST token (2026-09-04)
+
+- FP32-state probe: S[0] accumulates correctly (rms 0.029→0.066→0.106→0.142→
+  0.153 across tokens), alpha/beta gates healthy (alpha [-4.8, -3e-6], beta
+  [0.03, 0.98]), conv state updates. The recurrence IS running and storing.
+- But: "apple banana cherry is" and "zebra monkey lion is" → identical "The";
+  earlier "successes" ("Say hello"→"Hello!", "Repeat: zebra"→"ze") are
+  LAST-TOKEN ECHOES, not context use.
+=> The dense model's output depends only on the immediately preceding token.
+The DeltaNet recurrence stores state, yet that state does not influence the
+final logits. FA layers also cannot see past context through the LA layers.
+Candidates narrowed to: (a) the recurrent-state contribution is not reaching
+the residual/wo path (state read-back wrong), (b) q/k/v feeding the recurrence
+don't encode the right content, or (c) the conv output split/ordering makes the
+per-token "current" path dominate and the state path vanish.
+The MoE control (same engine, same kernels, 32 v-heads) has full context —
+so this is specific to the 48-v-head/5120-dim dense config or my arm's use of
+it. Best next experiment: byte-compare one LA layer's gated_delta_net inputs
+and dn_attn_out between dense and a synthetic MoE-shaped run, or materialize
+the dense qkv as a folded WeightTensor and run the PLAIN DeltaNet arm.
