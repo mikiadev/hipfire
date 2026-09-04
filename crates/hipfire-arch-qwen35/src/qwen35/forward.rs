@@ -2936,6 +2936,24 @@ fn forward_scratch_layers(
 
             (LayerWeights::DeltaNetEscha(layer), LayerType::LinearAttention) => {
                 trace_escha_dense_progress(layer_idx, "DeltaNetEscha");
+                if layer_idx == 0
+                    && hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_some()
+                {
+                    // input to layer 0 = raw embedding (int8-dequantized)
+                    if let Ok(v) = gpu.download_f32(&s.x) {
+                        let (mut mn, mut mx, mut rms) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+                        for &x in &v {
+                            mn = mn.min(x);
+                            mx = mx.max(x);
+                            rms += (x as f64) * (x as f64) / v.len() as f64;
+                        }
+                        eprintln!(
+                            "[escha-dense] L0 input (embed) range=[{mn:.4e},{mx:.4e}] rms={:.4e} first4={:?}",
+                            rms.sqrt(),
+                            &v[..4.min(v.len())]
+                        );
+                    }
+                }
                 super::escha_dense_forward::deltanet_escha_layer_forward(
                     gpu, layer, config, pos, delta_layer_idx, kv_cache, dn_state, s,
                 )?;

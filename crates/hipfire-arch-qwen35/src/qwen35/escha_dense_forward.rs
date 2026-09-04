@@ -56,6 +56,7 @@ pub fn deltanet_escha_layer_forward(
     // ── attention input norm + coded projections ──
     // normed x → s.tmp (decode input is the raw normed activation).
     gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
+    stats(gpu, "post rmsnorm (decode input)", &s.tmp);
     decode_into(gpu, &layer.qkv, &s.tmp, &s.dn_qkv)?;
     decode_into(gpu, &layer.z, &s.tmp, &s.dn_z)?;
     stats(gpu, "post qkv/z decode", &s.dn_qkv);

@@ -579,8 +579,20 @@ impl Carrier for Qwen35Carrier {
                     eprintln!("  warning: CASK eviction is not supported for safetensors Dir sources; eviction sidecar ignored");
                 }
                 // CPU-only before any GPU ownership (parity with HFQ carrier).
-                let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
-                    .map_err(|e| format!("{e}"))?;
+                // HIPFIRE_ESCHA_DENSE_STATE_FP32=1 forces FP32 DeltaNet state
+                // for escha-coded dense dir models (B1 debug: Q8-state
+                // divergence hypothesis on 5120-dim linear attention).
+                let dn_quant = if config.is_escha_dense
+                    && hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_STATE_FP32")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                {
+                    hipfire_arch_qwen35::qwen35::StateQuant::FP32
+                } else {
+                    crate::parse_state_quant(ctx.state_quant_override)
+                        .map_err(|e| format!("{e}"))?
+                };
                 eprintln!(
                     "  DeltaNet state quant: {}",
                     if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
