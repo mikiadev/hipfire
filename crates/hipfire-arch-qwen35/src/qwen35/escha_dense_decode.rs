@@ -65,7 +65,7 @@ pub fn escha_dense_decode_proj_host(
     out_scale: &[f32],
     x: &[f32],
 ) -> Vec<f32> {
-    use super::escham_decode::{apply_t128_host, decode_tiles};
+    use crate::escham_decode::{apply_t128_host, decode_tiles};
     // w_bare [in_p, out_p]; decode_tiles returns [in_p, out_p]
     let w_bare = decode_tiles(code, k, in_p, out_p);
     // u = T128(x . in_scale)
@@ -120,6 +120,9 @@ pub fn escha_dense_check_proj(
         scale = scale.max(want[i].abs());
     }
     eprintln!("[escha-dense] {label}: max_abs={max_abs:.6} rel={:.6}", max_abs / (scale + 1e-9));
+    // dump first 8 values each for eyeball
+    eprintln!("  got  [0..8] = {:?}", &got[..8.min(oc)]);
+    eprintln!("  want [0..8] = {:?}", &want[..8.min(oc)]);
     let _ = gpu.free_tensor(y);
     let _ = gpu.free_tensor(x);
     Ok((max_abs, max_abs / (scale + 1e-9)))
@@ -145,4 +148,111 @@ pub fn escha_dense_validate_proj(proj: &EschaDenseProjWeights, label: &str) -> H
         )));
     }
     Ok(())
+}
+
+/// Debug: compare the in-kernel rotate `u` against the host T128 of x.in_scale.
+pub fn escha_dense_check_rotate(
+    gpu: &mut Gpu,
+    proj: &EschaDenseProjWeights,
+    x_host: &[f32],
+    in_scale_host: &[f32],
+) -> HipResult<f32> {
+    use crate::escham_decode::apply_t128_host;
+    let ic = proj.in_p;
+    let x = gpu.upload_f32(x_host, &[ic])?;
+    let u = gpu.alloc_tensor(&[ic], DType::F32)?;
+    rdna_compute::escha_dense::escha_dense_rotate_in(gpu, &proj.in_scale, &x, &u)?;
+    let got = gpu.download_f32(&u)?;
+    let xs: Vec<f32> = (0..ic).map(|i| x_host[i] * in_scale_host[i]).collect();
+    let want = apply_t128_host(&xs);
+    let mut max_abs = 0.0f32;
+    for i in 0..ic {
+        max_abs = max_abs.max((got[i] - want[i]).abs());
+    }
+    eprintln!("[escha-dense] rotate max_abs={max_abs:.6}");
+    eprintln!("  got  [0..8] = {:?}", &got[..8.min(ic)]);
+    eprintln!("  want [0..8] = {:?}", &want[..8.min(ic)]);
+    let _ = gpu.free_tensor(u);
+    let _ = gpu.free_tensor(x);
+    Ok(max_abs)
+}
+
+/// Debug: run rotate + decode-gemm only; sum slices on host; compare with
+/// host `u @ W_bare` where W_bare = decode_tiles([in,out]). No finalize WHT.
+#[allow(clippy::too_many_arguments)]
+pub fn escha_dense_check_decode_stage(
+    gpu: &mut Gpu,
+    proj: &EschaDenseProjWeights,
+    x_host: &[f32],
+    code_host: &[i16],
+    in_scale_host: &[f32],
+) -> HipResult<f32> {
+    use crate::escham_decode::{apply_t128_host, decode_tiles};
+    let ic = proj.in_p;
+    let oc = proj.out_p;
+    let nit = ic / 16;
+    let n_slices = rdna_compute::escha_dense::escha_dense_n_slices(nit, oc);
+
+    let x = gpu.upload_f32(x_host, &[ic])?;
+    let u = gpu.alloc_tensor(&[ic], DType::F32)?;
+    let partial = gpu.alloc_tensor(&[n_slices * oc], DType::F32)?;
+    rdna_compute::escha_dense::escha_dense_rotate_in(gpu, &proj.in_scale, &x, &u)?;
+    // launch decode gemv only
+    let r = rdna_compute::escha_dense::escha_dense_decode_gemv_stage(
+        gpu, &proj.code, &u, &partial, ic, oc, n_slices, proj.k as i32,
+    );
+    if let Err(e) = r {
+        let _ = gpu.free_tensor(x);
+        let _ = gpu.free_tensor(u);
+        let _ = gpu.free_tensor(partial);
+        return Err(e);
+    }
+    let partial_host = gpu.download_f32(&partial)?;
+    // host: u = T128(x.in_scale); raw = u @ W_bare^T? decide by trying both
+    let xs: Vec<f32> = (0..ic).map(|i| x_host[i] * in_scale_host[i]).collect();
+    let u_host = apply_t128_host(&xs);
+    let w_bare = decode_tiles(code_host, proj.k as usize, ic, oc); // [in, out]
+    // raw[c] = sum_i u[i] * w_bare[i][c]
+    let mut raw = vec![0.0f32; oc];
+    for c in 0..oc {
+        let mut s = 0.0f32;
+        for i in 0..ic {
+            s += u_host[i] * w_bare[i * oc + c];
+        }
+        raw[c] = s;
+    }
+    let mut got = vec![0.0f32; oc];
+    for s in 0..n_slices {
+        for c in 0..oc {
+            got[c] += partial_host[s * oc + c];
+        }
+    }
+    let mut raw_t = vec![0.0f32; oc];
+    for c in 0..oc {
+        let mut s = 0.0f32;
+        for i in 0..ic {
+            s += u_host[i] * w_bare[c * ic + i];
+        }
+        raw_t[c] = s;
+    }
+    let mut got = vec![0.0f32; oc];
+    for s in 0..n_slices {
+        for c in 0..oc {
+            got[c] += partial_host[s * oc + c];
+        }
+    }
+    let mut max_abs = 0.0f32;
+    let mut max_abs_t = 0.0f32;
+    for c in 0..oc {
+        max_abs = max_abs.max((got[c] - raw[c]).abs());
+        max_abs_t = max_abs_t.max((got[c] - raw_t[c]).abs());
+    }
+    eprintln!("[escha-dense] decode-stage max_abs(normal)={max_abs:.6} max_abs(transposed)={max_abs_t:.6}");
+    eprintln!("  got  [0..8] = {:?}", &got[..8.min(oc)]);
+    eprintln!("  raw  [0..8] = {:?}", &raw[..8.min(oc)]);
+    eprintln!("  rawT [0..8] = {:?}", &raw_t[..8.min(oc)]);
+    let _ = gpu.free_tensor(x);
+    let _ = gpu.free_tensor(u);
+    let _ = gpu.free_tensor(partial);
+    Ok(max_abs.min(max_abs_t))
 }

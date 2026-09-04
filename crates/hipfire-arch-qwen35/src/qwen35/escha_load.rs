@@ -487,7 +487,7 @@ impl<'a> EschaSource<'a> {
         gpu.hip.memcpy_htod(&buf, code_data)?;
         let code = GpuTensor {
             buf,
-            shape: vec![code_elems],
+            shape: vec![in_p / 16, out_p / 16, k as usize * 16],
             dtype: DType::F16,
         };
         let in_scale = gpu.upload_f32(&in_scale_f32, &[in_p])?;

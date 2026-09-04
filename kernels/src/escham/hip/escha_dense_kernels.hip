@@ -121,6 +121,12 @@ __device__ __forceinline__ int escha_dense_pi(int r) {
 // partial[row][ocb*128+tid] = sum over this slice's IC tiles of u . decode(code)
 // One row per block; IC reduction sliced across blockIdx.z so batch-1 fills the
 // device. Port of llama.cpp `escha_matmul_dense<K, R=1>` (generation path).
+//
+// Empirical pin (examples/pin_funnel.rs on real model tiles, both K): the exact
+// codebook index of weight (r,c) is the funnel (hi = payload word w0-1, lo =
+// payload word w0) >> (sp & 31), low 16 bits, where w0 = (NW - (sp>>5)) mod NW
+// and the payload words are the tile's 16*K int16 as little-endian u32. We keep
+// the tile's NW words in plain shared memory and do two reads per weight.
 extern "C" __global__ void escha_dense_decode_gemv_kernel(
     const int16_t* __restrict__ code,    // [in/16, out/16, 16*K] i16
     const float* __restrict__ u,         // [IC] pre-rotated input
@@ -130,9 +136,8 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
     int n_slices,
     int K) {
     extern __shared__ char s_raw[];
-    // overlapping uint2 pairs: s_pay[grp][w].y = word w, .x = word w+1 (mod NW)
-    uint2* s_pay = (uint2*)s_raw;             // [ESCHA_DGROUPS][ESCHA_DMAX_W]
-    float* s_u   = (float*)(s_pay + ESCHA_DGROUPS * ESCHA_DMAX_W);  // [tiles_max*16]
+    uint32_t* s_pay = (uint32_t*)s_raw;               // [ESCHA_DGROUPS][NW words]
+    float* s_u     = (float*)(s_pay + ESCHA_DGROUPS * (8 * K));  // [tiles_max*16]
 
     const int NW  = 8 * K;
     const int NB  = 32 * NW;
@@ -159,8 +164,7 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
         s_u[j] = u_row[j];
     }
 
-    uint2* pay = s_pay + grp * ESCHA_DMAX_W;
-    const int n_pay_w = NW;                      // words to load per tile
+    uint32_t* pay = s_pay + grp * NW;
 
     // start bit for this column lane, r = 0
     int s0 = ((32 - K) - K * (32 * cc + 4 * (cc >> 3))) % NB;
@@ -172,11 +176,9 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
     for (int ti = lo; ti < hi; ++ti) {
         const int16_t* tile =
             code + ((size_t)(ti * nct + tj)) * (size_t)(16 * K);
-        // load this tile's payload words as overlapping pairs
+        // load this tile's payload words (plain, little-endian u32)
         for (int w = cc; w < n_wd; w += ESCHA_DTILE) {
-            uint32_t v = ((const uint32_t*)tile)[w];
-            pay[w].y = v;                          // word w (hi of pair w)
-            pay[(w + 1 == NW) ? 0 : w + 1].x = v;  // word w also = lo of pair w-1
+            pay[w] = ((const uint32_t*)tile)[w];
         }
         __syncthreads();
 
@@ -187,15 +189,12 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
             if (sp < 0) sp += NB;
             const int g0 = sp >> 5;
             const int w0 = g0 ? (NW - g0) : 0;
-            const int w1 = w0 ? (w0 - 1) : (NW - 1);
+            const int wh = (w0 + NW - 1) % NW;   // hi word = w0 - 1 (circular)
 
-            // 64-bit funnel: (word w0 : word w0-1) >> (sp & 31), low 16 bits.
-            // word w0 is the LOW word of the pair we stored as pay[w0-1].x
-            // (pay[w-1].x = word w), i.e. the funnel hi:lo = pay[w0-1] as
-            // {hi=pay[w0-1].y=word w0-1, lo=pay[w0-1].x=word w0}.
-            uint2 p = pay[w1];   // .y = word w1, .x = word w0
+            uint32_t hi = pay[wh];
+            uint32_t lo = pay[w0];
             uint32_t idx =
-                ((uint64_t)(uint32_t)p.y << 32 | (uint32_t)p.x) >> (sp & 31);
+                ((uint64_t)hi << 32 | (uint64_t)lo) >> (sp & 31);
             idx &= 0xffffu;
             acc += uu[r] * escha_dense_codebook(idx);
         }

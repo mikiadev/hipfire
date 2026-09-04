@@ -160,9 +160,10 @@ pub fn escha_dense_decode_gemv(
         "escha_dense_decode_gemv",
         n_slices * ic * oc / n_slices * 4,
     );
-    // shared: 8*24 uint2 (1536 B) + tiles*16 floats
+    // shared: 8*NW u32 payload words (K=3: 8*24*4 = 768 B) + tiles*16 floats
     let tiles_max = nit.div_ceil(n_slices);
-    let smem = (8 * 24 * 8 + tiles_max * 16 * 4) as u32;
+    let nw = 8 * (k as usize);
+    let smem = (8 * nw * 4 + tiles_max * 16 * 4) as u32;
     gpu.launch_maybe_blob(
         "escha_dense_decode_gemv_kernel",
         [1, n_ocb as u32, n_slices as u32],
@@ -206,6 +207,66 @@ pub fn escha_dense_decode_gemv(
             b.push_ptr(yp);
             b.push_i32(oc_i);
             b.push_i32(ns_i);
+            b
+        },
+    )
+}
+
+/// Diagnostic stage launch: decode-gemm only (rotate + partial). Exposed for
+/// the GPU-vs-host stage comparison; production callers use
+/// [`escha_dense_decode_gemv`].
+#[allow(clippy::too_many_arguments)]
+pub fn escha_dense_decode_gemv_stage(
+    gpu: &mut Gpu,
+    code: &GpuTensor,
+    u: &GpuTensor,
+    partial: &GpuTensor,
+    ic: usize,
+    oc: usize,
+    n_slices: usize,
+    k: i32,
+) -> HipResult<()> {
+    gpu.bind_thread()?;
+    gpu.ensure_kernel(
+        "escha_dense_decode_gemv_stage",
+        &kernels::escha_dense_src(),
+        "escha_dense_decode_gemv_kernel",
+    )?;
+    let cp = code.buf.as_ptr();
+    let up = u.buf.as_ptr();
+    let pp = partial.buf.as_ptr();
+    let ic_i = ic as i32;
+    let oc_i = oc as i32;
+    let ns_i = n_slices as i32;
+    let nit = ic / 16;
+    let n_ocb = oc / 128;
+    let mut params: Vec<*mut c_void> = vec![
+        &cp as *const _ as *mut c_void,
+        &up as *const _ as *mut c_void,
+        &pp as *const _ as *mut c_void,
+        &ic_i as *const _ as *mut c_void,
+        &oc_i as *const _ as *mut c_void,
+        &ns_i as *const _ as *mut c_void,
+        &k as *const _ as *mut c_void,
+    ];
+    let tiles_max = nit.div_ceil(n_slices);
+    let nw = 8 * (k as usize);
+    let smem = (8 * nw * 4 + tiles_max * 16 * 4) as u32;
+    gpu.launch_maybe_blob(
+        "escha_dense_decode_gemv_kernel",
+        [1, n_ocb as u32, n_slices as u32],
+        [NT, 1, 1],
+        smem,
+        &mut params,
+        || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(cp);
+            b.push_ptr(up);
+            b.push_ptr(pp);
+            b.push_i32(ic_i);
+            b.push_i32(oc_i);
+            b.push_i32(ns_i);
+            b.push_i32(k);
             b
         },
     )
