@@ -1959,7 +1959,7 @@ pub fn forward_scratch_embed_mrope(
 
 // ── Forward scratch layers (dispatch family version) ────────────────────
 
-fn forward_scratch_layers(
+pub(crate) fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,

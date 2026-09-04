@@ -205,25 +205,195 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
 }
 
 // finalize: sum the slices, WHT over the 128-col group, scale by out_scale.
+// Works for both decode (n_rows=1, partial is [n_slices * OC]) and prefill
+// (n_rows > 1, partial is [n_slices * n_rows * OC]).
 extern "C" __global__ void escha_dense_finalize_kernel(
     const float* __restrict__ out_scale, // [OC]
-    const float* __restrict__ partial,   // [n_slices * OC]
-    float* __restrict__ y,               // [OC]
+    const float* __restrict__ partial,   // [n_slices * n_rows * OC] (or [n_slices * OC] when n_rows=1)
+    float* __restrict__ y,               // [n_rows * OC] (or [OC] when n_rows=1)
     int OC,
+    int n_rows,
     int n_slices) {
     __shared__ float s_acc[ESCHA_DNT];
     const int tid = threadIdx.x;
-    const int c   = blockIdx.x * ESCHA_DNT + tid;
+    const int row = blockIdx.x;
+    const int c   = blockIdx.y * ESCHA_DNT + tid;
+
+    // Compute the base offset for this row in the partial array
+    int64_t row_base;
+    if (n_rows <= 1) {
+        // Decode path: partial is [n_slices * OC], no row offset
+        row_base = 0;
+    } else {
+        // Prefill path: partial is [n_slices * n_rows * OC]
+        row_base = (int64_t)row * OC;
+    }
+
     float sum = 0.0f;
-    for (int s = 0; s < n_slices; ++s) {
-        sum += partial[((int64_t)s) * OC + c];
+    if (c < OC) {
+        for (int s = 0; s < n_slices; ++s) {
+            sum += partial[((int64_t)s) * (n_rows <= 1 ? OC : (int64_t)n_rows * OC) + row_base + c];
+        }
     }
     s_acc[tid] = sum;
     __syncthreads();
 
     escha_dense_hadamard_128(s_acc, ESCHA_DNT, tid, ESCHA_DNT);
 
-    y[c] = s_acc[tid] * out_scale[c];
+    if (c < OC) {
+        if (n_rows <= 1) {
+            y[c] = s_acc[tid] * out_scale[c];
+        } else {
+            y[row * OC + c] = s_acc[tid] * out_scale[c];
+        }
+    }
+}
+
+// ===========================================================================
+// Dense prefill kernels (batched, multi-row)
+//
+// Same codec, same rotations, and SAME payload/funnel-shift convention as
+// the decode path above — plain uint32_t payload array (not uint2 pairs),
+// hi:lo assembled as ((word_w0-1) << 32 | word_w0) to match the verified
+// decode kernel bit-for-bit.
+//
+//   escha_dense_matmul_prefill_kernel  scalar FMA, R rows per block (R=64
+//                                     prefill, R=1 gen). Decoded weights go to
+//                                     shared memory for reuse across rows.
+//
+// All write the same partial layout [n_slices][n_rows][OC] and share
+// escha_dense_finalize_kernel.
+// ===========================================================================
+
+#define ESCHA_DROWS_DENSE       64   // rows per block on the prefill path
+#define ESCHA_DROWS_DENSE_GEN    1   // rows per block on the gen path
+#define ESCHA_DGEN_MAX_ROWS     16   // at or below this, use gen instantiation
+
+// u[row] = T128(x[row] * in_scale) -- batched, chunked (IC up to 17408).
+// One block per row, 256 threads.
+__global__ void escha_dense_rotate_in_dense_kernel(
+    const float* __restrict__ in_scale, // [IC]
+    const float* __restrict__ x,        // [n_rows, IC]
+    float* __restrict__ u,              // [n_rows, IC]
+    int IC,
+    int n_rows) {
+    __shared__ float s_u[ESCHA_DROT_CHUNK];
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= n_rows) return;
+    const float* x_row = x + (int64_t)row * IC;
+    float* dst = u + (int64_t)row * IC;
+    for (int off = 0; off < IC; off += ESCHA_DROT_CHUNK) {
+        const int n = min(ESCHA_DROT_CHUNK, IC - off);
+        for (int i = tid; i < n; i += blockDim.x) {
+            s_u[i] = x_row[off + i] * in_scale[off + i];
+        }
+        __syncthreads();
+        escha_dense_hadamard_128(s_u, n, tid, blockDim.x);
+        __syncthreads();
+        for (int i = tid; i < n; i += blockDim.x) {
+            dst[off + i] = s_u[i];
+        }
+        __syncthreads();
+    }
+}
+
+// partial[slice][row][c] = sum over this slice's input tiles of u . decode(code)
+// R rows per block. Decoded weights go to shared memory for reuse across rows.
+// R is a runtime parameter (1 for gen, 64 for prefill).
+__global__ void escha_dense_matmul_prefill_kernel(
+    const int16_t* __restrict__ code,    // [in/16, out/16, 16*K] i16
+    const float* __restrict__ u,         // [n_rows, IC]
+    float* __restrict__ partial,         // [n_slices * n_rows * OC]
+    int IC,
+    int OC,
+    int n_rows,
+    int n_slices,
+    int K,
+    int R) {
+    // Same payload convention as escha_dense_decode_gemv_kernel:
+    // plain uint32_t array, funnel-shift (hi=pay[w0-1] << 32 | lo=pay[w0]) >> (sp&31).
+    extern __shared__ char s_raw[];
+    uint32_t* s_pay = (uint32_t*)s_raw;
+    float* s_u = (float*)(s_pay + ESCHA_DGROUPS * (8 * K));
+
+    const int NW = 8 * K;
+    const int NB = 32 * NW;
+    const int nit = IC / ESCHA_DTILE;
+    const int nct = OC / ESCHA_DTILE;
+    const int n_wd = (16 * K) / 2;
+
+    const int tid = threadIdx.x;
+    const int start = blockIdx.x * R;
+    const int nrow = min(R, n_rows - start);
+    const int sl = blockIdx.z;
+    const int lo = (int)(((int64_t)nit * sl) / n_slices);
+    const int hi = (int)(((int64_t)nit * (sl + 1)) / n_slices);
+
+    const int grp = tid / ESCHA_DTILE;
+    const int cc = tid % ESCHA_DTILE;
+    const int tj = blockIdx.y * ESCHA_DGROUPS + grp;
+
+    uint32_t* pay = s_pay + grp * NW;
+
+    int s0 = ((32 - K) - K * (32 * cc + 4 * (cc >> 3))) % NB;
+    if (s0 < 0) s0 += NB;
+
+    float acc[64];
+    for (int m = 0; m < R; ++m) acc[m] = 0.0f;
+
+    if (R == 1) {
+        const float* u_row = u + (int64_t)start * IC + (int64_t)lo * ESCHA_DTILE;
+        const int n_stage = (hi - lo) * ESCHA_DTILE;
+        for (int j = tid; j < n_stage; j += ESCHA_DNT) {
+            s_u[j] = u_row[j];
+        }
+    }
+    __syncthreads();
+
+    for (int ti = lo; ti < hi; ++ti) {
+        if (R != 1) {
+            for (int j = tid; j < R * ESCHA_DTILE; j += ESCHA_DNT) {
+                const int m = j / ESCHA_DTILE;
+                const int r = j % ESCHA_DTILE;
+                s_u[j] = m < nrow ? u[(int64_t)(start + m) * IC + ti * ESCHA_DTILE + r] : 0.0f;
+            }
+        }
+
+        const uint32_t* src = (const uint32_t*)(code + (int64_t)(ti * nct + tj) * (16 * K));
+        for (int w = cc; w < n_wd; w += ESCHA_DTILE) {
+            pay[w] = src[w];
+        }
+        if (R == 1) { __syncwarp(); } else { __syncthreads(); }
+
+        const float* uu = s_u + (ti - lo) * ESCHA_DTILE;
+
+        for (int r = 0; r < ESCHA_DTILE; ++r) {
+            int sp = s0 - K * escha_dense_pi(r);
+            if (sp < 0) sp += NB;
+            const int g0 = sp >> 5;
+            const int w0 = g0 ? (NW - g0) : 0;
+            const int wh = (w0 + NW - 1) % NW;
+
+            uint32_t hi = pay[wh];
+            uint32_t lo = pay[w0];
+            uint32_t idx = ((uint64_t)hi << 32 | (uint64_t)lo) >> (sp & 31);
+            idx &= 0xffffu;
+            const float wv = escha_dense_codebook(idx);
+            if (R == 1) {
+                acc[0] += uu[r] * wv;
+            } else {
+                for (int m = 0; m < R; ++m) {
+                    acc[m] += s_u[m * ESCHA_DTILE + r] * wv;
+                }
+            }
+        }
+        if (R == 1) { __syncwarp(); } else { __syncthreads(); }
+    }
+
+    for (int m = 0; m < nrow; ++m) {
+        partial[((int64_t)sl * n_rows + start + m) * OC + blockIdx.y * ESCHA_DNT + tid] = acc[m];
+    }
 }
 
 #endif  // ESCHA_DENSE_KERNELS_HIP

@@ -7410,6 +7410,56 @@ pub(crate) fn forward_batch_chunk_impl(
                 kv_layer_idx += 1;
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
+            // Escha code-quant dense layers: per-token fallback (gather/scatter).
+            // These layers use in-kernel decode of int16 trellis codes (no
+            // WeightTensor), so they can't run through the batched MQ/Q8
+            // projection path. They fall back to the proven per-token
+            // forward_scratch_layers path with gather/scatter.
+            (LayerWeights::DeltaNetEscha(_), LayerType::LinearAttention) |
+            (LayerWeights::FullAttnEscha(_), LayerType::FullAttention) => {
+                for i in 0..n {
+                    let pos = start_pos + i;
+                    gpu.hip.memcpy_dtod_at(
+                        &s.x.buf,
+                        0,
+                        &pbs.x_batch.buf,
+                        i * dim_row_bytes,
+                        dim_row_bytes,
+                    )?;
+                    let pos_i32 = pos as i32;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+                    super::forward::forward_scratch_layers(
+                        gpu,
+                        weights,
+                        config,
+                        pos,
+                        kv_cache,
+                        dn_state,
+                        s,
+                        None,
+                        None,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &pbs.x_batch.buf,
+                        i * dim_row_bytes,
+                        &s.x.buf,
+                        0,
+                        dim_row_bytes,
+                    )?;
+                }
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+                // DeltaNetEscha advances delta_layer_idx; FullAttnEscha advances kv_layer_idx
+                match &weights.layers[layer_idx] {
+                    LayerWeights::DeltaNetEscha(_) => delta_layer_idx += 1,
+                    LayerWeights::FullAttnEscha(_) => kv_layer_idx += 1,
+                    _ => {}
+                }
+                dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+            }
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
     }

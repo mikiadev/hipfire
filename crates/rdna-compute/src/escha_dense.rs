@@ -186,17 +186,19 @@ pub fn escha_dense_decode_gemv(
     // 3. finalize (grid: OC/128, one block per 128-col group)
     let op = out_scale.buf.as_ptr();
     let yp = y.buf.as_ptr();
+    let n_rows_i = 1i32; // decode path: 1 row
     let mut params: Vec<*mut c_void> = vec![
         &op as *const _ as *mut c_void,
         &pp as *const _ as *mut c_void,
         &yp as *const _ as *mut c_void,
         &oc_i as *const _ as *mut c_void,
+        &n_rows_i as *const _ as *mut c_void,
         &ns_i as *const _ as *mut c_void,
     ];
     let _timer2 = crate::profile::begin_timer(&gpu.hip, "escha", "escha_dense_finalize", oc * 4);
     gpu.launch_maybe_blob(
         "escha_dense_finalize_kernel",
-        [n_ocb as u32, 1, 1],
+        [1, n_ocb as u32, 1], // row=0 for decode
         [NT, 1, 1],
         0,
         &mut params,
@@ -206,10 +208,198 @@ pub fn escha_dense_decode_gemv(
             b.push_ptr(pp);
             b.push_ptr(yp);
             b.push_i32(oc_i);
+            b.push_i32(n_rows_i);
             b.push_i32(ns_i);
             b
         },
     )
+}
+
+/// Batched rotate: u[row] = T128(x[row] . in_scale) for all rows.
+/// `u` is [n_rows, IC] (f32).
+pub fn escha_dense_rotate_in_dense(
+    gpu: &mut Gpu,
+    in_scale: &GpuTensor,
+    x: &GpuTensor,
+    u: &GpuTensor,
+    n_rows: usize,
+) -> HipResult<()> {
+    gpu.bind_thread()?;
+    gpu.ensure_kernel(
+        "escha_dense_rotate_in_dense",
+        &kernels::escha_dense_src(),
+        "escha_dense_rotate_in_dense_kernel",
+    )?;
+    let sp = in_scale.buf.as_ptr();
+    let xp = x.buf.as_ptr();
+    let up = u.buf.as_ptr();
+    let ic = u.shape.last().copied().unwrap_or(x.numel() / n_rows.max(1)) as i32;
+    let n_rows_i = n_rows as i32;
+
+    let mut params: Vec<*mut c_void> = vec![
+        &sp as *const _ as *mut c_void,
+        &xp as *const _ as *mut c_void,
+        &up as *const _ as *mut c_void,
+        &ic as *const _ as *mut c_void,
+        &n_rows_i as *const _ as *mut c_void,
+    ];
+    gpu.launch_maybe_blob(
+        "escha_dense_rotate_in_dense_kernel",
+        [n_rows as u32, 1, 1],
+        [256, 1, 1],
+        0,
+        &mut params,
+        || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(sp);
+            b.push_ptr(xp);
+            b.push_ptr(up);
+            b.push_i32(ic);
+            b.push_i32(n_rows_i);
+            b
+        },
+    )
+}
+
+/// Batched prefill matmul for one coded projection.
+/// `u` is [n_rows, IC] pre-rotated activations.
+/// `partial` is [n_slices * n_rows * OC] (f32).
+/// `n_slices` is chosen to fill the device.
+/// R = rows per block (1 for gen, 64 for prefill).
+#[allow(clippy::too_many_arguments)]
+pub fn escha_dense_matmul_prefill(
+    gpu: &mut Gpu,
+    code: &GpuTensor,
+    u: &GpuTensor,
+    partial: &GpuTensor,
+    n_rows: usize,
+    n_slices: usize,
+    k: i32,
+    r: i32,
+) -> HipResult<()> {
+    let ic = code.shape[0] as usize * 16;
+    let oc = code.shape[1] as usize * 16;
+    let nit = ic / 16;
+    let n_ocb = oc / 128;
+
+    gpu.bind_thread()?;
+    gpu.ensure_kernel(
+        "escha_dense_matmul_prefill",
+        &kernels::escha_dense_src(),
+        "escha_dense_matmul_prefill_kernel",
+    )?;
+
+    let cp = code.buf.as_ptr();
+    let up = u.buf.as_ptr();
+    let pp = partial.buf.as_ptr();
+    let ic_i = ic as i32;
+    let oc_i = oc as i32;
+    let n_rows_i = n_rows as i32;
+    let ns_i = n_slices as i32;
+
+    let n_rb = (n_rows + r as usize - 1) / r as usize;
+
+    let nw = 8 * k as usize;
+    let tiles_max = nit.div_ceil(n_slices);
+    let smem = (8 * nw * std::mem::size_of::<u32>() + tiles_max * 16 * std::mem::size_of::<f32>()) as u32;
+
+    let mut params: Vec<*mut c_void> = vec![
+        &cp as *const _ as *mut c_void,
+        &up as *const _ as *mut c_void,
+        &pp as *const _ as *mut c_void,
+        &ic_i as *const _ as *mut c_void,
+        &oc_i as *const _ as *mut c_void,
+        &n_rows_i as *const _ as *mut c_void,
+        &ns_i as *const _ as *mut c_void,
+        &k as *const _ as *mut c_void,
+        &r as *const _ as *mut c_void,
+    ];
+    gpu.launch_maybe_blob(
+        "escha_dense_matmul_prefill_kernel",
+        [n_rb as u32, n_ocb as u32, n_slices as u32],
+        [NT, 1, 1],
+        smem,
+        &mut params,
+        || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(cp);
+            b.push_ptr(up);
+            b.push_ptr(pp);
+            b.push_i32(ic_i);
+            b.push_i32(oc_i);
+            b.push_i32(n_rows_i);
+            b.push_i32(ns_i);
+            b.push_i32(k);
+            b.push_i32(r);
+            b
+        },
+    )
+}
+
+/// Batched finalize: sum slices, WHT over 128-col group, scale by out_scale.
+/// `partial` is [n_slices * n_rows * OC], `y` is [n_rows, OC].
+pub fn escha_dense_finalize_dense(
+    gpu: &mut Gpu,
+    out_scale: &GpuTensor,
+    partial: &GpuTensor,
+    y: &GpuTensor,
+    n_rows: usize,
+    n_slices: usize,
+) -> HipResult<()> {
+    gpu.bind_thread()?;
+    gpu.ensure_kernel(
+        "escha_dense_finalize_dense",
+        &kernels::escha_dense_src(),
+        "escha_dense_finalize_kernel",
+    )?;
+    let op = out_scale.buf.as_ptr();
+    let pp = partial.buf.as_ptr();
+    let yp = y.buf.as_ptr();
+    let oc = out_scale.numel() as i32;
+    let n_rows_i = n_rows as i32;
+    let ns_i = n_slices as i32;
+    let n_ocb = (out_scale.numel() / 128) as u32;
+
+    let mut params: Vec<*mut c_void> = vec![
+        &op as *const _ as *mut c_void,
+        &pp as *const _ as *mut c_void,
+        &yp as *const _ as *mut c_void,
+        &oc as *const _ as *mut c_void,
+        &n_rows_i as *const _ as *mut c_void,
+        &ns_i as *const _ as *mut c_void,
+    ];
+    gpu.launch_maybe_blob(
+        "escha_dense_finalize_kernel",
+        [n_rows as u32, n_ocb, 1],
+        [128, 1, 1],
+        0,
+        &mut params,
+        || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(op);
+            b.push_ptr(pp);
+            b.push_ptr(yp);
+            b.push_i32(oc);
+            b.push_i32(n_rows_i);
+            b.push_i32(ns_i);
+            b
+        },
+    )
+}
+
+/// Choose the IC-slice count for prefill: target ~512 blocks at batch 1,
+/// but long prompts already have plenty of rows.
+pub fn escha_dense_n_slices_prefill(nit: usize, oc: usize, n_rows: usize) -> usize {
+    let n_ocb = (oc / 128).max(1);
+    let n_rb = (n_rows + 63) / 64; // R=64
+    let target = 512;
+    let mut n_slices = target / n_rb.max(1) / n_ocb.max(1);
+    n_slices = n_slices.max(1).min(nit);
+    // Ensure nit is divisible by n_slices
+    while n_slices < nit && nit % n_slices != 0 {
+        n_slices += 1;
+    }
+    n_slices
 }
 
 /// Diagnostic stage launch: decode-gemm only (rotate + partial). Exposed for

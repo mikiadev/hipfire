@@ -15,6 +15,7 @@
 
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 
@@ -440,6 +441,46 @@ pub fn fullattn_escha_layer_forward(
     decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
     gpu.add_f32(&s.x, &s.o, &s.x)?;
     stats(gpu, "post FFN residual (FA)", &s.x);
+    Ok(())
+}
+
+/// Batched prefill for one Escha-coded dense projection.
+/// `x_batch` is [N, IC], `y_batch` is [N, OC].
+/// Uses the prefill kernel (R=64 rows per block, decoded weights to shared).
+pub fn escha_dense_decode_proj_batch(
+    gpu: &mut Gpu,
+    proj: &super::weights::EschaDenseProjWeights,
+    x_batch: &GpuTensor,
+    y_batch: &GpuTensor,
+    n_rows: usize,
+) -> HipResult<()> {
+    let ic = proj.in_p;
+    let oc = proj.out_p;
+    let k = proj.k as i32;
+    let nit = ic / 16;
+    let r = if n_rows <= 1 { 1 } else { 64 };
+    let n_slices = rdna_compute::escha_dense::escha_dense_n_slices_prefill(nit, oc, n_rows);
+    debug_assert!(n_slices >= 1);
+
+    // Rotate: u = T128(x . in_scale)
+    let u = gpu.alloc_tensor(&[n_rows * ic], DType::F32)?;
+    rdna_compute::escha_dense::escha_dense_rotate_in_dense(
+        gpu, &proj.in_scale, x_batch, &u, n_rows,
+    )?;
+
+    // Matmul: partial = u @ decode(code)
+    let partial = gpu.alloc_tensor(&[n_slices * n_rows * oc], DType::F32)?;
+    rdna_compute::escha_dense::escha_dense_matmul_prefill(
+        gpu, &proj.code, &u, &partial, n_rows, n_slices, k, r,
+    )?;
+
+    // Finalize: y = T128_col(sum_slices) . out_scale
+    rdna_compute::escha_dense::escha_dense_finalize_dense(
+        gpu, &proj.out_scale, &partial, y_batch, n_rows, n_slices,
+    )?;
+
+    let _ = gpu.free_tensor(u);
+    let _ = gpu.free_tensor(partial);
     Ok(())
 }
 
