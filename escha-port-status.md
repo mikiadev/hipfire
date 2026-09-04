@@ -265,3 +265,31 @@ deinterleave subtlety, or conv/state ordering) rather than the decode math.
 Suggested next step (not yet run): materialize one dense projection to a folded
 f32 WeightTensor at load and route the PLAIN DeltaNet/FullAttn arm over it —
 decodes coherent → bug in the escha arm; still broken → kernel interaction.
+
+## B1c — q/k norm convention fix: first tokens now correct (2026-09-04, commit 888ef3b08)
+
+BREAKTHROUGH via A/B norm-convention sweep: the dense export stores the FA
+q_norm/k_norm RMSNorm weights as TRUE gamma (raw mean ~0.23 — NOT gamma-1
+offsets like the MoE export and like the layer input/ffn norms, which are
+stored ~N(0,0.03) and need +1.0). Loading q/k norms with bias 0.0 (raw) flips
+the model from garbage to CORRECT first tokens:
+  - "Tokyo is the capital of" → "Japan" (was "Tokyoyo巴尔onos…")
+  - "The capital of France is" → "The capital cathedral" (grammatical)
+FA attention was confirmed as the corrupting path pre-fix (passthrough test
+gave natural "It looks"), and q/k raw fixed it.
+
+Root rule: hipfire's +1.0 norm-bias convention (gamma-1 storage) applies to the
+layer input/ffn norms in BOTH exports, but the dense export's q/k norms are
+plain gamma. (Why the MoE export differs for q/k is an open question — its
+q_norm may be stored gamma-1, or the EschaLabs pipelines differ between
+exports.)
+
+Remaining: after the correct first token, decode decays toward template/special
+tokens (248068 <think>, 248046 <im_end>, newlines) — the DeltaNet recurrent-
+state divergence profile. FA path is now producing correct early tokens; next
+suspects are the LA DeltaNet path across decode steps (state persistence /
+conv ordering) or a template/reasoning interaction for this VL-shaped model.
+
+Debug toggles now in tree (all env-gated, MoE path untouched):
+HIPFIRE_ESCHA_DENSE_TRACE / _LOGITS / _NO_FFN / _NO_ATTN / _NO_FA_GATE /
+_STATE_FP32 / _RAW_NORMS (q/k raw is now the hard-coded default).
