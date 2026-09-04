@@ -145,6 +145,8 @@ pub fn deltanet_escha_layer_forward(
         k_dim,
         v_dim,
     )?;
+    qkv_probe(gpu, "dn_q_raw", &s.dn_q_raw);
+    qkv_probe(gpu, "dn_v", &s.dn_v);
     gpu.fused_qk_l2_norm_scale_f32(
         &s.dn_q_raw,
         &s.dn_k_raw,
@@ -231,6 +233,7 @@ pub fn deltanet_escha_layer_forward(
     // ── wo coded projection + residual ──
     decode_into(gpu, &layer.wo, &s.dn_normed, &s.o)?;
     stats(gpu, "post wo decode", &s.o);
+    stats(gpu, "pre-add x (LA)", &s.x);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
     stats(gpu, "post LA residual", &s.x);
 
@@ -432,5 +435,26 @@ fn small_probe(gpu: &Gpu, label: &str, t: &GpuTensor) {
             mx = mx.max(x);
         }
         eprintln!("[escha-dense] {label}: n={} range=[{mn:.3e},{mx:.3e}] first4={:?}", v.len(), &v[..4.min(v.len())]);
+    }
+}
+
+/// Probe whether conv outputs are token-differentiating (env-gated).
+fn qkv_probe(gpu: &Gpu, label: &str, t: &GpuTensor) {
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_none() {
+        return;
+    }
+    if let Ok(v) = gpu.download_f32(t) {
+        let (mut mn, mut mx, mut rms) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+        for &x in &v {
+            mn = mn.min(x);
+            mx = mx.max(x);
+            rms += (x as f64) * (x as f64) / v.len() as f64;
+        }
+        eprintln!(
+            "[escha-dense] {label}: n={} rms={:.4e} range=[{mn:.3e},{mx:.3e}] first2={:?}",
+            v.len(),
+            rms.sqrt(),
+            &v[..2.min(v.len())]
+        );
     }
 }
