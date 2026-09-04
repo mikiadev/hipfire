@@ -486,3 +486,20 @@ Consolidated state after two subagent passes (port 97e0d889 + bisect ada12fbb),
   it (coherent ⇒ escha-arm wiring; broken ⇒ kernel/state interaction at 48
   v-heads). Env-gated probes exist: HIPFIRE_ESCHA_DENSE_* toggles.
 - M3 (prefill/throughput) not started; dense decode ~1-2 tok/s per-token.
+
+## B3b — decisive control: HFQ-dense 27B multi-token is COHERENT (2026-09-04)
+
+Ran qwen3.6-27b.mq4r (HFQ dense, same 5120-dim/64L/24H/4KV/16kH/48vH/128hd
+hybrid, plain MQ4 weights) on this tree with reasoning.mode off:
+"The sky appears blue because sunlight is scattered in all directions by the
+gases and particles in Earth's atmosphere, with blue light being scattered more
+than other colors because it travels in shorter, smaller waves. This" — 40
+coherent tokens, 13.3 tok/s, finish length.
+=> The shared dense-DeltaNet path at the 48-v-head/5120 shape is FULLY coherent
+on this tree. The dense-escha multi-token decay is therefore conclusively in
+the ESCHA DENSE ARM / LOADER (projection handling), NOT the kernels or the
+shared DeltaNet/FA path. The per-projection decode is proven exact, so the
+remaining defect is a wiring/integration detail in how the escha-coded
+projections feed the shared arm flow — e.g. a buffer/order/scale convention in
+deltanet_escha_layer_forward (escha_dense_forward.rs) vs the plain arm
+(forward.rs ~1999), which is now the ONLY untested difference.
