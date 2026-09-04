@@ -7652,7 +7652,7 @@ fn run_fa_layer_body(
     }
     let ctx = DispatchCtx::new(gpu);
     let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos)?;
+        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, Some(&layer.wo), layer_idx, pos)?;
 
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;

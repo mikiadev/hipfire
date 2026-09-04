@@ -12,6 +12,7 @@ pub mod batch;
 pub mod config;
 pub mod ep_batch;
 pub mod escha_dense_decode;
+pub mod escha_dense_forward;
 pub mod escha_ffn;
 pub mod escha_load;
 pub mod forward;

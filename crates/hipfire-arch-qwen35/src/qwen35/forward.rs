@@ -2263,7 +2263,7 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, Some(&layer.wo), layer_idx, pos,
                 )?;
 
                 if !fused_epilogue {
@@ -2757,7 +2757,7 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, Some(&layer.wo), layer_idx, pos,
                 )?;
 
                 if !fused_epilogue {
@@ -2889,7 +2889,7 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, Some(&layer.wo), layer_idx, pos,
                 )?;
 
                 if !fused_epilogue {
@@ -2924,6 +2924,30 @@ fn forward_scratch_layers(
                     }
                 }
 
+                kv_layer_idx += 1;
+            }
+
+            (LayerWeights::DeltaNetEscha(layer), LayerType::LinearAttention) => {
+                super::escha_dense_forward::deltanet_escha_layer_forward(
+                    gpu, layer, config, pos, delta_layer_idx, kv_cache, dn_state, s,
+                )?;
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
+                delta_layer_idx += 1;
+            }
+
+            (LayerWeights::FullAttnEscha(layer), LayerType::FullAttention) => {
+                super::escha_dense_forward::fullattn_escha_layer_forward(
+                    gpu, layer, config, pos, kv_layer_idx, kv_cache, s,
+                )?;
+                if let Some(ref rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_at_head(gpu, slot, &s.x)?;
+                    }
+                }
                 kv_layer_idx += 1;
             }
 
@@ -3662,7 +3686,7 @@ pub(crate) fn kv_cache_attention_dispatch(
     kv_cache: &mut llama::KvCache,
     s: &Qwen35Scratch,
     config: &Qwen35Config,
-    wo: &WeightTensor,
+    wo: Option<&WeightTensor>,
     layer_idx: usize,
     pos: usize,
 ) -> HipResult<bool> {
@@ -3679,7 +3703,10 @@ pub(crate) fn kv_cache_attention_dispatch(
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
     let fused_epilogue_route =
         qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
-    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
+    let fused_epilogue = match wo {
+        Some(wo) => qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route,
+        None => false,
+    };
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -3972,7 +3999,7 @@ fn dense_tp_attention_partial(
         config.rope_theta,
     )?;
     let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, kv_layer_idx, pos)?;
+        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, Some(&layer.wo), kv_layer_idx, pos)?;
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
     }
@@ -5510,8 +5537,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         let res: HipResult<()> = (|| match op_code(op) {
             q35_op::ATTEND_FULL => {
                 let (q_norm, k_norm, wo) = match self.layer {
-                    LayerWeights::FullAttn(l) => (&l.q_norm, &l.k_norm, &l.wo),
-                    LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm, &l.wo),
+                    LayerWeights::FullAttn(l) => (&l.q_norm, &l.k_norm, Some(&l.wo)),
+                    LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm, Some(&l.wo)),
                     _ => return Err(HipError::new(0, "ATTEND_FULL on non-FullAttn layer")),
                 };
                 let tap_enabled = hipfire_runtime::triattn::tap_enabled();
