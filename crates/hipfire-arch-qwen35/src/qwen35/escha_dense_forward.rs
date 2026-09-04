@@ -19,6 +19,8 @@ use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 
+use super::batch::BatchSemantics;
+use super::batch::PrefillBatchScratch;
 use super::config::Qwen35Config;
 use super::escha_dense_decode::escha_dense_decode_proj;
 use super::forward::Qwen35Scratch;
@@ -481,6 +483,178 @@ pub fn escha_dense_decode_proj_batch(
 
     let _ = gpu.free_tensor(u);
     let _ = gpu.free_tensor(partial);
+    Ok(())
+}
+
+/// Batched prefill forward for one DeltaNetEscha layer.
+/// Mirrors `deltanet_escha_layer_forward` but uses batched prefill projections.
+#[allow(clippy::too_many_arguments)]
+pub fn deltanet_escha_layer_prefill(
+    gpu: &mut Gpu,
+    layer: &DeltaNetEschaLayerWeights,
+    config: &Qwen35Config,
+    n_rows: usize,
+    delta_layer_idx: usize,
+    dn_state: &mut super::weights::DeltaNetState,
+    pbs: &super::batch::PrefillBatchScratch,
+) -> HipResult<()> {
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let qkv_dim = k_dim * 2 + v_dim;
+
+    // ── attention input norm + coded projections ──
+    gpu.rmsnorm_batched(&pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, n_rows, config.dim, config.norm_eps)?;
+    escha_dense_decode_proj_batch(gpu, &layer.qkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n_rows)?;
+    escha_dense_decode_proj_batch(gpu, &layer.z, &pbs.x_rot_batch, &pbs.dn_z_batch, n_rows)?;
+
+    // beta / alpha stay dense f16 gemvs of the normed input.
+    {
+        use hipfire_dispatch::context::DispatchCtx;
+        use hipfire_dispatch::families::gemv::WeightRef;
+        use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+        let ctx = DispatchCtx::new(gpu);
+        let wr_beta = WeightRef {
+            buf: &layer.w_beta.buf,
+            dtype: layer.w_beta.gpu_dtype,
+            m: layer.w_beta.m,
+            k: layer.w_beta.k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+        };
+        let wr_alpha = WeightRef {
+            buf: &layer.w_alpha.buf,
+            dtype: layer.w_alpha.gpu_dtype,
+            m: layer.w_alpha.m,
+            k: layer.w_alpha.k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+        };
+        execute_steps(
+            gpu,
+            &ctx,
+            &[
+                Step::Gemv {
+                    w: &wr_beta,
+                    input: GemvInput::Raw(&pbs.x_rot_batch),
+                    out: &pbs.dn_beta_batch,
+                },
+                Step::Gemv {
+                    w: &wr_alpha,
+                    input: GemvInput::Raw(&pbs.x_rot_batch),
+                    out: &pbs.dn_alpha_batch,
+                },
+            ],
+        )
+        .map_err(|e| HipError::new(0, &e.to_string()))?;
+    }
+
+    gpu.fused_sigmoid_alpha_gate_f32_batched(
+        &pbs.dn_beta_batch,
+        &pbs.dn_alpha_batch,
+        &layer.dt_bias,
+        &layer.a_log,
+        n_v_heads,
+        n_rows,
+    )?;
+
+    gpu.conv1d_silu_split_f32_n(
+        &pbs.dn_q_raw_batch,
+        &pbs.dn_k_raw_batch,
+        &pbs.dn_v_batch,
+        &pbs.dn_qkv_batch,
+        &layer.conv_weight,
+        &dn_state.conv_states[delta_layer_idx],
+        k_dim,
+        v_dim,
+        n_rows,
+    )?;
+    gpu.fused_qk_l2_norm_scale_f32_batched(
+        &pbs.dn_q_raw_batch,
+        &pbs.dn_k_raw_batch,
+        config.linear_num_key_heads,
+        hd,
+        1.0 / (hd as f32).sqrt(),
+        config.norm_eps,
+        n_rows,
+    )?;
+    if config.linear_num_key_heads < n_v_heads {
+        let ratio = n_v_heads / config.linear_num_key_heads;
+        gpu.repeat_interleave_qk_f32_batched(
+            &pbs.dn_q_raw_batch,
+            &pbs.dn_k_raw_batch,
+            &pbs.dn_q_batch,
+            &pbs.dn_k_batch,
+            config.linear_num_key_heads,
+            ratio,
+            hd,
+            n_rows,
+        )?;
+    } else {
+        gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n_rows * k_dim * 4)?;
+        gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n_rows * k_dim * 4)?;
+    }
+    match dn_state.quant {
+        super::weights::StateQuant::FP32 => {
+            gpu.gated_delta_net_f32_batch_seq(
+                &pbs.dn_q_batch,
+                &pbs.dn_k_batch,
+                &pbs.dn_v_batch,
+                &pbs.dn_alpha_batch,
+                &pbs.dn_beta_batch,
+                &dn_state.s_matrices[delta_layer_idx],
+                &pbs.dn_attn_out_batch,
+                n_rows,
+                n_v_heads,
+                config.linear_value_head_dim,
+            )?;
+        }
+        super::weights::StateQuant::Q8 => {
+            gpu.gated_delta_net_q8_batch_seq(
+                &pbs.dn_q_batch,
+                &pbs.dn_k_batch,
+                &pbs.dn_v_batch,
+                &pbs.dn_alpha_batch,
+                &pbs.dn_beta_batch,
+                &dn_state.s_matrices[delta_layer_idx],
+                &dn_state.s_scales[delta_layer_idx],
+                &pbs.dn_attn_out_batch,
+                n_rows,
+                n_v_heads,
+                config.linear_value_head_dim,
+                dn_state.ef_residual(delta_layer_idx),
+            )?;
+        }
+        super::weights::StateQuant::Q4 => {
+            return Err(HipError::new(0, "escha-dense Q4 state not yet batched"));
+        }
+    }
+    gpu.gated_norm_f32_batched(
+        &pbs.dn_attn_out_batch,
+        &pbs.dn_z_batch,
+        &layer.norm_weight,
+        &pbs.dn_normed_batch,
+        n_v_heads,
+        config.linear_value_head_dim,
+        config.norm_eps,
+        n_rows,
+    )?;
+
+    // ── wo coded projection + residual ──
+    escha_dense_decode_proj_batch(gpu, &layer.wo, &pbs.dn_normed_batch, &pbs.x_rot_batch, n_rows)?;
+    gpu.add_f32(&pbs.x_batch, &pbs.x_rot_batch, &pbs.x_batch)?;
+
+    // ── FFN (gate/up/down coded) ──
+    gpu.rmsnorm_batched(&pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, n_rows, config.dim, config.norm_eps)?;
+    escha_dense_decode_proj_batch(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n_rows)?;
+    escha_dense_decode_proj_batch(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n_rows)?;
+    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+    escha_dense_decode_proj_batch(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &pbs.x_rot_batch, n_rows)?;
+    gpu.add_f32(&pbs.x_batch, &pbs.x_rot_batch, &pbs.x_batch)?;
+
     Ok(())
 }
 
