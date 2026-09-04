@@ -1118,7 +1118,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         let id = "id\"quote\"\n";
         let mut sink = Vec::new();
         emit_qwen_dflash_done_terminal(
-            &mut sink, id, 2, 1.0, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 0, "stop", None,
+            &mut sink, id, 2, 1.0, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 0, "stop", None, "dflash",
         );
         let out = String::from_utf8(sink).unwrap();
         let lines = parse_jsonl(&out);
@@ -1287,11 +1287,12 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     #[test]
     fn production_done_value_builder_matches_epilogue_shape() {
         let v =
-            hipfire_generate::qwen::qwen_dflash_done_value("r", 3, 1.5, 10, 2.0, 5.0, 1.2, 2.0, 0.5, 2, 0, "length", 99);
+            hipfire_generate::qwen::qwen_dflash_done_value("r", 3, 1.5, 10, 2.0, 5.0, 1.2, 2.0, 0.5, 2, 0, "length", 99, "dflash");
         assert_eq!(v["type"], "done");
         assert_eq!(v["finish_reason"], "length");
         assert_eq!(v["attempt_id"], 99);
         assert_eq!(v["dflash"], true);
+        assert_eq!(v["drafter"], "dflash");
         assert_eq!(v["tokens"], 3);
     }
 

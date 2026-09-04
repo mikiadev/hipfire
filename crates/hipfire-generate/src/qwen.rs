@@ -2501,6 +2501,7 @@ pub fn generate_dflash(
                     cached_tokens_dflash,
                     finish_reason,
                     active_attempt_id(),
+                    &spec_name,
                 );
                 if spec_name == "mtp" {
                     if let Some(obj) = pending_done.as_object_mut() {
@@ -5410,6 +5411,9 @@ pub fn qwen_dflash_reasoning_event_value(
 
 /// Production done envelope core for Qwen DFlash epilogue + tests.
 /// Optional pflash fields are merged by the caller after construction.
+/// `drafter` names the active speculator (`Speculator::name`, e.g.
+/// "dflash"/"mtp"/"ngram"/"dspark"); empty (no speculator) omits the key so
+/// AR fall-through stays unambiguous on the wire.
 pub fn qwen_dflash_done_value(
     id: &str,
     generated: usize,
@@ -5424,8 +5428,9 @@ pub fn qwen_dflash_done_value(
     cached_tokens: usize,
     finish_reason: &str,
     attempt_id: u64,
+    drafter: &str,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated,
@@ -5441,7 +5446,11 @@ pub fn qwen_dflash_done_value(
         "cached_tokens": cached_tokens,
         "finish_reason": finish_reason,
         "attempt_id": attempt_id,
-    })
+    });
+    if !drafter.is_empty() {
+        done["drafter"] = serde_json::json!(drafter);
+    }
+    done
 }
 
 /// Write one Qwen DFlash Malformed terminal via the production fail-closed

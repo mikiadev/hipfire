@@ -1412,6 +1412,8 @@ pub fn attest_rollback_steps(
 }
 
 /// Write one Qwen DFlash Done terminal via the production envelope builder.
+/// `drafter` names the active speculator (`Speculator::name`); empty omits
+/// the key (AR fall-through stays unambiguous on the wire).
 pub fn emit_qwen_dflash_done_terminal(
     stdout: &mut impl std::io::Write,
     id: &str,
@@ -1427,6 +1429,7 @@ pub fn emit_qwen_dflash_done_terminal(
     cached_tokens: usize,
     finish_reason: &str,
     pflash: Option<(&str, f32)>,
+    drafter: &str,
 ) {
     let mut done_env = crate::qwen::qwen_dflash_done_value(
         id,
@@ -1442,6 +1445,7 @@ pub fn emit_qwen_dflash_done_terminal(
         cached_tokens,
         finish_reason,
         active_attempt_id(),
+        drafter,
     );
     if let Some((reason, alpha)) = pflash {
         done_env["pflash"] = serde_json::json!({

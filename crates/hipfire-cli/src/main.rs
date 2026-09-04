@@ -2083,16 +2083,18 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         Ok(())
     })?;
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "content": content,
-                "reasoning": reasoning,
-                "tokens": done.get("tokens").and_then(serde_json::Value::as_u64),
-                "tok_s": done.get("tok_s").and_then(serde_json::Value::as_f64),
-                "finish_reason": done.get("finish_reason"),
-            }))?
-        );
+        let stats = run_stats_summary(&done);
+        let mut out = serde_json::json!({
+            "content": content,
+            "reasoning": reasoning,
+            "tokens": done.get("tokens").and_then(serde_json::Value::as_u64),
+            "tok_s": done.get("tok_s").and_then(serde_json::Value::as_f64),
+            "finish_reason": done.get("finish_reason"),
+        });
+        for (key, value) in stats {
+            out[key] = value;
+        }
+        println!("{}", serde_json::to_string(&out)?);
     } else if args.no_stream {
         if !reasoning.is_empty() {
             println!("<reasoning>\n{reasoning}\n</reasoning>");
@@ -2101,8 +2103,140 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     } else {
         println!();
     }
+    print_run_stats(&done);
     let _ = engine.unload();
     Ok(())
+}
+
+/// Subset of `done`-envelope timing/spec fields surfaced on `hipfire run`.
+///
+/// Every accessor uses `.get()` and clones the value verbatim (no
+/// reformatting, no defaults): absent keys stay absent so `--json` mirrors
+/// exactly what the daemon reported. See the done-envelope writers in
+/// `hipfire-generate` (`ar.rs` `qwen_ar_done_value`, `qwen.rs` DFlash +
+/// plain-AR envelopes, `dense.rs` DS4/glimmer envelopes, `batch.rs`
+/// lane envelopes) for the per-route field provenance.
+fn run_stats_summary(done: &serde_json::Value) -> Vec<(&'static str, serde_json::Value)> {
+    const KEYS: &[&str] = &[
+        "prefill_tokens",
+        "prefill_ms",
+        "prefill_tok_s",
+        "decode_tok_s",
+        "ttft_ms",
+        "total_ms",
+        "latency_ms",
+        "cached_tokens",
+        "drafter",
+        "tau",
+        "cycles",
+        "spec_windows",
+        "spec_accept_pct",
+        "spec_k",
+        "mtp",
+        "dflash",
+        "mtp_windows",
+        "ar_windows",
+        "ngram_mod_windows",
+    ];
+    let mut out = Vec::new();
+    for key in KEYS {
+        if let Some(value) = done.get(*key) {
+            if !value.is_null() {
+                out.push((*key, value.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Human-readable stats trailer for `hipfire run` (stderr, after the
+/// generated text): token usage + timing + spec identity.
+///
+/// Same `done.get()` projection as [`run_stats_summary`] (what the daemon
+/// didn't report is omitted, never zero-filled). Daemon-own stderr lines
+/// (`[req <id>] drafter=…`, `[daemon] … done: …`) may also appear; this
+/// trailer is the CLI's own summary keyed off the correlated `done` value
+/// `Engine::generate` returns, so it works over both local-spawn and
+/// serve-HTTP paths once their envelopes carry the fields.
+///
+/// Spec-decode shape (mirrors the daemon's own per-request stderr summary):
+/// `[stats] 140 tok decode (67 windows) drafter=dflash tau=2.09 tok/s=17.0`.
+fn print_run_stats(done: &serde_json::Value) {
+    fn num(done: &serde_json::Value, key: &str) -> Option<f64> {
+        done.get(key).and_then(serde_json::Value::as_f64)
+    }
+    fn int(done: &serde_json::Value, key: &str) -> Option<u64> {
+        done.get(key).and_then(serde_json::Value::as_u64)
+    }
+    fn text<'a>(done: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        done.get(key).and_then(serde_json::Value::as_str)
+    }
+    let tokens = int(done, "tokens");
+    let prefill_tokens = int(done, "prefill_tokens");
+    let cached_tokens = int(done, "cached_tokens");
+    let prefill_ms = num(done, "prefill_ms");
+    let prefill_tok_s = num(done, "prefill_tok_s");
+    let decode_tok_s = num(done, "decode_tok_s")
+        .or_else(|| num(done, "tok_s"));
+    let ttft_ms = num(done, "ttft_ms");
+    let total_ms = num(done, "total_ms").or_else(|| num(done, "latency_ms"));
+    let drafter = text(done, "drafter");
+    let tau = num(done, "tau");
+    let cycles = int(done, "cycles")
+        .or_else(|| int(done, "spec_windows"))
+        .or_else(|| int(done, "mtp_windows"));
+    let finish = text(done, "finish_reason").unwrap_or("stop");
+    // No daemon numbers at all (e.g. immediate validation error): stay silent.
+    if tokens.is_none()
+        && prefill_tokens.is_none()
+        && prefill_tok_s.is_none()
+        && decode_tok_s.is_none()
+        && tau.is_none()
+    {
+        return;
+    }
+    let mut usage = String::from("[stats]");
+    if let Some(n) = tokens {
+        usage.push_str(&format!(" {n} tok"));
+    }
+    if let Some(n) = prefill_tokens {
+        usage.push_str(&format!(" (prompt {n}"));
+        if let Some(c) = cached_tokens {
+            if c > 0 {
+                usage.push_str(&format!(", cached {c}"));
+            }
+        }
+        usage.push(')');
+    }
+    if let Some(ms) = prefill_ms {
+        usage.push_str(&format!(" prefill {ms:.0}ms"));
+    }
+    if let Some(s) = prefill_tok_s {
+        usage.push_str(&format!(" ({s:.1} tok/s)"));
+    }
+    if let Some(s) = decode_tok_s {
+        usage.push_str(&format!(" decode {s:.1} tok/s"));
+    }
+    if let Some(ms) = ttft_ms {
+        usage.push_str(&format!(" ttft {ms:.0}ms"));
+    }
+    if let Some(ms) = total_ms {
+        usage.push_str(&format!(" total {ms:.0}ms"));
+    }
+    if let Some(d) = drafter {
+        usage.push_str(&format!(" drafter={d}"));
+    }
+    if let Some(t) = tau {
+        usage.push_str(&format!(" tau={t:.2}"));
+    }
+    if let Some(c) = cycles {
+        usage.push_str(&format!(" {c} windows"));
+    }
+    if let Some(pct) = num(done, "spec_accept_pct") {
+        usage.push_str(&format!(" accept={pct:.0}%"));
+    }
+    usage.push_str(&format!(" finish={finish}"));
+    eprintln!("{usage}");
 }
 
 fn process_truthy(name: &str) -> bool {
@@ -2155,20 +2289,27 @@ fn run_via_http(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         if json {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "content": content,
-                    "tokens": response.pointer("/usage/completion_tokens"),
-                    "tok_s": response.pointer("/hipfire/tok_s"),
-                    "finish_reason": response.pointer("/choices/0/finish_reason"),
-                }))?
-            );
+            let stats = run_stats_summary(&response);
+            let mut out = serde_json::json!({
+                "content": content,
+                "tokens": response.pointer("/usage/completion_tokens"),
+                "tok_s": response.pointer("/hipfire/tok_s"),
+                "finish_reason": response.pointer("/choices/0/finish_reason"),
+            });
+            for (key, value) in stats {
+                out[key] = value;
+            }
+            println!("{}", serde_json::to_string(&out)?);
         } else {
             println!("{content}");
         }
+        print_run_stats(&response);
         return Ok(());
     }
+
+    let mut saw_timings: Option<serde_json::Value> = None;
+    let mut saw_usage_tokens: Option<u64> = None;
+    let mut saw_usage: Option<serde_json::Value> = None;
 
     stream_openai_chat(
         host,
@@ -2183,15 +2324,40 @@ fn run_via_http(
                 }
                 OpenAiSseEvent::Role { .. }
                 | OpenAiSseEvent::ToolCall { .. }
-                | OpenAiSseEvent::Finish { .. }
-                | OpenAiSseEvent::Usage { .. }
                 | OpenAiSseEvent::Done => {}
+                OpenAiSseEvent::Finish { timings, .. } => {
+                    saw_timings = timings;
+                }
+                OpenAiSseEvent::Usage { usage } => {
+                    saw_usage_tokens = usage
+                        .get("completion_tokens")
+                        .and_then(serde_json::Value::as_u64);
+                    saw_usage = Some(usage);
+                }
             }
             Ok(())
         },
         || false,
     )?;
     println!();
+    // SSE stream trailer: same projection as the non-stream path. The
+    // terminal choice carries `timings` (+ `hipfire` on this server) and
+    // the trailing `choices: []` chunk carries `usage`.
+    let mut stream_done = serde_json::json!({});
+    if let Some(timings) = saw_timings {
+        if let serde_json::Value::Object(map) = timings {
+            for (key, value) in map {
+                stream_done[key] = value;
+            }
+        }
+    }
+    if let Some(usage) = saw_usage {
+        stream_done["usage"] = usage;
+    }
+    if let Some(n) = saw_usage_tokens {
+        stream_done["tokens"] = serde_json::json!(n);
+    }
+    print_run_stats(&stream_done);
     Ok(())
 }
 
