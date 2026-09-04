@@ -461,3 +461,28 @@ Reframing from re-tests with correct controls:
   generated tokens breaks. LA-path-specific (FA passthrough unchanged); all
   per-stage signals verified healthy. Open question remains the state read-back
   across decode steps.
+
+## B3 — checkpoint: dense multi-token gate still open (2026-09-04)
+
+Consolidated state after two subagent passes (port 97e0d889 + bisect ada12fbb),
+23+ dense commits on feat/escha-w2:
+- M1 (dense loads) + M2 kernels (per-projection decode EXACT vs host/EschaLabs
+  rel 2e-4, funnel pairing pinned to this export) DONE. Norm conventions
+  fixed (q/k true-gamma raw; LA gated-norm gamma-1 +1). Single-token factual
+  answers correct: France→Paris, Paris→France, Berlin→Germany, Tokyo→Japan.
+- MoE path fully coherent and unregressed (40-token prose generation; 10.6
+  tok/s rainbow 128t checkpoint 8ab56739).
+- Remaining blocker: dense multi-token GENERATION decays at decode token ~3
+  into a fixed attractor. Context DOES reach the model (prompt length/content
+  changes output); single-token answers work; FA and framework excluded;
+  all per-stage signals (decode, norms, gates, conv, S-matrix accumulation,
+  weight scales) verified healthy.
+- Candidate (narrowed): DeltaNet state read-back across decode steps for the
+  48-v-head × 5120-dim dense shape — the identical-shape HFQ-dense 27B
+  (qwen36_27b_dense_shape = dim5120/64L/24H/4KV/16kH/48vH/128hd, upstream
+  known shape) is the coherent template; the escha arm shares every kernel
+  with it. Decisive untried experiment: materialize one dense projection to a
+  folded f32 WeightTensor at load and run the PLAIN DeltaNet/FullAttn arm over
+  it (coherent ⇒ escha-arm wiring; broken ⇒ kernel/state interaction at 48
+  v-heads). Env-gated probes exist: HIPFIRE_ESCHA_DENSE_* toggles.
+- M3 (prefill/throughput) not started; dense decode ~1-2 tok/s per-token.
