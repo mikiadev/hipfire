@@ -58,6 +58,8 @@ pub fn deltanet_escha_layer_forward(
     gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
     decode_into(gpu, &layer.qkv, &s.tmp, &s.dn_qkv)?;
     decode_into(gpu, &layer.z, &s.tmp, &s.dn_z)?;
+    stats(gpu, "post qkv/z decode", &s.dn_qkv);
+    stats(gpu, "post z decode", &s.dn_z);
     // beta / alpha stay dense f16 gemvs of the normed input.
     {
         use hipfire_dispatch::context::DispatchCtx;
@@ -194,7 +196,9 @@ pub fn deltanet_escha_layer_forward(
 
     // ── wo coded projection + residual ──
     decode_into(gpu, &layer.wo, &s.dn_normed, &s.o)?;
+    stats(gpu, "post wo decode", &s.o);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
+    stats(gpu, "post LA residual", &s.x);
 
     // ── FFN (gate/up/down coded) ──
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
@@ -202,7 +206,9 @@ pub fn deltanet_escha_layer_forward(
     decode_into(gpu, &layer.w_up, &s.tmp, &s.up)?;
     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
     decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
+    stats(gpu, "post down decode", &s.o);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
+    stats(gpu, "post FFN residual", &s.x);
     let _ = pos;
     Ok(())
 }
@@ -214,7 +220,7 @@ pub fn fullattn_escha_layer_forward(
     layer: &FullAttnEschaLayerWeights,
     config: &Qwen35Config,
     pos: usize,
-    kv_layer_idx: usize,
+    layer_idx: usize,
     kv_cache: &mut hipfire_runtime::llama::KvCache,
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
@@ -272,15 +278,22 @@ pub fn fullattn_escha_layer_forward(
 
     // Escha-dense FA runs UNFUSED (coded wo is not a WeightTensor), so the
     // attention kernel always leaves fa_attn_out pre-gate; apply sigmoid(gate).
+    // NOTE: kv_cache is indexed by the MODEL layer index (0..63) — every
+    // filtered constructor keeps one Vec entry per model layer with real
+    // buffers only on full-attention layers.
     let fused_epilogue = super::forward::kv_cache_attention_dispatch(
-        &ctx, gpu, kv_cache, s, config, None, kv_layer_idx, pos,
+        &ctx, gpu, kv_cache, s, config, None, layer_idx, pos,
     )?;
     debug_assert!(!fused_epilogue, "escha-dense FA must be unfused");
     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
 
+    stats(gpu, "post attend out", &s.fa_attn_out);
+
     // ── wo coded projection + residual ──
     decode_into(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
+    stats(gpu, "post wo decode (FA)", &s.o);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
+    stats(gpu, "post FA residual", &s.x);
 
     // ── FFN ──
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
@@ -289,5 +302,25 @@ pub fn fullattn_escha_layer_forward(
     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
     decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
     gpu.add_f32(&s.x, &s.o, &s.x)?;
+    stats(gpu, "post FFN residual (FA)", &s.x);
     Ok(())
+}
+
+/// Debug stats (HIPFIRE_ESCHA_DENSE_TRACE=1 prints post-op ranges per layer).
+fn stats(gpu: &Gpu, label: &str, t: &GpuTensor) {
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_none() {
+        return;
+    }
+    if let Ok(vals) = gpu.download_f32(t) {
+        let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut nn = 0usize;
+        let mut ninf = 0usize;
+        let mut n = 0usize;
+        for &v in &vals {
+            if v.is_nan() { nn += 1; }
+            else if v.is_infinite() { ninf += 1; }
+            else { n += 1; mn = mn.min(v); mx = mx.max(v); }
+        }
+        eprintln!("[escha-dense] {label}: n={n} nan={nn} inf={ninf} range=[{mn:.4e},{mx:.4e}] first3={:?}", &vals[..3.min(vals.len())]);
+    }
 }

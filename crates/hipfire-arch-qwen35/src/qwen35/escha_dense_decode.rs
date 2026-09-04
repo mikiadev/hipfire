@@ -256,3 +256,55 @@ pub fn escha_dense_check_decode_stage(
     let _ = gpu.free_tensor(partial);
     Ok(max_abs.min(max_abs_t))
 }
+
+/// Host check: fold-side reconstruction (the MoE-verified semantics) gemv'd on
+/// raw x vs the activation-side decode (my kernel semantics). Equal iff the
+/// two algebra conventions agree.
+#[allow(clippy::too_many_arguments)]
+pub fn escha_dense_check_fold_vs_act(
+    code_host: &[i16],
+    k: usize,
+    in_p: usize,
+    out_p: usize,
+    in_scale: &[f32],
+    out_scale: &[f32],
+    x: &[f32],
+) -> (f32, Vec<f32>, Vec<f32>) {
+    use crate::escham_decode::{decode_tiles, had128_matrix};
+    // fold-side: M_folded = diag(out_scale) @ H_out @ W_bare^T @ H_in @ diag(in_scale)
+    let w_bare = decode_tiles(code_host, k, in_p, out_p); // [in, out]
+    let mut m = vec![0.0f32; out_p * in_p]; // W_bare^T [out, in]
+    for i in 0..in_p {
+        for j in 0..out_p {
+            m[j * in_p + i] = w_bare[i * out_p + j];
+        }
+    }
+    let mh = had128_matrix(&m, out_p, in_p); // H_out over rows, H_in over cols
+    // scale: rows by out_scale, cols by in_scale
+    let mut mf = vec![0.0f32; out_p * in_p];
+    for j in 0..out_p {
+        for i in 0..in_p {
+            mf[j * in_p + i] = mh[j * in_p + i] * out_scale[j] * in_scale[i];
+        }
+    }
+    // y = M_folded @ x
+    let mut yf = vec![0.0f32; out_p];
+    for j in 0..out_p {
+        let mut s = 0.0f32;
+        for i in 0..in_p {
+            s += mf[j * in_p + i] * x[i];
+        }
+        yf[j] = s;
+    }
+    // activation-side
+    let ya = escha_dense_decode_proj_host(code_host, k, in_p, out_p, in_scale, out_scale, x);
+    let mut max_abs = 0.0f32;
+    for j in 0..out_p {
+        max_abs = max_abs.max((yf[j] - ya[j]).abs());
+    }
+    eprintln!(
+        "[escha-dense] fold-vs-activation max_abs={max_abs:.6}  ({})",
+        if max_abs < 1e-3 { "AGREE" } else { "DISAGREE" }
+    );
+    (max_abs, yf, ya)
+}

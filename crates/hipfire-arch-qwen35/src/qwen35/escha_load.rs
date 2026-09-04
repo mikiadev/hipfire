@@ -420,14 +420,27 @@ impl<'a> EschaSource<'a> {
                 ),
             ));
         }
-        // escha_config sanity: [16, K, 2, 1, in, out]
+        // escha_config sanity: [16, K, 2, 1, in, out] (stored I32).
         if let Some((cfg_info, cfg_data)) = self.source.tensor_data(&cfg_name) {
-            let cfg = source_bytes_to_f32_vec(&cfg_info.dtype, cfg_data);
+            let cfg: Vec<i32> = match cfg_info.dtype.as_str() {
+                "I32" => cfg_data
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                "F32" => cfg_data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i32)
+                    .collect(),
+                other => {
+                    return Err(HipError::new(
+                        0,
+                        &format!("{cfg_name}: unsupported escha_config dtype {other}"),
+                    ))
+                }
+            };
             if cfg.len() >= 6 {
-                let (tile, ck, _v, _e, cin, cout) = (
-                    cfg[0] as i32, cfg[1] as i32, cfg[2] as i32, cfg[3] as i32,
-                    cfg[4] as i32, cfg[5] as i32,
-                );
+                let (tile, ck, _v, _e, cin, cout) =
+                    (cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5]);
                 if tile != 16 || ck as u8 != k || cin as usize != expected_in
                     || cout as usize != expected_out
                 {

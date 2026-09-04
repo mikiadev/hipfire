@@ -189,6 +189,11 @@ fn main() {
         &mut gpu, &proj_w, &x, &in_scale,
     )
     .expect("rotate");
+    let (fa, yf, ya) =
+        hipfire_arch_qwen35::qwen35::escha_dense_decode::escha_dense_check_fold_vs_act(
+            &code, k, in_p, out_p, &in_scale, &out_scale, &x,
+        );
+    eprintln!("fold-vs-act max_abs {fa} yf[0..3]={:?} ya[0..3]={:?}", &yf[..3], &ya[..3]);
     let _ = hipfire_arch_qwen35::qwen35::escha_dense_decode::escha_dense_check_decode_stage(
         &mut gpu, &proj_w, &x, &code, &in_scale,
     )

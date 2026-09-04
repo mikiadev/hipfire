@@ -956,6 +956,13 @@ fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
     dim.max(hidden_dim).max(v_dim)
 }
 
+/// Progress trace for Escha code-quant dense decode (HIPFIRE_ESCHA_DENSE_TRACE=1).
+fn trace_escha_dense_progress(layer_idx: usize, kind: &str) {
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_some() {
+        eprintln!("[escha-dense] layer {layer_idx} {kind} start");
+    }
+}
+
 impl Qwen35Scratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
         // Flash partials are sized for up to 8192 ctx. Override via new_with_kv_max.
@@ -2928,6 +2935,7 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::DeltaNetEscha(layer), LayerType::LinearAttention) => {
+                trace_escha_dense_progress(layer_idx, "DeltaNetEscha");
                 super::escha_dense_forward::deltanet_escha_layer_forward(
                     gpu, layer, config, pos, delta_layer_idx, kv_cache, dn_state, s,
                 )?;
@@ -2940,8 +2948,9 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::FullAttnEscha(layer), LayerType::FullAttention) => {
+                trace_escha_dense_progress(layer_idx, "FullAttnEscha");
                 super::escha_dense_forward::fullattn_escha_layer_forward(
-                    gpu, layer, config, pos, kv_layer_idx, kv_cache, s,
+                    gpu, layer, config, pos, layer_idx, kv_cache, s,
                 )?;
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -2970,6 +2979,26 @@ fn forward_scratch_layers(
         };
         execute_steps(gpu, &ctx, &[step])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
+    // Escha-dense logits probe (HIPFIRE_ESCHA_DENSE_TRACE=1): top-5 tokens.
+    if hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_TRACE").is_some()
+        && hipfire_config::developer_var_os("HIPFIRE_ESCHA_DENSE_LOGITS").is_some()
+    {
+        if let Ok(logits) = gpu.download_f32(&s.logits) {
+            let mut idx: Vec<usize> = (0..logits.len()).collect();
+            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
+            let (mut mean, mut mn, mut mx) = (0.0f64, f64::INFINITY, f64::NEG_INFINITY);
+            for &l in &logits {
+                mean += l as f64 / logits.len() as f64;
+                mn = mn.min(l as f64);
+                mx = mx.max(l as f64);
+            }
+            eprintln!(
+                "[escha-dense] pos {pos} logits: n={} mean={mean:.4} range=[{mn:.2},{mx:.2}] top5={:?}",
+                logits.len(),
+                &idx[..5.min(idx.len())]
+            );
+        }
     }
 
     Ok(())
