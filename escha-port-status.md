@@ -503,3 +503,50 @@ remaining defect is a wiring/integration detail in how the escha-coded
 projections feed the shared arm flow — e.g. a buffer/order/scale convention in
 deltanet_escha_layer_forward (escha_dense_forward.rs) vs the plain arm
 (forward.rs ~1999), which is now the ONLY untested difference.
+
+## B4 — ROOT CAUSE FOUND + FIXED: AR hipGraph replay corrupts escha-dense decode (2026-09-04, commit 5bb373af)
+
+The multi-token decay was NOT in the escha arm/loader at all — it was the AR
+hipGraph capture/replay path engaging on the escha-dense model.
+
+Mechanism:
+- `use_graph` (forward.rs forward_scratch) excluded `is_escham_moe` from AR
+  hipGraph capture/replay but NOT `is_escha_dense`. The escha per-projection
+  decode (`escha_dense_decode_proj` in escha_dense_decode.rs) allocs `u` +
+  `partial` pool scratch on EVERY call. Pool alloc/free is not
+  hipGraph-capture-safe: the captured graph records kernargs that pin pool
+  buffers, and the host-side alloc/free cycle reuses those buffers across
+  tokens. From the first replay onward the decode kernels read/write buffers
+  that the host has since recycled for other per-token allocations → the
+  fixed "ollеш暇ragenessarortableheimer…" attractor from decode token ~3.
+- Token alignment: token 1 = direct (kernel dirty), token 2 = fresh
+  capture+launch (correct pointers), token 3+ = REPLAY of the graph recorded
+  at token 2 → garbage. Exactly the observed "coherent 1-2 tokens then
+  collapse" symptom and why every "LA-path-specific" probe seemed to point at
+  the state read-back (the replayed graph re-ran a stale view of the layer
+  sequence, but the visible divergence is the decode output).
+
+Evidence (gfx1151, this tree, temp 0, deterministic; reasoning off):
+- experimental.graph.ar=true (DEFAULT): "Hello!,lsa agencesollеш暇ragenessarortableheimer浒ovitify强制执行scribe…" (decay at ~token 3)
+- experimental.graph.ar=false: "Hello! I am an AI assistant designed to assist
+  you with a wide variety of tasks, from answering questions to creative
+  writing" — fully coherent 24 tok.
+- After the fix (graphs stay default-ON): identical coherent 24-tok output;
+  "The capital of France is" → Paris; "The ocean is deep and" → coherent
+  sentence; 40-token poem → coherent structured English. No attractor.
+- MoE control (Escha-W2, same binary): "The capital of France is **Paris**."
+  UNCHANGED (MoE was already graph-excluded; fix adds only is_escha_dense to
+  the same predicate).
+- HFQ-dense 27B control (qwen3.6-27b.mq4r, same 48-v-head/5120 shape) was
+  coherent 40-tok on BOTH graph settings — the shared kernels/shape were
+  exonerated from the start; the escha arm/loader and per-projection decode
+  are proven exact (B1/B3) and remain untouched by this fix.
+
+Fix: forward.rs use_graph predicate now also excludes `config.is_escha_dense`.
+Direct-only decode until the escha decode scratch (`u`/`partial`) is hoisted
+into Qwen35Scratch (pre-allocated, like the MoE down-expand buffers) so the
+path can rejoin graph capture.
+
+Dense multi-token decode gate: PASSED for prose/poetry/factual prompts.
+Remaining perf note: decode ~1.6-2.3 tok/s (per-token decode-gemm, direct
+path); M3 (prefill/throughput + capture-safe decode scratch) is next.
