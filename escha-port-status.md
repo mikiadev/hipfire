@@ -293,3 +293,29 @@ conv ordering) or a template/reasoning interaction for this VL-shaped model.
 Debug toggles now in tree (all env-gated, MoE path untouched):
 HIPFIRE_ESCHA_DENSE_TRACE / _LOGITS / _NO_FFN / _NO_ATTN / _NO_FA_GATE /
 _STATE_FP32 / _RAW_NORMS (q/k raw is now the hard-coded default).
+
+## B1d — France→Paris & Tokyo→Japan coherent (2026-09-04, commit 1ea28000)
+
+Fix: linear_attn.norm.weight (gated-output norm, raw mean 0.87) is stored as a
+gamma-1 offset in the dense export — loading with +1.0 (default) makes short
+factual completions correct and STABLE where raw loading decayed into the fixed
+"TokenNameertoolsuttle…" attractor:
+  - "The capital of France is" → "Paris" (finish stop), deterministic ×2.
+  - "Tokyo is the capital of" → "Japan" (finish stop).
+  - MoE control (same prompts): "**Japan" / "**Tokyo". Dense answers differ in
+    formatting but are semantically right for these.
+
+Not yet coherent (remaining, narrow):
+  - "The capital of Japan is" → miscues (MoE control: "Tokyo"); logits for that
+    prompt sit on template tokens (think/EOS/newline) — conditioning on certain
+    prompt tokens still imperfect.
+  - Longer generations (>2-3 tokens) drift toward the fixed attractor for many
+    prompts. Profile = DeltaNet recurrent-state divergence, not weight decode.
+  - Note: LA gated-norm +1 vs MoE raw — dense and MoE exports store this tensor
+    differently; verified by A/B not by theory. Same class of finding as the
+    q/k-norm (dense stores q/k true-gamma, layer/LA-gated norms gamma-1).
+
+All Phase-B work is on feat/escha-w2; MoE path byte-identical (control rerun
+coherent). Debug toggles (env-gated): HIPFIRE_ESCHA_DENSE_TRACE/_LOGITS/_NO_FFN/
+_NO_ATTN/_NO_FA_GATE/_STATE_FP32/_RAW_NORMS. examples/pin_funnel.rs +
+check_escha_dense.rs remain the decode oracles.
