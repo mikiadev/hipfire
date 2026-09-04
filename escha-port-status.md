@@ -434,3 +434,30 @@ so this is specific to the 48-v-head/5120-dim dense config or my arm's use of
 it. Best next experiment: byte-compare one LA layer's gated_delta_net inputs
 and dn_attn_out between dense and a synthetic MoE-shaped run, or materialize
 the dense qkv as a folded WeightTensor and run the PLAIN DeltaNet arm.
+
+## B2 — external reference validation (2026-09-04, yaminerl/escha-amd-port)
+
+/home/mika/git/escha-amd-port (HF yaminerl/escha-amd-port) is a minimal HIP
+patch of the SAME llama.cpp-escha dense work, run coherently on gfx1030 (RDNA2,
+no tensor cores). Confirms:
+1. The fp32-FMA decode-gemm (no tensor cores) runs the dense model on AMD —
+   our non-WMMA decode-gemm milestone is the correct first target.
+2. The portable codebook spelling (x & 0x8fff8fffu) ^ 0x3b603b60u is EXACT under
+   HIP (lop3 immLut 0x6a == (a&b)^c) — our kernels already use exactly this.
+3. Only CUDA-isms needing HIP guards were cuda_pipeline.h (cp.async, mma path
+   only) and the lop3 asm — both irrelevant to our path.
+No merge needed; our port is independent and on gfx1151. GGUF oracle exists at
+aj9o9/Qwen3.8-27B-Escha-W2-GGUF but disk is ~97% full; CPU-llama.cpp comparison
+not attempted for that reason.
+
+Reframing from re-tests with correct controls:
+- Context DOES flow: "France"→"France is !**", "The capital of France"→"The
+  capital cathedral", "The capital of France is"→"Paris" — output changes with
+  prompt length/content; the earlier "apple/zebra is → The" results were low-
+  confidence continuations of nonsensical lists, NOT proof of no context.
+- The REAL remaining defect is multi-token generation: MoE control continues
+  coherently 40 tokens on prose/self-intro; dense decays at token ~3 into the
+  fixed attractor. Single-token factual answers work; anything requiring >2
+  generated tokens breaks. LA-path-specific (FA passthrough unchanged); all
+  per-stage signals verified healthy. Open question remains the state read-back
+  across decode steps.
