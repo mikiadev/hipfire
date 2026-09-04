@@ -78,6 +78,47 @@ ancestor of this master).
 2. Dense loader + pipeline for /data/rocmfpx/Qwen3.8-27B-Escha-W2.
 3. Full-kernel decode + (later) prefill; throughput targets per handoff.
 
+## A5 status (MoE decode coherent — 2026-09-04)
+
+Root cause found and fixed (per-expert input-scale indexing in the routed-FFN
+cache fill). With `HIPFIRE_TOKEN_TRACE=1` per-token prints, decode emitted a
+conditioned 2-6 token prefix then collapsed to period-2/period-5 attractors
+(`220,16,220,16…`, `11,220,1,423,198,…`) — identical symptoms across prompts.
+The framework itself was exonerated by a control run of the HFQ A3B MoE
+(`qwen3.6-35b-a3b.mq4r`, byte-identical text_config) which decoded
+flawlessly on this tree ("The capital of France is **Paris**.").
+
+**Root cause:** `escha_ffn.rs::escham_moe_ffn_decode` filled each routed
+expert's cached folded weight with the *entire stacked* per-expert input
+scale tensor (`&ffn.gate_up_in_scale`, `[n_exp, dim]` / `&ffn.down_in_scale`,
+`[n_exp, mi]`) passed to `escham_apply_rowcol_scales_f32`. That kernel
+indexes `in_scale[j]` for `j in 0..in_p`, so every expert's folded weight
+was scaled by **expert 0's** `s_in·rin` column vector. The export's rin/s_in
+are genuinely per-expert (rel diff vs expert 0: 1.3 for e1, 1.5 for e200),
+so all routed experts but (by luck) the first got the wrong input rotation —
+plausible but corrupt FFN output. Beta's working fill slices per-expert:
+`gate_up_in_scale.sub_offset(exp_idx * hidden, hidden)` (and the same for
+down). The fresh clone dropped that per-expert sub-offset. Note the
+single-expert FFN verifications (rel ~3e-4) never caught this: the
+production-path check tool (`examples/check_escha_ffn.rs`) exercises one
+expert at a time via an already-sliced host upload.
+
+**Fix (crates/hipfire-arch-qwen35/src/qwen35/escha_ffn.rs):** bind
+`gu_in_scale = ffn.gate_up_in_scale.sub_offset(exp_idx * gu_in_p, gu_in_p)`
+and `dn_in_scale = ffn.down_in_scale.sub_offset(exp_idx * down_in_p,
+down_in_p)` before the row-col scale absorb, matching beta.
+
+**Verified coherent (all --temp 0):**
+- "The capital of France is" → "The capital of France is **Paris**." —
+  token ids byte-identical to the HFQ A3B control (760, 6511, 314, 9338,
+  369, 2972, 57590, 159034, 248046).
+- "The capital of Japan is" → "…**Tokyo**. Tokyo is the largest
+  metropolitan area…" (fluent past 30 tokens).
+- "Write a haiku about the ocean" → coherent haiku.
+- "Explain why the sky is blue." → fluent 60-token Rayleigh-scattering
+  answer.
+- "def fibonacci(n):" / "def is_prime(n):" → open ```python fences.
+
 ## A4 status (MoE decode on the fresh tree — 2026-09-04)
 
 Commits: baseline bf1214ca → A1 scaffolding 944ff9d0 → match-sweep 0c487847 →

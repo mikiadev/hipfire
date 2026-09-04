@@ -141,9 +141,17 @@ pub fn escham_moe_ffn_decode(
     let mut dn_ptrs: Vec<u64> = Vec::with_capacity(k);
 
     for &(exp_idx, _logit) in topk.iter() {
-        let (gu_codes, gu_in_scale) = (&ffn.gate_up_codes[exp_idx], &ffn.gate_up_in_scale);
-        let (dn_codes, dn_in_scale) = (&ffn.down_codes[exp_idx], &ffn.down_in_scale);
-        let (gu_rout, dn_rout) = (&ffn.gate_up_rout[exp_idx], &ffn.down_rout[exp_idx]);
+        let gu_codes = &ffn.gate_up_codes[exp_idx];
+        let dn_codes = &ffn.down_codes[exp_idx];
+        let gu_rout = &ffn.gate_up_rout[exp_idx];
+        let dn_rout = &ffn.down_rout[exp_idx];
+        // Per-expert input scale rows (s_in · rin, stacked [n_exp, in]).
+        // The scale is per-EXPERT (each expert carries its own escha_rin /
+        // escha_s_in), so the whole stacked tensor must NOT be passed to the
+        // row-col kernel — only expert `exp_idx`'s slice (else every folded
+        // weight is scaled by expert 0's row, corrupting the FFN).
+        let gu_in_scale = ffn.gate_up_in_scale.sub_offset(exp_idx * gu_in_p, gu_in_p);
+        let dn_in_scale = ffn.down_in_scale.sub_offset(exp_idx * down_in_p, down_in_p);
 
         let folded_gu_gpu = if let Some(ref cached) = cache_gu[exp_idx] {
             cached.shallow_clone()
@@ -154,7 +162,7 @@ pub fn escham_moe_ffn_decode(
                 gpu,
                 &folded_f32,
                 gu_rout,
-                gu_in_scale,
+                &gu_in_scale,
                 gu_out_p,
                 gu_in_p,
             )?;
@@ -173,7 +181,7 @@ pub fn escham_moe_ffn_decode(
                 gpu,
                 &folded_f32,
                 dn_rout,
-                dn_in_scale,
+                &dn_in_scale,
                 down_out_p,
                 down_in_p,
             )?;
