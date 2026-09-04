@@ -587,10 +587,12 @@ impl<'a> EschaSource<'a> {
                         qkv_dim * config.conv_kernel_dim,
                         gpu,
                     )?,
-                    norm_weight: load_f16_vec(
-                        "linear_attn.norm.weight",
-                        config.linear_value_head_dim,
+                    norm_weight: paro_load_norm(
+                        self.source,
                         gpu,
+                        &format!("{p}.linear_attn.norm.weight"),
+                        &[config.linear_value_head_dim],
+                        escha_dense_norm_bias(),
                     )?,
                     wo: self.escha_load_dense_proj(gpu, &p, "linear_attn.out_proj", v_dim, dim)?,
                     ffn_norm,

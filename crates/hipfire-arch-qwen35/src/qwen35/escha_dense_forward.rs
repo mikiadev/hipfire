@@ -194,6 +194,7 @@ pub fn deltanet_escha_layer_forward(
         config.linear_value_head_dim,
         config.norm_eps,
     )?;
+    stats(gpu, "post gated-norm", &s.dn_normed);
 
     // ── wo coded projection + residual ──
     decode_into(gpu, &layer.wo, &s.dn_normed, &s.o)?;
