@@ -319,3 +319,24 @@ All Phase-B work is on feat/escha-w2; MoE path byte-identical (control rerun
 coherent). Debug toggles (env-gated): HIPFIRE_ESCHA_DENSE_TRACE/_LOGITS/_NO_FFN/
 _NO_ATTN/_NO_FA_GATE/_STATE_FP32/_RAW_NORMS. examples/pin_funnel.rs +
 check_escha_dense.rs remain the decode oracles.
+
+## B1e — final evidence (2026-09-04): partial conditioning confirmed
+
+Directional A/B (all temp 0, deterministic):
+  "The capital of France is" → Paris (correct)
+  "Paris is the capital of"  → France (correct)
+  "Tokyo is the capital of"  → Japan (correct)
+  "The capital of Japan is"  → miscue; "Japan is the capital of" → miscue;
+  "The capital of Germany is" → miscue.
+France/Paris work both directions; Japan/Germany subjects fail both directions.
+This asymmetry — some short completions correct via next-token prior, others
+exposing the loss — confirms the model's CONTEXT isn't reliably integrated for
+all prompt tokens (DeltaNet state or KV over the prompt), NOT a decode-math or
+norm-convention error (those are fixed/proven). The fixed attractor after ~2-3
+generated tokens ("TokenNameertoolsuttle…") is the same recurrent-divergence
+signature.
+
+Phase B status: M1 LOADS; M2 kernels EXACT + arms run with several correct
+deterministic short completions; coherent-decode GATE for the full model is the
+remaining M2 item (narrow integration bug, candidates documented above);
+M3 (prefill/throughput) not started.
