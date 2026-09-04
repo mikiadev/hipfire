@@ -387,3 +387,29 @@ while France succeeds. All country/city names are single BPE tokens (verified),
 so this is not tokenization. Characterized but not root-caused: a
 token/context-specific LA-path conditioning gap (DeltaNet state loses some
 tokens' context; FA excluded by passthrough; kernels/norms/decode proven).
+
+## B1h — root cause reframed: dense LA has NO cross-token memory (2026-09-04)
+
+New tests prove the dense model completes from phrase/token PRIORS only, with
+no working context integration:
+- "The capital of China/Italy/Spain/Japan/Germany is" → all echo "The capital"
+  then decay; ONLY France→Paris "works" (a near-deterministic phrase prior —
+  "The capital of France is Paris" is an extremely common trivia sentence, so
+  it does not prove conditioning).
+- "The word after zebra in the list apple zebra banana is" → "The word zoo…"
+  (no mid-prompt recall).
+- Conv-state probes DO show per-position updates (conv[0] rms varies
+  1.97→0.48→0.33… across tokens), so the conv path is live; the fault is
+  upstream of the output logits.
+
+=> The DeltaNet recurrent state is not delivering prompt content to the final
+layers: tokens are processed nearly independently. FA layers (KV) cannot
+compensate because LA layers dominate (48/64) and their outputs don't carry
+the needed context. NOT a decode/norm/scale error (all proven); NOT the FA/KV
+path (passthrough test); NOT the framework (MoE control fully coherent on the
+same engine/slots/state). The remaining suspect is the gated_delta_net state
+update semantics for this model's 48-v-head shape or the alpha/beta (in_proj_a/
+b) conventions feeding it, OR how q/k/v land in the recurrence for dim 5120.
+Next: capture q/k/v/alpha/beta from a live LA layer and compare against the
+same tensors through the coherent MoE (32-v-head) arm — the first kernel whose
+state behavior diverges is the bug.
