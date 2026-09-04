@@ -1545,11 +1545,20 @@ pub fn forward_scratch(
     }
     // MoE models require `experimental.graph.moe` in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
+    // ESCHA code-quant dense is EXCLUDED like escham-moe: its per-projection
+    // decode allocates pool scratch (`escha_dense_decode_proj` allocs `u` +
+    // `partial` every call), which is not hipGraph-capture-safe — the recorded
+    // kernargs pin pool buffers that the host-side alloc/free cycle reuses
+    // across tokens, so replay from decode token ~3 diverges into the fixed
+    // attractor (observed: token-1 direct correct, token-2 capture launch
+    // correct, token-3+ replay garbage). Direct-only until the decode scratch
+    // is hoisted to Qwen35Scratch like the MoE down-expand buffers.
     let use_graph = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
         && !config.is_escham_moe
+        && !config.is_escha_dense
         && (config.num_experts == 0 || allow_moe);
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
