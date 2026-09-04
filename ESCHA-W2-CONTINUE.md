@@ -1,7 +1,7 @@
 # Escha-W2 — continue here (fresh-context handoff)
 
 Branch: **`feat/escha-w2`** in `/home/mika/git/hipfire`. Working tree clean at
-`baf35dd17` (39 commits vs upstream master 8cd15a62).
+`18871f381` (41 commits vs upstream master 8cd15a62).
 
 This is the one-file entry point for a fresh session. The full investigation
 trail lives in `escha-port-status.md` (repo root, committed); perf evidence in
@@ -169,6 +169,40 @@ runs 2-bit ATTENTION q/k/v/o at 5120-dim/64L). Highest-value next experiments:
 
 ---
 
+## B7 — ROOT CAUSE SOLVED: FA q/k norms were gamma-1, loaded raw (2026-09-04, commit 18871f381)
+
+The B6 "long-horizon decay" is FIXED. Root cause: the dense export stores
+`self_attn` q/k RMSNorm weights as **gamma-1 offsets** (raw means
++0.23/+0.22 with a handful of NEGATIVES — impossible for a true gamma),
+and hipfire loaded them **raw** (bias 0.0), running the whole FA path at
+~5x under-scale. The B1c A/B (888ef3b08) that chose raw was confounded:
++1 was tested while the LA gated-norm was still raw (fixed later in
+1ea28000), so the +1 arm was judged inside a still-broken model.
+
+Authoritative evidence (not another A/B): llama.cpp's HF→GGUF conversion
+(`conversion/qwen.py::modify_tensors`) adds +1 to every `norm.weight`
+EXCEPT `linear_attn.norm.weight`. `q_norm.weight`/`k_norm.weight` match
+the `norm.weight` suffix → the reference runtime (coherent to 256K ctx)
+runs them as (raw+1). Fix: bias 0.0 → 1.0 in `escha_load.rs`.
+
+Verified on gfx1151 (temp 0, reasoning off; OLD vs NEW same-prompt A/B):
+- Spark n=120: OLD top 8-gram x4 verbatim loop from para 1 → NEW top
+  8-gram x2, varied prose, no verbatim loop.
+- Directional factual battery 5/5 (B1g was 3/6): France→Paris,
+  Japan→Tokyo, Paris→France, Tokyo→Japan, Germany→Berlin.
+- Sky n=200/300, quantum n=300, rainbow n=128, fibonacci n=100, haiku,
+  self-intro: coherent. MoE unregressed (Paris, haiku).
+
+Residual (second, smaller effect — NOT this bug): greedy temp-0 creative
+prose still thematically loops at ~150–260 tok on BOTH Q8 and FP32 state;
+MoE/HFQ controls stay clean to 800. The q/k fix moves the horizon
+12 → ~200 tok and converts immediate verbatim echo into late thematic
+looping. With temp 0.3 + repeat-penalty 1.1 the dense path is clean to
+300 tok (top 8-gram x1). Next lever for the residual: state precision /
+2-bit attention fidelity work (M3), not FA scaling.
+
+---
+
 ## Next steps (M3 / follow-up, in order)
 
 1. **Hoist dense decode scratch**: the per-projection decode
@@ -200,4 +234,4 @@ portable codebook spelling is exact under HIP.
 
 ---
 
-*Last updated 2026-09-04 (B6 long-horizon decay re-diagnosis).*
+*Last updated 2026-09-04 (B7 q/k-norm root cause solved).*
