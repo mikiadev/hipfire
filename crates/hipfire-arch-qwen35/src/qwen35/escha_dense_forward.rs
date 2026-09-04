@@ -230,6 +230,16 @@ pub fn fullattn_escha_layer_forward(
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_ATTN").ok().as_deref() == Some("1") {
+        // B1 debug: full-attention passthrough (only FFN acts).
+        gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+        decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
+        decode_into(gpu, &layer.w_up, &s.tmp, &s.up)?;
+        gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
+        decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
+        gpu.add_f32(&s.x, &s.o, &s.x)?;
+        return Ok(());
+    }
     // ── q/k/v coded projections from the normed input ──
     gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
     decode_into(gpu, &layer.wq, &s.tmp, &s.fa_q_full)?;
@@ -290,7 +300,9 @@ pub fn fullattn_escha_layer_forward(
         &ctx, gpu, kv_cache, s, config, None, layer_idx, pos,
     )?;
     debug_assert!(!fused_epilogue, "escha-dense FA must be unfused");
-    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FA_GATE").ok().as_deref() != Some("1") {
+        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    }
 
     stats(gpu, "post attend out", &s.fa_attn_out);
 

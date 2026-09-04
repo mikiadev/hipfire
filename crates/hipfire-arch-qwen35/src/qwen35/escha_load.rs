@@ -607,19 +607,22 @@ impl<'a> EschaSource<'a> {
                     wk: self.escha_load_dense_proj(gpu, &p, "self_attn.k_proj", dim, kv_dim)?,
                     wv: self.escha_load_dense_proj(gpu, &p, "self_attn.v_proj", dim, kv_dim)?,
                     wo: self.escha_load_dense_proj(gpu, &p, "self_attn.o_proj", o_in, dim)?,
+                    // q/k norms are stored as TRUE gamma in the dense export
+                    // (raw mean ~0.23), NOT as gamma-1 offsets like the layer
+                    // norms — so load them with bias 0.0.
                     q_norm: paro_load_norm(
                         self.source,
                         gpu,
                         &format!("{p}.self_attn.q_norm.weight"),
                         &[config.head_dim],
-                        1.0,
+                        0.0,
                     )?,
                     k_norm: paro_load_norm(
                         self.source,
                         gpu,
                         &format!("{p}.self_attn.k_norm.weight"),
                         &[config.head_dim],
-                        1.0,
+                        0.0,
                     )?,
                     ffn_norm,
                     w_gate,
@@ -814,5 +817,20 @@ impl WeightSource for EschaSource<'_> {
             self.escha_load_moe_ffn(bk.gpu, li, cfg)
         };
         crate::layer_driver::load_layer(&mut b, config, layer_idx, moe, moe_escha)
+    }
+}
+
+/// B1 debug: layer-norm bias for escha-dense loaders. Default 1.0 (mirrors the
+/// proven MoE export convention where layer norms store gamma-1 offsets).
+/// HIPFIRE_ESCHA_DENSE_RAW_NORMS=1 loads norms raw (bias 0).
+fn escha_dense_norm_bias() -> f32 {
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_RAW_NORMS")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        0.0
+    } else {
+        1.0
     }
 }
