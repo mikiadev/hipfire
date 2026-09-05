@@ -204,6 +204,11 @@ fn main() {
     eprintln!(
         "\n===== PER-TOKEN DECODE (n_rows=1, per-projection, with pool allocs) ====="
     );
+    // Hoisted decode scratch (matches production path: no per-call pool allocs).
+    let nit = in_p / 16;
+    let n_slices = rdna_compute::escha_dense::escha_dense_n_slices(nit, out_p);
+    let u = gpu.alloc_tensor(&[in_p], rdna_compute::DType::F32).expect("u alloc");
+    let partial = gpu.alloc_tensor(&[n_slices * out_p], rdna_compute::DType::F32).expect("p alloc");
     let mut per_token_samples = Vec::new();
     for i in 0..(warmup + reps) {
         let x_host = rng_x();
@@ -211,7 +216,7 @@ fn main() {
         let y = gpu.alloc_tensor(&[out_p], rdna_compute::DType::F32).expect("y alloc");
         let t0 = Instant::now();
         hipfire_arch_qwen35::qwen35::escha_dense_decode::escha_dense_decode_proj(
-            &mut gpu, &proj_w, &x, &y,
+            &mut gpu, &proj_w, &x, &y, &u, &partial,
         )
         .expect("per-token decode");
         let _ = gpu.download_f32(&y).expect("download sync");
@@ -222,6 +227,8 @@ fn main() {
         let _ = gpu.free_tensor(y);
         let _ = gpu.free_tensor(x);
     }
+    let _ = gpu.free_tensor(u);
+    let _ = gpu.free_tensor(partial);
     per_token_samples.sort();
     let med = per_token_samples[per_token_samples.len() / 2];
     let min_t = *per_token_samples.iter().min().unwrap();

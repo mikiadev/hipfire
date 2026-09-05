@@ -205,25 +205,10 @@ looping. With temp 0.3 + repeat-penalty 1.1 the dense path is clean to
 
 ## Next steps (M3 / follow-up, in order)
 
-1. **Hoist dense decode scratch**: the per-projection decode
-   (`escha_dense_decode_proj`) allocs `u` + `partial` pool tensors per call.
-   Move them into `Qwen35Scratch` (like the MoE down-expand buffers) so the
-   escha-dense path can rejoin AR hipGraph capture (drop the 5bb373af
-   exclusion after verifying).
-2. **Dense prefill + throughput**: add the batched / WMMA prefill path (port
-   llama.cpp-escha `2940b807c` tensor-core kernels to HIP WMMA
-   `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`, see
-   `kernels/src/gemm_f16_wmma.hip`). Currently decode is ~1.6–2.5 tok/s
-   (per-token decode-gemm, no batching); prefill needs the multi-row
-   decode-gemm (`escha_matmul_dense_tiled`) + slice-of-reduction.
-3. **MoE throughput**: beyond 10.6 tok/s requires the fp16/int8 dense
-   attention path (handoff note: dense attention is int8→f32 at load,
-   ~4.5 GB/token f32 traffic on the MoE).
-4. **Dense decode scratch on host** — the export carries per-projection
-   `escha_config[6]` (6 floats near 1.0, not the MoE doc's
-   `[tile,K,bits,mcg,...]`) and `s_in/s_out` ≈ ±0.6% around 1 that MUST be
-   applied (the loader folds s_in·rin / s_out·rout). llama.cpp ignores
-   s_in/s_out; we apply them for exactness.
+1. **Dense prefill + throughput**: ~~add the batched / WMMA prefill path~~ ✅ DONE. Batched prefill kernels exist and are enabled for DeltaNetEscha/FullAttnEscha layers. R is chosen dynamically to match n_rows, avoiding the R=64 waste for small batches. n_slices scales with R to keep per-block work bounded. Benchmark on gfx1151 (in_proj_qkv 5120x10240 K=2, per-token baseline ~620µs): n_rows=4 → 251µs/row (2.48x), n_rows=8 → 235µs/row (2.67x), n_rows=64 → 427µs/row (1.46x). Profile harness: `examples/profile_escha_dense_prefill.rs`.
+2. **Hoist dense decode scratch**: the per-projection decode (`escha_dense_decode_proj`) allocs `u` + `partial` pool tensors per call. Move them into `Qwen35Scratch` (like the MoE down-expand buffers) so the escha-dense path can rejoin AR hipGraph capture (drop the `5bb373af` exclusion after verifying).
+3. **MoE throughput**: beyond 10.6 tok/s requires the fp16/int8 dense attention path (handoff note: dense attention is int8→f32 at load, ~4.5 GB/token f32 traffic on the MoE).
+4. **Dense decode scratch on host** — the export carries per-projection `escha_config[6]` (6 floats near 1.0, not the MoE doc's `[tile,K,bits,mcg,...]`) and `s_in/s_out` ≈ ±0.6% around 1 that MUST be applied (the loader folds s_in·rin / s_out·rout). llama.cpp ignores s_in/s_out; we apply them for exactness.
 
 External references: llama.cpp-escha fork
 `/home/mika/git/llama.cpp-escha` (branch `escha-w2-dense`, commits 2a238a40d +

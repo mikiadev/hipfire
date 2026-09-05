@@ -947,6 +947,14 @@ pub struct Qwen35Scratch {
     // replay (task #100).
     pub moe_down_expanded: Option<GpuTensor>,
 
+    // Escha code-quant DENSE decode scratch: the per-projection decode
+    // (`escha_dense_decode_proj`) used to alloc/free `u` + `partial` pool
+    // tensors per call, which is not hipGraph-capture-safe. Hoist them here
+    // (sized for the worst-case projection) so the escha-dense path can
+    // rejoin AR hipGraph capture. Gated on config.is_escha_dense.
+    pub escha_dense_u: Option<GpuTensor>,       // [max_in_p]
+    pub escha_dense_partial: Option<GpuTensor>, // [max_n_slices * max_out_p]
+
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
     pub prefill_batch: Option<PrefillBatchScratch>,
@@ -1185,6 +1193,8 @@ impl Qwen35Scratch {
             moe_topk_indices: None,
             moe_topk_weights: None,
             moe_down_expanded: None,
+            escha_dense_u: None,
+            escha_dense_partial: None,
             prefill_batch: None,
         })
         .and_then(|mut s| {
@@ -1234,6 +1244,26 @@ impl Qwen35Scratch {
                 // Atomic-free decode MoE down payload plus reusable counter tail.
                 s.moe_down_expanded = Some(tracked_tensor!(
                     gpu.zeros(&[k * hidden + hidden.div_ceil(4)], DType::F32)
+                ));
+            }
+            if config.is_escha_dense {
+                // Worst-case projection sizes for Qwen3.8-27B-Escha-W2:
+                //   in_p  = 17408 (down_proj, gate_proj, up_proj)
+                //   out_p = 17408 (same)
+                //   nit   = in_p/16 = 1088
+                //   n_slices(nit=1088, oc=17408) → depends on arch; allocate
+                //   for the max possible (nit) to be safe.
+                let max_in_p = config.hidden_dim; // 17408
+                let max_out_p = config.hidden_dim;
+                let max_nit = max_in_p / 16;
+                // Allocate for the worst-case n_slices (could equal max_in_p/16).
+                // partial = n_slices * out_p. Over-allocate for the max.
+                let max_n_slices = max_nit;
+                s.escha_dense_u = Some(tracked_tensor!(
+                    gpu.alloc_tensor(&[max_in_p], DType::F32)
+                ));
+                s.escha_dense_partial = Some(tracked_tensor!(
+                    gpu.alloc_tensor(&[max_n_slices * max_out_p], DType::F32)
                 ));
             }
             if hipfire_config::developer_var("HIPFIRE_PREFILL_REUSE_PBS")
@@ -1322,6 +1352,12 @@ impl Qwen35Scratch {
             self.moe_topk_weights,
             self.moe_down_expanded,
         ] {
+            if let Some(buf) = t {
+                note(gpu.free_tensor(buf));
+            }
+        }
+        // Escha code-quant DENSE decode scratch.
+        for t in [self.escha_dense_u, self.escha_dense_partial] {
             if let Some(buf) = t {
                 note(gpu.free_tensor(buf));
             }
@@ -1545,14 +1581,9 @@ pub fn forward_scratch(
     }
     // MoE models require `experimental.graph.moe` in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    // ESCHA code-quant dense is EXCLUDED like escham-moe: its per-projection
-    // decode allocates pool scratch (`escha_dense_decode_proj` allocs `u` +
-    // `partial` every call), which is not hipGraph-capture-safe — the recorded
-    // kernargs pin pool buffers that the host-side alloc/free cycle reuses
-    // across tokens, so replay from decode token ~3 diverges into the fixed
-    // attractor (observed: token-1 direct correct, token-2 capture launch
-    // correct, token-3+ replay garbage). Direct-only until the decode scratch
-    // is hoisted to Qwen35Scratch like the MoE down-expand buffers.
+    // Escha code-quant dense: the decode scratch is hoisted into Qwen35Scratch,
+    // but the escha-dense kernels (escha_dense_decode_gemv) have NOT been
+    // verified graph-capture-safe — keep direct-only until verified.
     let use_graph = ar_graph_test
         && graph_enabled
         && graph_eligible
@@ -2965,6 +2996,8 @@ pub(crate) fn forward_scratch_layers(
                 }
                 super::escha_dense_forward::deltanet_escha_layer_forward(
                     gpu, layer, config, pos, layer_idx, delta_layer_idx, kv_cache, dn_state, s,
+                    s.escha_dense_u.as_ref().expect("escha-dense scratch"),
+                    s.escha_dense_partial.as_ref().expect("escha-dense scratch"),
                 )?;
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -2978,6 +3011,8 @@ pub(crate) fn forward_scratch_layers(
                 trace_escha_dense_progress(layer_idx, "FullAttnEscha");
                 super::escha_dense_forward::fullattn_escha_layer_forward(
                     gpu, layer, config, pos, layer_idx, kv_cache, s,
+                    s.escha_dense_u.as_ref().expect("escha-dense scratch"),
+                    s.escha_dense_partial.as_ref().expect("escha-dense scratch"),
                 )?;
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {

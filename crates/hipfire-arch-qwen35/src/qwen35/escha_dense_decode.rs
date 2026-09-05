@@ -28,27 +28,21 @@ use super::weights::EschaDenseProjWeights;
 /// Run one Escha-coded dense projection: y[out] = decode(x).
 /// `x` is the raw (pre-rotation) activation vector [in].
 /// `y` is a caller scratch [out] that receives the result.
+/// `u` and `partial` are caller-owned decode scratch (sized >= [in_p] and
+/// [n_slices*out_p]); the per-call pool alloc/free that used to live here was
+/// not hipGraph-capture-safe, so the escha-dense path now hoists them into
+/// `Qwen35Scratch`.
 pub fn escha_dense_decode_proj(
     gpu: &mut Gpu,
     proj: &EschaDenseProjWeights,
     x: &GpuTensor,
     y: &GpuTensor,
+    u: &GpuTensor,
+    partial: &GpuTensor,
 ) -> HipResult<()> {
-    let ic = proj.in_p;
-    let oc = proj.out_p;
-    let nit = ic / 16;
-    let n_slices = escha_dense::escha_dense_n_slices(nit, oc);
-
-    // scratch (per-call; freed after). The GPU pool reuses the same VMM arena.
-    let u = gpu.alloc_tensor(&[ic], DType::F32)?;
-    let partial = gpu.alloc_tensor(&[n_slices * oc], DType::F32)?;
-
-    let r = escha_dense::escha_dense_decode_gemv(
-        gpu, &proj.code, &proj.in_scale, &proj.out_scale, x, &u, &partial, y,
-    );
-    let _ = gpu.free_tensor(u);
-    let _ = gpu.free_tensor(partial);
-    r
+    escha_dense::escha_dense_decode_gemv(
+        gpu, &proj.code, &proj.in_scale, &proj.out_scale, x, u, partial, y,
+    )
 }
 
 /// Host reference for one dense projection decode: y[out] computed by the
@@ -99,9 +93,13 @@ pub fn escha_dense_check_proj(
 ) -> HipResult<(f32, f32)> {
     let ic = proj.in_p;
     let oc = proj.out_p;
+    let nit = ic / 16;
+    let n_slices = escha_dense::escha_dense_n_slices(nit, oc);
+    let u = gpu.alloc_tensor(&[ic], DType::F32)?;
+    let partial = gpu.alloc_tensor(&[n_slices * oc], DType::F32)?;
     let x = gpu.upload_f32(x_host, &[ic])?;
     let y = gpu.alloc_tensor(&[oc], DType::F32)?;
-    escha_dense_decode_proj(gpu, proj, &x, &y)?;
+    escha_dense_decode_proj(gpu, proj, &x, &y, &u, &partial)?;
     let got = gpu.download_f32(&y)?;
     let want = escha_dense_decode_proj_host(
         code_host,
@@ -125,6 +123,8 @@ pub fn escha_dense_check_proj(
     eprintln!("  want [0..8] = {:?}", &want[..8.min(oc)]);
     let _ = gpu.free_tensor(y);
     let _ = gpu.free_tensor(x);
+    let _ = gpu.free_tensor(u);
+    let _ = gpu.free_tensor(partial);
     Ok((max_abs, max_abs / (scale + 1e-9)))
 }
 
@@ -161,7 +161,7 @@ pub fn escha_dense_check_rotate(
     let ic = proj.in_p;
     let x = gpu.upload_f32(x_host, &[ic])?;
     let u = gpu.alloc_tensor(&[ic], DType::F32)?;
-    rdna_compute::escha_dense::escha_dense_rotate_in(gpu, &proj.in_scale, &x, &u)?;
+    rdna_compute::escha_dense::escha_dense_rotate_in(gpu, &proj.in_scale, &x, &u, ic)?;
     let got = gpu.download_f32(&u)?;
     let xs: Vec<f32> = (0..ic).map(|i| x_host[i] * in_scale_host[i]).collect();
     let want = apply_t128_host(&xs);
@@ -196,7 +196,7 @@ pub fn escha_dense_check_decode_stage(
     let x = gpu.upload_f32(x_host, &[ic])?;
     let u = gpu.alloc_tensor(&[ic], DType::F32)?;
     let partial = gpu.alloc_tensor(&[n_slices * oc], DType::F32)?;
-    rdna_compute::escha_dense::escha_dense_rotate_in(gpu, &proj.in_scale, &x, &u)?;
+    rdna_compute::escha_dense::escha_dense_rotate_in(gpu, &proj.in_scale, &x, &u, ic)?;
     // launch decode gemv only
     let r = rdna_compute::escha_dense::escha_dense_decode_gemv_stage(
         gpu, &proj.code, &u, &partial, ic, oc, n_slices, proj.k as i32,

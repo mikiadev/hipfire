@@ -48,12 +48,15 @@ pub fn escha_dense_n_slices(nit: usize, oc: usize) -> usize {
     n_slices.max(1).min(nit)
 }
 
-/// `u = T128(x . in_scale)` for one row.
+/// `u = T128(x . in_scale)` for one row. `ic` is the actual projection input
+/// size (the caller may pass a scratch `u` sized larger than `ic` for
+/// hipGraph-capture safety).
 pub fn escha_dense_rotate_in(
     gpu: &mut Gpu,
     in_scale: &GpuTensor,
     x: &GpuTensor,
     u: &GpuTensor,
+    ic: usize,
 ) -> HipResult<()> {
     gpu.bind_thread()?;
     gpu.ensure_kernel(
@@ -64,7 +67,7 @@ pub fn escha_dense_rotate_in(
     let sp = in_scale.buf.as_ptr();
     let xp = x.buf.as_ptr();
     let up = u.buf.as_ptr();
-    let ic = u.shape.last().copied().unwrap_or(x.numel()) as i32;
+    let ic = ic as i32;
 
     let mut params: Vec<*mut c_void> = vec![
         &sp as *const _ as *mut c_void,
@@ -151,7 +154,7 @@ pub fn escha_dense_decode_gemv(
     ];
 
     // 1. rotate
-    escha_dense_rotate_in(gpu, in_scale, x, u)?;
+    escha_dense_rotate_in(gpu, in_scale, x, u, ic)?;
 
     // 2. decode-gemm (grid: 1 row x OC/128 col-blocks x n_slices)
     let _timer = crate::profile::begin_timer(

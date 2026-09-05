@@ -56,8 +56,10 @@ fn decode_into(
     proj: &super::weights::EschaDenseProjWeights,
     x: &GpuTensor,
     dst: &GpuTensor,
+    u: &GpuTensor,
+    partial: &GpuTensor,
 ) -> HipResult<()> {
-    escha_dense_decode_proj(gpu, proj, x, dst)
+    escha_dense_decode_proj(gpu, proj, x, dst, u, partial)
 }
 
 /// Live-decode audit (HIPFIRE_ESCHA_DENSE_AUDIT=1): compare the GPU in-kernel
@@ -147,6 +149,8 @@ pub fn deltanet_escha_layer_forward(
     kv_cache: &mut hipfire_runtime::llama::KvCache,
     dn_state: &mut super::weights::DeltaNetState,
     s: &Qwen35Scratch,
+    escha_u: &GpuTensor,
+    escha_partial: &GpuTensor,
 ) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -159,8 +163,8 @@ pub fn deltanet_escha_layer_forward(
     // normed x → s.tmp (decode input is the raw normed activation).
     gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
     stats(gpu, "post rmsnorm (decode input)", &s.tmp);
-    decode_into(gpu, &layer.qkv, &s.tmp, &s.dn_qkv)?;
-    decode_into(gpu, &layer.z, &s.tmp, &s.dn_z)?;
+    decode_into(gpu, &layer.qkv, &s.tmp, &s.dn_qkv, escha_u, escha_partial)?;
+    decode_into(gpu, &layer.z, &s.tmp, &s.dn_z, escha_u, escha_partial)?;
     audit_decode(gpu, &layer.qkv, &s.tmp, &s.dn_qkv, layer_idx, pos, "qkv");
     audit_decode(gpu, &layer.z, &s.tmp, &s.dn_z, layer_idx, pos, "z");
     stats(gpu, "post qkv/z decode", &s.dn_qkv);
@@ -313,7 +317,7 @@ pub fn deltanet_escha_layer_forward(
     stats(gpu, "post gated-norm", &s.dn_normed);
 
     // ── wo coded projection + residual ──
-    decode_into(gpu, &layer.wo, &s.dn_normed, &s.o)?;
+    decode_into(gpu, &layer.wo, &s.dn_normed, &s.o, escha_u, escha_partial)?;
     audit_decode(gpu, &layer.wo, &s.dn_normed, &s.o, layer_idx, pos, "wo");
     stats(gpu, "post wo decode", &s.o);
     stats(gpu, "pre-add x (LA)", &s.x);
@@ -326,12 +330,12 @@ pub fn deltanet_escha_layer_forward(
         return Ok(());
     }
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-    decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
-    decode_into(gpu, &layer.w_up, &s.tmp, &s.up)?;
+    decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, escha_u, escha_partial)?;
+    decode_into(gpu, &layer.w_up, &s.tmp, &s.up, escha_u, escha_partial)?;
     audit_decode(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, layer_idx, pos, "gate");
     audit_decode(gpu, &layer.w_up, &s.tmp, &s.up, layer_idx, pos, "up");
     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-    decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
+    decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o, escha_u, escha_partial)?;
     audit_decode(gpu, &layer.w_down, &s.ffn_hidden, &s.o, layer_idx, pos, "down");
     stats(gpu, "post down decode", &s.o);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
@@ -350,24 +354,26 @@ pub fn fullattn_escha_layer_forward(
     layer_idx: usize,
     kv_cache: &mut hipfire_runtime::llama::KvCache,
     s: &Qwen35Scratch,
+    escha_u: &GpuTensor,
+    escha_partial: &GpuTensor,
 ) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     entry_probe(gpu, layer_idx, s, "FA");
     if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_ATTN").ok().as_deref() == Some("1") {
         // B1 debug: full-attention passthrough (only FFN acts).
         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-        decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
-        decode_into(gpu, &layer.w_up, &s.tmp, &s.up)?;
+        decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, escha_u, escha_partial)?;
+        decode_into(gpu, &layer.w_up, &s.tmp, &s.up, escha_u, escha_partial)?;
         gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-        decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
+        decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o, escha_u, escha_partial)?;
         gpu.add_f32(&s.x, &s.o, &s.x)?;
         return Ok(());
     }
     // ── q/k/v coded projections from the normed input ──
     gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
-    decode_into(gpu, &layer.wq, &s.tmp, &s.fa_q_full)?;
-    decode_into(gpu, &layer.wk, &s.tmp, &s.fa_k)?;
-    decode_into(gpu, &layer.wv, &s.tmp, &s.fa_v)?;
+    decode_into(gpu, &layer.wq, &s.tmp, &s.fa_q_full, escha_u, escha_partial)?;
+    decode_into(gpu, &layer.wk, &s.tmp, &s.fa_k, escha_u, escha_partial)?;
+    decode_into(gpu, &layer.wv, &s.tmp, &s.fa_v, escha_u, escha_partial)?;
 
     gpu.deinterleave_f32(
         &s.fa_q_full,
@@ -430,17 +436,17 @@ pub fn fullattn_escha_layer_forward(
     stats(gpu, "post attend out", &s.fa_attn_out);
 
     // ── wo coded projection + residual ──
-    decode_into(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
+    decode_into(gpu, &layer.wo, &s.fa_attn_out, &s.o, escha_u, escha_partial)?;
     stats(gpu, "post wo decode (FA)", &s.o);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
     stats(gpu, "post FA residual", &s.x);
 
     // ── FFN ──
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-    decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
-    decode_into(gpu, &layer.w_up, &s.tmp, &s.up)?;
+    decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, escha_u, escha_partial)?;
+    decode_into(gpu, &layer.w_up, &s.tmp, &s.up, escha_u, escha_partial)?;
     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-    decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
+    decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o, escha_u, escha_partial)?;
     gpu.add_f32(&s.x, &s.o, &s.x)?;
     stats(gpu, "post FFN residual (FA)", &s.x);
     Ok(())
