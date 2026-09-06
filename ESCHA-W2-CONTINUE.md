@@ -269,7 +269,29 @@ not yet verified graph-capture-safe).
 3. **Prefill attractor fix**: ✅ DONE (9daf925bf). Shared-memory buffer sized for max(tiles_max, R).
 4. **Batched FA attention** (task #71): FA layers still use per-token fallback. Need a batched FA kernel that works with coded wo projections.
 5. **MoE throughput**: beyond 10.6 tok/s requires the fp16/int8 dense attention path (handoff note: dense attention is int8→f32 at load, ~4.5 GB/token f32 traffic on the MoE).
-6. **Dense decode scratch on host** — the export carries per-projection `escha_config[6]` (6 floats near 1.0, not the MoE doc's `[tile,K,bits,mcg,...]`) and `s_in/s_out` ≈ ±0.6% around 1 that MUST be applied (the loader folds s_in·rin / s_out·rout). llama.cpp ignores s_in/s_out; we apply them for exactness.
+6. **Dense decode scratch on host** — see the corrected note below.
+7. **Batched-prefill gate**: ✅ RE-OPENED. `qwen35_layer_batch_admissible` returned `Err` for `DeltaNetEscha`/`FullAttnEscha` long after `9daf925bf` fixed the attractor that closed it, so `prefill_batch_pbs_eligible()` was false for the whole model and prefill silently ran the per-token fallback ("byte-identical to decode"). That is why pp == tg. Kill-switch: `HIPFIRE_ESCHA_DENSE_BATCHED=0`.
+8. **FA-escha fallback replayed the whole model** (found while re-opening 7): inside `forward_batch_chunk_impl`, the `FullAttnEscha` arm called `forward_scratch_layers`, which iterates `0..config.n_layers`. Enabling batched prefill would have replayed all 64 layers once per FA layer per token and then kept applying outer layers on top. Now calls `fullattn_escha_layer_forward` — one layer.
+
+### Corrected field notes (do not re-derive)
+
+- `escha_config` is **int32 `[tile=16, K, V=2, codebook_id, IC, OC]`**, NOT "6 floats
+  near 1.0" — that earlier reading was int32 reinterpreted as float. Verified across
+  all 400 projections against the matching `escha_code` shapes. `codebook_id == 1`
+  everywhere, so the single hardcoded codebook is right. `escha_load.rs` already
+  parsed this correctly.
+- The checkpoint is **mixed-rate**: `gate_proj` and all attention / linear-attn
+  projections are **K=2** (32 B per 16×16 tile, 0.25 B/weight); `up_proj` and
+  `down_proj` are **K=3** (48 B, 0.375 B/weight). Consequence: gate and up can never
+  share one coded-GEMM launch with a single K — fusing them needs K-grouped slicing.
+- **The `*.bias` tensors on disk are dead.** Every coded projection ships one, but the
+  authoritative sglang runtime builds all of them with `bias=False`
+  (`qwen3_5.py:121/134/143/152/161/232/510/520`, `qwen2_moe.py:109/118`) and its
+  `load_weights` skips `.bias` names absent from `params_dict`. hipfire not applying
+  bias matches the reference; stop treating this as an open question.
+- RoPE: reference is `rotary_dim=head_dim`, `partial_rotary_factor=0.25`,
+  `is_neox_style=True` → 64 of 256 dims, half-split = hipfire's
+  `rope_partial_halfsplit_f32`. `mrope_interleaved` is inert for text (t==h==w).
 
 External references: llama.cpp-escha fork
 `/home/mika/git/llama.cpp-escha` (branch `escha-w2-dense`, commits 2a238a40d +
