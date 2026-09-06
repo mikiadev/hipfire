@@ -240,13 +240,36 @@ fully per-token.
 
 ---
 
+## Prefill attractor FIXED (2026-09-06, commit 9daf925bf)
+
+**Root cause:** The matmul_prefill kernel stages R*16 floats into s_u for the
+R>1 prefill path, but the dispatch only allocated tiles_max*16 floats. For the
+27B model (qkv: nit=320, down: nit=640) `n_slices_prefill` forces n_slices >= R
+for parallelism, so tiles_max = nit/n_slices << R. The R>1 path overflowed the
+shared-memory buffer, corrupting decoded weights into a verbatim echo.
+
+**Fix:** Size the s_u buffer for max(tiles_max, R)*16 floats in
+`escha_dense_matmul_prefill` dispatch. Re-enabled the batched prefill path for
+DeltaNetEscha layers in `forward_prefill_chunk`.
+
+**Verified:** profile_escha_dense_prefill PASS across all batch sizes
+(max_err=0.0001), output coherent on the dense 27B model. Prefill speedup:
+n_rows=4 → 2.48x, n_rows=8 → 2.68x, n_rows=64 → 1.39x per-row vs per-token.
+
+**Remaining:** FA layers still use per-token fallback (task #71 — batched FA
+attention kernel). Decode path still excluded from hipGraph capture (kernels
+not yet verified graph-capture-safe).
+
+---
+
 ## Next steps (M3 / follow-up, in order)
 
-1. **Dense prefill + throughput**: ~~add the batched / WMMA prefill path~~ ✅ DONE. Batched prefill kernels exist and are correct for DeltaNetEscha layers. R is chosen dynamically to match n_rows, avoiding the R=64 waste for small batches. n_slices scales with R to keep per-block work bounded. Benchmark on gfx1151 (in_proj_qkv 5120x10240 K=2, per-token baseline ~620µs): n_rows=4 → 251µs/row (2.48x), n_rows=8 → 235µs/row (2.67x), n_rows=64 → 427µs/row (1.46x). Profile harness: `examples/profile_escha_dense_prefill.rs`.
-2. **Hoist dense decode scratch**: ✅ DONE (70d860bb9). Per-projection decode (`escha_dense_decode_proj`) no longer allocs pool scratch per call. Scratch hoisted into `Qwen35Scratch` as `escha_dense_u` / `escha_dense_partial`. Next: drop the `&& !config.is_escha_dense` exclusion in the `use_graph` predicate once escha-dense kernels are verified graph-capture-safe.
-3. **Prefill attractor fix**: The batched escha-dense path triggers an attractor on 64L models. Need to investigate the batched kernel coherence (likely a shared-mem bank conflict or grid-stride loop issue in `escha_dense_matmul_prefill`). This is the highest-value perf lever — would bring prefill from 1.9 tok/s to ~5-8 tok/s.
-4. **MoE throughput**: beyond 10.6 tok/s requires the fp16/int8 dense attention path (handoff note: dense attention is int8→f32 at load, ~4.5 GB/token f32 traffic on the MoE).
-5. **Dense decode scratch on host** — the export carries per-projection `escha_config[6]` (6 floats near 1.0, not the MoE doc's `[tile,K,bits,mcg,...]`) and `s_in/s_out` ≈ ±0.6% around 1 that MUST be applied (the loader folds s_in·rin / s_out·rout). llama.cpp ignores s_in/s_out; we apply them for exactness.
+1. **Dense prefill + throughput**: ✅ DONE. Batched prefill kernels correct for DeltaNetEscha layers. R chosen dynamically, n_slices scales with R. Profile harness: `examples/profile_escha_dense_prefill.rs`.
+2. **Hoist dense decode scratch**: ✅ DONE (70d860bb9). Scratch hoisted into `Qwen35Scratch` as `escha_dense_u` / `escha_dense_partial`. Next: drop the `&& !config.is_escha_dense` exclusion in the `use_graph` predicate once escha-dense kernels are verified graph-capture-safe.
+3. **Prefill attractor fix**: ✅ DONE (9daf925bf). Shared-memory buffer sized for max(tiles_max, R).
+4. **Batched FA attention** (task #71): FA layers still use per-token fallback. Need a batched FA kernel that works with coded wo projections.
+5. **MoE throughput**: beyond 10.6 tok/s requires the fp16/int8 dense attention path (handoff note: dense attention is int8→f32 at load, ~4.5 GB/token f32 traffic on the MoE).
+6. **Dense decode scratch on host** — the export carries per-projection `escha_config[6]` (6 floats near 1.0, not the MoE doc's `[tile,K,bits,mcg,...]`) and `s_in/s_out` ≈ ±0.6% around 1 that MUST be applied (the loader folds s_in·rin / s_out·rout). llama.cpp ignores s_in/s_out; we apply them for exactness.
 
 External references: llama.cpp-escha fork
 `/home/mika/git/llama.cpp-escha` (branch `escha-w2-dense`, commits 2a238a40d +
@@ -257,4 +280,4 @@ portable codebook spelling is exact under HIP.
 
 ---
 
-*Last updated 2026-09-05 (decode scratch hoist + prefill regression fix).*
+*Last updated 2026-09-06 (prefill attractor fix + batched path re-enabled).*
