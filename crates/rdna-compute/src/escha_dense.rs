@@ -305,7 +305,15 @@ pub fn escha_dense_matmul_prefill(
 
     let nw = 8 * k as usize;
     let tiles_max = nit.div_ceil(n_slices);
-    let smem = (8 * nw * std::mem::size_of::<u32>() + tiles_max * 16 * std::mem::size_of::<f32>()) as u32;
+    // The kernel stages R*16 floats into s_u for the R>1 prefill path but
+    // only tiles_max*16 for the R==1 gen path. For the 27B model (qkv: nit=320,
+    // down: nit=640) n_slices_prefill forces n_slices >= R, so tiles_max =
+    // nit/n_slices << R — allocating only tiles_max*16 under-sizes s_u and
+    // the R>1 path overflows the buffer, corrupting the decoded weights and
+    // producing a verbatim attractor past the prefill horizon. Size for the
+    // larger of the two so both paths are buffer-safe.
+    let s_u_floats = tiles_max.max(r as usize) * 16;
+    let smem = (8 * nw * std::mem::size_of::<u32>() + s_u_floats * std::mem::size_of::<f32>()) as u32;
 
     let mut params: Vec<*mut c_void> = vec![
         &cp as *const _ as *mut c_void,

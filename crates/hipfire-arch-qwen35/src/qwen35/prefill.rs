@@ -7412,12 +7412,35 @@ pub(crate) fn forward_batch_chunk_impl(
             // Escha code-quant dense layers: batched prefill.
             // Uses the in-kernel trellis decode path (batched projections)
             // instead of the per-token gather/scatter fallback.
-            (LayerWeights::DeltaNetEscha(_), LayerType::LinearAttention) |
+            (LayerWeights::DeltaNetEscha(layer), LayerType::LinearAttention) => {
+                // Batched prefill for Escha code-quant dense layers. Root-
+                // caused the prior attractor: the matmul_prefill kernel stages
+                // R*16 floats into s_u but the dispatch only allocated
+                // tiles_max*16. For the 27B shape, n_slices_prefill forces
+                // n_slices >= R, so tiles_max << R and the R>1 path overflowed
+                // the shared-memory buffer — corrupting decoded weights into
+                // a verbatim echo. Fixed by sizing s_u for max(tiles_max, R).
+                super::escha_dense_forward::deltanet_escha_layer_prefill(
+                    gpu,
+                    layer,
+                    config,
+                    n,
+                    delta_layer_idx,
+                    dn_state,
+                    pbs,
+                )?;
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+                delta_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+            }
             (LayerWeights::FullAttnEscha(_), LayerType::FullAttention) => {
-                // Per-token fallback for Escha-dense layers (gather/scatter).
-                // The batched path exists but triggers an attractor on this model
-                // shape — keep correct-and-slow until the batched kernel is
-                // validated coherent on 64-layer escha-dense.
+                // Per-token fallback for Escha-dense FA layers (gather/scatter).
+                // The FA path's batched attention kernel cannot yet be exercised
+                // on this model shape.
                 for i in 0..n {
                     let pos = start_pos + i;
                     gpu.hip.memcpy_dtod_at(
@@ -7453,11 +7476,7 @@ pub(crate) fn forward_batch_chunk_impl(
                         rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
-                match &weights.layers[layer_idx] {
-                    LayerWeights::DeltaNetEscha(_) => delta_layer_idx += 1,
-                    LayerWeights::FullAttnEscha(_) => kv_layer_idx += 1,
-                    _ => {}
-                }
+                kv_layer_idx += 1;
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
             _ => panic!("layer type mismatch at layer {layer_idx}"),
