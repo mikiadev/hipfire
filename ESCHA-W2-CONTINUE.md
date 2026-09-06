@@ -1,7 +1,7 @@
 # Escha-W2 — continue here (fresh-context handoff)
 
 Branch: **`feat/escha-w2`** in `/home/mika/git/hipfire`. Working tree clean at
-`18871f381` (41 commits vs upstream master 8cd15a62).
+`70d860bb9` (44 commits vs upstream master 8cd15a62).
 
 This is the one-file entry point for a fresh session. The full investigation
 trail lives in `escha-port-status.md` (repo root, committed); perf evidence in
@@ -26,8 +26,12 @@ loader, `LayerWeights` DeltaNetEscha/FullAttnEscha, HIP decode-gemm kernels
 (`kernels/src/escham/hip/escha_dense_kernels.hip`: rotate-in T128 →
 in-kernel tile decode → finalize) + `rdna-compute/src/escha_dense.rs` +
 `qwen35/escha_dense_{decode,forward}.rs`. Per-projection decode **exact** vs
-host/EschaLabs (rel 2e-4). Coherent multi-token prose/haiku at **~1.6–2.5
-tok/s** (unoptimized per-token decode-gemm).
+host/EschaLabs (rel 2e-4). Coherent multi-token prose/haiku at **~1.9
+tok/s** decode (post-reboot, per-token prefill path).
+
+**Current perf (2026-09-05, commit 70d860bb9):**
+- Decode: ~1.9 tok/s (per-token decode-gemm)
+- Prefill: ~1.9 tok/s (per-token fallback; batched path triggers attractor on 64L escha-dense)
 
 ---
 
@@ -70,6 +74,7 @@ MoE runs identically with `/data/rocmfpx/Escha-W2`.
 | Dense loader (+norms) | `crates/hipfire-arch-qwen35/src/qwen35/escha_load.rs` (DenseEschaSource) |
 | Dense decode engine/ref | `crates/hipfire-arch-qwen35/src/qwen35/escha_dense_decode.rs` |
 | Dense forward arms | `crates/hipfire-arch-qwen35/src/qwen35/escha_dense_forward.rs` |
+| Dense decode scratch | `Qwen35Scratch.escha_dense_u` / `escha_dense_partial` in `forward.rs` |
 | Dense kernels (HIP) | `kernels/src/escham/hip/escha_dense_kernels.hip` |
 | Dense dispatch | `crates/rdna-compute/src/escha_dense.rs` |
 | MoE kernels (HIP) | `kernels/src/escham/hip/{escham_moe_decode_trellis,escham_moe_fold,escham_moe_grouped_kernels}.hip` |
@@ -104,6 +109,11 @@ MoE runs identically with `/data/rocmfpx/Escha-W2`.
    pool scratch per call (capture-unsafe) → replay diverged at decode token ~3.
    Fix: add `&& !config.is_escha_dense` to the `use_graph` predicate in
    `crates/hipfire-arch-qwen35/src/qwen35/forward.rs`.
+7. **Decode scratch hoisting** (70d860bb9): `escha_dense_decode_proj` allocs
+   `u` + `partial` pool tensors per call (capture-unsafe). Hoisted into
+   `Qwen35Scratch` as `escha_dense_u` / `escha_dense_partial` (gated on
+   `config.is_escha_dense`). `escha_dense_rotate_in` now takes explicit `ic`
+   (scratch is oversized for max projection). Per-call alloc/free removed.
 
 Env-gated debug toggles (all harmless, MoE path untouched):
 `HIPFIRE_ESCHA_DENSE_TRACE/_LOGITS/_NO_FFN/_NO_ATTN/_STATE_FP32/_RAW_NORMS`,
@@ -203,12 +213,40 @@ looping. With temp 0.3 + repeat-penalty 1.1 the dense path is clean to
 
 ---
 
+## Prefill regression (2026-09-05, commit 70d860bb9)
+
+**Regression:** Prefill dropped from 3-4 tok/s to 0.1 tok/s (378s for 20 tokens).
+Root cause: the batched prefill commits marked escha-dense layers as
+`batch_admissible = true` in `qwen35_layer_batch_admissible`, which routed the
+entire model through the batched path. But escha-dense layers still used the
+per-token fallback *inside* the batched path (gather/scatter overhead for all
+64 layers), making it slower than pure per-token.
+
+**Fix:** Mark escha-dense layers as `batch_admissible = false` in
+`qwen35_layer_batch_admissible` to force the proven per-token fallback.
+Prefill restored to **1.9 tok/s** (correct output).
+
+**Finding:** The batched escha-dense kernels (`escha_dense_matmul_prefill`,
+`escha_dense_finalize_dense`) DO exist and are correct (verified via
+`examples/profile_escha_dense_prefill.rs`), but trigger an attractor on
+64-layer escha-dense (repetitive output like "在进行进行进行..."). Root cause
+unknown — needs kernel-level coherence investigation.
+
+**Key insight:** The batched path is only safe when ALL layers are
+batch-admissible. Mixed models (some layers batched, some per-token) need the
+per-token fallback inside the batched path, which has gather/scatter overhead.
+Escha-dense models are ALL escha-dense, so they either run fully batched or
+fully per-token.
+
+---
+
 ## Next steps (M3 / follow-up, in order)
 
-1. **Dense prefill + throughput**: ~~add the batched / WMMA prefill path~~ ✅ DONE. Batched prefill kernels exist and are enabled for DeltaNetEscha/FullAttnEscha layers. R is chosen dynamically to match n_rows, avoiding the R=64 waste for small batches. n_slices scales with R to keep per-block work bounded. Benchmark on gfx1151 (in_proj_qkv 5120x10240 K=2, per-token baseline ~620µs): n_rows=4 → 251µs/row (2.48x), n_rows=8 → 235µs/row (2.67x), n_rows=64 → 427µs/row (1.46x). Profile harness: `examples/profile_escha_dense_prefill.rs`.
-2. **Hoist dense decode scratch**: the per-projection decode (`escha_dense_decode_proj`) allocs `u` + `partial` pool tensors per call. Move them into `Qwen35Scratch` (like the MoE down-expand buffers) so the escha-dense path can rejoin AR hipGraph capture (drop the `5bb373af` exclusion after verifying).
-3. **MoE throughput**: beyond 10.6 tok/s requires the fp16/int8 dense attention path (handoff note: dense attention is int8→f32 at load, ~4.5 GB/token f32 traffic on the MoE).
-4. **Dense decode scratch on host** — the export carries per-projection `escha_config[6]` (6 floats near 1.0, not the MoE doc's `[tile,K,bits,mcg,...]`) and `s_in/s_out` ≈ ±0.6% around 1 that MUST be applied (the loader folds s_in·rin / s_out·rout). llama.cpp ignores s_in/s_out; we apply them for exactness.
+1. **Dense prefill + throughput**: ~~add the batched / WMMA prefill path~~ ✅ DONE. Batched prefill kernels exist and are correct for DeltaNetEscha layers. R is chosen dynamically to match n_rows, avoiding the R=64 waste for small batches. n_slices scales with R to keep per-block work bounded. Benchmark on gfx1151 (in_proj_qkv 5120x10240 K=2, per-token baseline ~620µs): n_rows=4 → 251µs/row (2.48x), n_rows=8 → 235µs/row (2.67x), n_rows=64 → 427µs/row (1.46x). Profile harness: `examples/profile_escha_dense_prefill.rs`.
+2. **Hoist dense decode scratch**: ✅ DONE (70d860bb9). Per-projection decode (`escha_dense_decode_proj`) no longer allocs pool scratch per call. Scratch hoisted into `Qwen35Scratch` as `escha_dense_u` / `escha_dense_partial`. Next: drop the `&& !config.is_escha_dense` exclusion in the `use_graph` predicate once escha-dense kernels are verified graph-capture-safe.
+3. **Prefill attractor fix**: The batched escha-dense path triggers an attractor on 64L models. Need to investigate the batched kernel coherence (likely a shared-mem bank conflict or grid-stride loop issue in `escha_dense_matmul_prefill`). This is the highest-value perf lever — would bring prefill from 1.9 tok/s to ~5-8 tok/s.
+4. **MoE throughput**: beyond 10.6 tok/s requires the fp16/int8 dense attention path (handoff note: dense attention is int8→f32 at load, ~4.5 GB/token f32 traffic on the MoE).
+5. **Dense decode scratch on host** — the export carries per-projection `escha_config[6]` (6 floats near 1.0, not the MoE doc's `[tile,K,bits,mcg,...]`) and `s_in/s_out` ≈ ±0.6% around 1 that MUST be applied (the loader folds s_in·rin / s_out·rout). llama.cpp ignores s_in/s_out; we apply them for exactness.
 
 External references: llama.cpp-escha fork
 `/home/mika/git/llama.cpp-escha` (branch `escha-w2-dense`, commits 2a238a40d +
@@ -219,4 +257,4 @@ portable codebook spelling is exact under HIP.
 
 ---
 
-*Last updated 2026-09-04 (B7 q/k-norm root cause solved).*
+*Last updated 2026-09-05 (decode scratch hoist + prefill regression fix).*
