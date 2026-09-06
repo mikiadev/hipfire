@@ -1940,16 +1940,156 @@ pub fn qwen35_layer_batch_admissible(
         // Escha code-quant MoE is never batched-prefill admissible on this tree
         // (routed experts are int16 trellis codes, not batchable quant weights).
         // The decode path runs per-token through the escham FFN engine.
-        LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => Err(
-            HipError::new(0, "Escha code-quant MoE layers are not batched-prefill admissible"),
-        ),
-        // Escha code-quant dense layers: batched prefill kernels exist but
-        // trigger an attractor on deep (64L) models. Keep per-token until the
-        // batched kernel is validated coherent on 64-layer escha-dense.
-        LayerWeights::DeltaNetEscha(_) | LayerWeights::FullAttnEscha(_) => Err(
-            HipError::new(0, "Escha code-quant dense layers: batched prefill deferred (attractor risk)"),
-        ),
+        LayerWeights::DeltaNetEschaMoe(_) | LayerWeights::FullAttnEschaMoe(_) => {
+            Err(HipError::new(
+                0,
+                "Escha code-quant MoE layers are not batched-prefill admissible",
+            ))
+        }
+        // Escha code-quant DENSE layers (Qwen3.8-27B-Escha-W2). Every
+        // projection is an int16 trellis code decoded in-kernel, so there is no
+        // `WeightTensor` and no `gpu_dtype` to gate on — admit on shape.
+        //
+        // History: `70d860bb9` closed this gate to dodge a prefill attractor.
+        // The attractor's root cause — `escha_dense_matmul_prefill_kernel`
+        // staging `R * 16` floats into an `s_u` sized only for `tiles_max * 16`,
+        // which overflowed whenever the old `n_slices >= R` heuristic drove
+        // `tiles_max` below `R` — was fixed in `9daf925bf`, but the gate was
+        // never re-opened. Closed, `prefill_batch_pbs_eligible()` is false for
+        // the WHOLE model and prefill silently takes the per-token fallback
+        // ("byte-identical to decode"), which is why pp == tg on the 27B: 58
+        // tokens x 285 ms reproduced the measured 16.8 s TTFT to within 1.5%.
+        //
+        // `HIPFIRE_ESCHA_DENSE_BATCHED=0` restores the per-token fallback.
+        LayerWeights::DeltaNetEscha(l) => {
+            if !escha_dense_batched_admit_enabled(
+                hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_BATCHED")
+                    .ok()
+                    .as_deref(),
+            ) {
+                return Err(HipError::new(
+                    0,
+                    "DeltaNetEscha batched prefill disabled by HIPFIRE_ESCHA_DENSE_BATCHED",
+                ));
+            }
+            if l.attn_norm.shape != vec![dim] || l.ffn_norm.shape != vec![dim] {
+                return Err(HipError::new(0, "DeltaNetEscha norm shape mismatch"));
+            }
+            for (name, p, i, o) in [
+                ("qkv", &l.qkv, dim, qkv_dim),
+                ("z", &l.z, dim, d_inner),
+                ("wo", &l.wo, d_inner, dim),
+                ("w_gate", &l.w_gate, dim, config.hidden_dim),
+                ("w_up", &l.w_up, dim, config.hidden_dim),
+                ("w_down", &l.w_down, config.hidden_dim, dim),
+            ] {
+                escha_dense_proj_shape_ok(name, p, i, o)?;
+            }
+            // in_proj_a / in_proj_b stay dense f16 WeightTensors.
+            for (name, w) in [("w_alpha", &l.w_alpha), ("w_beta", &l.w_beta)] {
+                if w.m != config.linear_num_value_heads || w.k != dim {
+                    return Err(HipError::new(
+                        0,
+                        &format!("DeltaNetEscha {name} shape mismatch"),
+                    ));
+                }
+            }
+            if l.a_log.shape != vec![config.linear_num_value_heads]
+                || l.dt_bias.shape != vec![config.linear_num_value_heads]
+            {
+                return Err(HipError::new(
+                    0,
+                    "DeltaNetEscha a_log/dt_bias shape mismatch",
+                ));
+            }
+            if l.conv_weight.shape != vec![conv_elems] {
+                return Err(HipError::new(0, "DeltaNetEscha conv_weight shape mismatch"));
+            }
+            if l.norm_weight.shape != vec![config.linear_value_head_dim] {
+                return Err(HipError::new(0, "DeltaNetEscha norm_weight shape mismatch"));
+            }
+            Ok(())
+        }
+        LayerWeights::FullAttnEscha(l) => {
+            if !escha_dense_batched_admit_enabled(
+                hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_BATCHED")
+                    .ok()
+                    .as_deref(),
+            ) {
+                return Err(HipError::new(
+                    0,
+                    "FullAttnEscha batched prefill disabled by HIPFIRE_ESCHA_DENSE_BATCHED",
+                ));
+            }
+            if l.attn_norm.shape != vec![dim] || l.ffn_norm.shape != vec![dim] {
+                return Err(HipError::new(0, "FullAttnEscha norm shape mismatch"));
+            }
+            // wq is the gated query projection: n_heads * head_dim * 2.
+            for (name, p, i, o) in [
+                ("wq", &l.wq, dim, q_out_dim),
+                ("wk", &l.wk, dim, kv_dim),
+                ("wv", &l.wv, dim, kv_dim),
+                ("wo", &l.wo, o_in, dim),
+                ("w_gate", &l.w_gate, dim, config.hidden_dim),
+                ("w_up", &l.w_up, dim, config.hidden_dim),
+                ("w_down", &l.w_down, config.hidden_dim, dim),
+            ] {
+                escha_dense_proj_shape_ok(name, p, i, o)?;
+            }
+            if l.q_norm.shape != vec![config.head_dim] || l.k_norm.shape != vec![config.head_dim] {
+                return Err(HipError::new(0, "FullAttnEscha q/k_norm shape mismatch"));
+            }
+            Ok(())
+        }
     }
+}
+
+/// Kill-switch for admitting Escha code-quant DENSE layers to batched prefill.
+/// Default ON (the attractor that motivated the refusal was root-caused and
+/// fixed in `9daf925bf`).
+fn escha_dense_batched_admit_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        Some("0") | Some("off") | Some("false") => false,
+        _ => true,
+    }
+}
+
+/// Shape contract for one Escha-coded dense projection inside a batched layer.
+/// `escha_dense_matmul_prefill_kernel` tiles 16-wide along both axes and needs
+/// 128-wide blocks for the two Sylvester-Hadamard passes, so both dims must be
+/// 128-aligned. `k` is the trellis bit-width parameter, derived by the loader
+/// from `code.shape[2] / 16`; this checkpoint is mixed-rate — `gate_proj` and
+/// the attention/linear-attn projections are K=2, `up_proj`/`down_proj` are K=3
+/// (48 B per 16x16 tile). That mix is why gate and up can never share one
+/// coded-GEMM launch without K-grouped slicing.
+fn escha_dense_proj_shape_ok(
+    name: &str,
+    p: &super::weights::EschaDenseProjWeights,
+    in_exp: usize,
+    out_exp: usize,
+) -> HipResult<()> {
+    if p.in_p != in_exp || p.out_p != out_exp {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "Escha {name} shape mismatch: {}x{}, expected {in_exp}x{out_exp}",
+                p.in_p, p.out_p
+            ),
+        ));
+    }
+    if !matches!(p.k, 2 | 3) {
+        return Err(HipError::new(
+            0,
+            &format!("Escha {name} trellis K={} unsupported", p.k),
+        ));
+    }
+    if p.in_p % 128 != 0 || p.out_p % 128 != 0 {
+        return Err(HipError::new(
+            0,
+            &format!("Escha {name} {}x{} is not 128-aligned", p.in_p, p.out_p),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
@@ -2489,10 +2629,14 @@ pub fn prefill_batch_pbs_eligible(
         && decouple_env.as_deref() != Some("0")
         && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
     let force_fallback = !verify_decouple && !hipfire_runtime::config::get().prefill_batched;
-    let has_dn = weights
-        .layers
-        .iter()
-        .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_) | LayerWeights::DeltaNetEscha(_),));
+    let has_dn = weights.layers.iter().any(|lw| {
+        matches!(
+            lw,
+            LayerWeights::DeltaNet(_)
+                | LayerWeights::DeltaNetMoe(_)
+                | LayerWeights::DeltaNetEscha(_),
+        )
+    });
     let all_layers_ok = weights.layers.iter().all(|lw| {
         if matches!(
             lw,
@@ -7437,10 +7581,19 @@ pub(crate) fn forward_batch_chunk_impl(
                 delta_layer_idx += 1;
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
-            (LayerWeights::FullAttnEscha(_), LayerType::FullAttention) => {
+            (LayerWeights::FullAttnEscha(layer), LayerType::FullAttention) => {
                 // Per-token fallback for Escha-dense FA layers (gather/scatter).
-                // The FA path's batched attention kernel cannot yet be exercised
-                // on this model shape.
+                // The batched attention kernel cannot yet be exercised on this
+                // model shape, so each row runs the single-token Escha FA body —
+                // ONE layer, the same body the per-token decode path runs.
+                //
+                // This used to call `forward_scratch_layers`, which iterates
+                // `0..config.n_layers`. That replayed the ENTIRE model once per
+                // FA layer per token (16 x n full-stack forwards per chunk), and
+                // the outer loop then carried on applying the remaining layers on
+                // top of the result. It was neither correct nor merely slow; it
+                // was only unreachable, because the eligibility gate below
+                // refused escha-dense before any of this could run.
                 for i in 0..n {
                     let pos = start_pos + i;
                     gpu.hip.memcpy_dtod_at(
@@ -7452,16 +7605,16 @@ pub(crate) fn forward_batch_chunk_impl(
                     )?;
                     let pos_i32 = pos as i32;
                     gpu.memcpy_htod_auto(&s.pos_buf, &pos_i32.to_ne_bytes())?;
-                    super::forward::forward_scratch_layers(
+                    super::escha_dense_forward::fullattn_escha_layer_forward(
                         gpu,
-                        weights,
+                        layer,
                         config,
                         pos,
+                        layer_idx,
                         kv_cache,
-                        dn_state,
                         s,
-                        None,
-                        None,
+                        s.escha_dense_u.as_ref().expect("escha-dense scratch"),
+                        s.escha_dense_partial.as_ref().expect("escha-dense scratch"),
                     )?;
                     gpu.hip.memcpy_dtod_at(
                         &pbs.x_batch.buf,
@@ -7720,8 +7873,16 @@ fn run_fa_layer_body(
         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
     let ctx = DispatchCtx::new(gpu);
-    let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, Some(&layer.wo), layer_idx, pos)?;
+    let fused_epilogue = kv_cache_attention_dispatch(
+        &ctx,
+        gpu,
+        kv_cache,
+        s,
+        config,
+        Some(&layer.wo),
+        layer_idx,
+        pos,
+    )?;
 
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
