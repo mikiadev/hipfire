@@ -300,28 +300,45 @@ extern "C" __global__ void escha_dense_rotate_in_dense_kernel(
 
 // partial[slice][row][c] = sum over this slice's input tiles of u . decode(code)
 // R rows per block. Decoded weights go to shared memory for reuse across rows.
-// R is a runtime parameter (1 for gen, 64 for prefill).
-extern "C" __global__ void escha_dense_matmul_prefill_kernel(
+//
+// K (trellis width) and R (rows per block) are TEMPLATE parameters, not kernel
+// arguments. Both have to be compile-time:
+//
+//   * `float acc[R]` with a runtime R cannot be register-allocated. The
+//     original declared `float acc[64]` and looped against a runtime `R`, so
+//     LLVM pushed the whole array into the private segment — gfx1151 reported
+//     `private_segment_fixed_size = 272` at `VGPR = 19`, i.e. every
+//     `acc[m] +=` was a scratch load plus store, with 272 B x 32 lanes ~ 8.7 KB
+//     of private state per wavefront against a 32 KB L1 that therefore thrashes.
+//     That is why 64-row batching bought ~1.4x instead of ~8x.
+//   * `NW = 8*K` feeds a `% NW` inside the r loop. With K constant that folds
+//     to a compare+subtract and the whole s0/sp/w0/wh index chain constant-
+//     folds far better.
+//
+// R is instantiated up to 32 rather than 64: `acc[R]` costs R VGPRs, and past
+// that the register file stops paying for the row reuse. The grid carries any
+// remaining rows on `blockIdx.x`.
+template <int K, int R>
+__device__ __forceinline__ void escha_dense_matmul_prefill_body(
     const int16_t* __restrict__ code,    // [in/16, out/16, 16*K] i16
     const float* __restrict__ u,         // [n_rows, IC]
     float* __restrict__ partial,         // [n_slices * n_rows * OC]
     int IC,
     int OC,
     int n_rows,
-    int n_slices,
-    int K,
-    int R) {
+    int n_slices) {
     // Same payload convention as escha_dense_decode_gemv_kernel:
     // plain uint32_t array, funnel-shift (hi=pay[w0-1] << 32 | lo=pay[w0]) >> (sp&31).
+    constexpr int NW = 8 * K;
+    constexpr int NB = 32 * NW;
+    constexpr int N_WD = (16 * K) / 2;
+
     extern __shared__ char s_raw[];
     uint32_t* s_pay = (uint32_t*)s_raw;
-    float* s_u = (float*)(s_pay + ESCHA_DGROUPS * (8 * K));
+    float* s_u = (float*)(s_pay + ESCHA_DGROUPS * NW);
 
-    const int NW = 8 * K;
-    const int NB = 32 * NW;
     const int nit = IC / ESCHA_DTILE;
     const int nct = OC / ESCHA_DTILE;
-    const int n_wd = (16 * K) / 2;
 
     const int tid = threadIdx.x;
     const int start = blockIdx.x * R;
@@ -339,7 +356,7 @@ extern "C" __global__ void escha_dense_matmul_prefill_kernel(
     int s0 = ((32 - K) - K * (32 * cc + 4 * (cc >> 3))) % NB;
     if (s0 < 0) s0 += NB;
 
-    float acc[64];
+    float acc[R];
     for (int m = 0; m < R; ++m) acc[m] = 0.0f;
 
     if (R == 1) {
@@ -361,7 +378,7 @@ extern "C" __global__ void escha_dense_matmul_prefill_kernel(
         }
 
         const uint32_t* src = (const uint32_t*)(code + (int64_t)(ti * nct + tj) * (16 * K));
-        for (int w = cc; w < n_wd; w += ESCHA_DTILE) {
+        for (int w = cc; w < N_WD; w += ESCHA_DTILE) {
             pay[w] = src[w];
         }
         if (R == 1) { __syncwarp(); } else { __syncthreads(); }
@@ -395,5 +412,34 @@ extern "C" __global__ void escha_dense_matmul_prefill_kernel(
         partial[((int64_t)sl * n_rows + start + m) * OC + blockIdx.y * ESCHA_DNT + tid] = acc[m];
     }
 }
+
+// One extern "C" entry point per (K, R). The dispatcher picks the symbol and
+// refuses anything outside this set; K is 2 or 3 in this checkpoint (gate_proj
+// and the attention/linear-attn projections are K=2, up_proj/down_proj are
+// K=3), so both are instantiated.
+#define ESCHA_DEFINE_MATMUL_PREFILL(K, R)                                  \
+    extern "C" __global__ void escha_dense_matmul_prefill_k##K##_r##R##_kernel( \
+        const int16_t* __restrict__ code,                                  \
+        const float* __restrict__ u,                                       \
+        float* __restrict__ partial,                                       \
+        int IC, int OC, int n_rows, int n_slices) {                        \
+        escha_dense_matmul_prefill_body<K, R>(                             \
+            code, u, partial, IC, OC, n_rows, n_slices);                   \
+    }
+
+ESCHA_DEFINE_MATMUL_PREFILL(2, 1)
+ESCHA_DEFINE_MATMUL_PREFILL(2, 2)
+ESCHA_DEFINE_MATMUL_PREFILL(2, 4)
+ESCHA_DEFINE_MATMUL_PREFILL(2, 8)
+ESCHA_DEFINE_MATMUL_PREFILL(2, 16)
+ESCHA_DEFINE_MATMUL_PREFILL(2, 32)
+ESCHA_DEFINE_MATMUL_PREFILL(3, 1)
+ESCHA_DEFINE_MATMUL_PREFILL(3, 2)
+ESCHA_DEFINE_MATMUL_PREFILL(3, 4)
+ESCHA_DEFINE_MATMUL_PREFILL(3, 8)
+ESCHA_DEFINE_MATMUL_PREFILL(3, 16)
+ESCHA_DEFINE_MATMUL_PREFILL(3, 32)
+
+#undef ESCHA_DEFINE_MATMUL_PREFILL
 
 #endif  // ESCHA_DENSE_KERNELS_HIP

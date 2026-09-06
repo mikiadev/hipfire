@@ -47,7 +47,10 @@ fn entry_probe(gpu: &Gpu, layer_idx: usize, s: &Qwen35Scratch, kind: &str) {
             mx = mx.max(x);
             rms += (x as f64) * (x as f64) / v.len() as f64;
         }
-        eprintln!("[escha-dense] {kind} L{layer_idx} x: range=[{mn:.3e},{mx:.3e}] rms={:.3e}", rms.sqrt());
+        eprintln!(
+            "[escha-dense] {kind} L{layer_idx} x: range=[{mn:.3e},{mx:.3e}] rms={:.3e}",
+            rms.sqrt()
+        );
     }
 }
 
@@ -83,7 +86,10 @@ fn audit_decode(
     let layer_filter = hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_AUDIT_LAYER")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
-    if !layer_filter.map(|lf| lf == layer_idx).unwrap_or(layer_idx % 16 == 0) {
+    if !layer_filter
+        .map(|lf| lf == layer_idx)
+        .unwrap_or(layer_idx % 16 == 0)
+    {
         return;
     }
     let pos_filter = hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_AUDIT_POS")
@@ -105,7 +111,11 @@ fn audit_decode(
     };
     let n_bytes = proj.code.buf.size();
     let mut code_bytes = vec![0u8; n_bytes];
-    if gpu.hip.memcpy_dtoh(&mut code_bytes, &proj.code.buf).is_err() {
+    if gpu
+        .hip
+        .memcpy_dtoh(&mut code_bytes, &proj.code.buf)
+        .is_err()
+    {
         return;
     }
     let code_i16: Vec<i16> = code_bytes
@@ -325,18 +335,52 @@ pub fn deltanet_escha_layer_forward(
     stats(gpu, "post LA residual", &s.x);
 
     // ── FFN (gate/up/down coded) ──
-    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FFN").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FFN")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         // B1 debug: skip the FFN contribution entirely.
         return Ok(());
     }
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-    decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, escha_u, escha_partial)?;
+    decode_into(
+        gpu,
+        &layer.w_gate,
+        &s.tmp,
+        &s.gate_ffn,
+        escha_u,
+        escha_partial,
+    )?;
     decode_into(gpu, &layer.w_up, &s.tmp, &s.up, escha_u, escha_partial)?;
-    audit_decode(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, layer_idx, pos, "gate");
+    audit_decode(
+        gpu,
+        &layer.w_gate,
+        &s.tmp,
+        &s.gate_ffn,
+        layer_idx,
+        pos,
+        "gate",
+    );
     audit_decode(gpu, &layer.w_up, &s.tmp, &s.up, layer_idx, pos, "up");
     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-    decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o, escha_u, escha_partial)?;
-    audit_decode(gpu, &layer.w_down, &s.ffn_hidden, &s.o, layer_idx, pos, "down");
+    decode_into(
+        gpu,
+        &layer.w_down,
+        &s.ffn_hidden,
+        &s.o,
+        escha_u,
+        escha_partial,
+    )?;
+    audit_decode(
+        gpu,
+        &layer.w_down,
+        &s.ffn_hidden,
+        &s.o,
+        layer_idx,
+        pos,
+        "down",
+    );
     stats(gpu, "post down decode", &s.o);
     gpu.add_f32(&s.x, &s.o, &s.x)?;
     stats(gpu, "post FFN residual", &s.x);
@@ -359,13 +403,31 @@ pub fn fullattn_escha_layer_forward(
 ) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     entry_probe(gpu, layer_idx, s, "FA");
-    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_ATTN").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_ATTN")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         // B1 debug: full-attention passthrough (only FFN acts).
         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-        decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, escha_u, escha_partial)?;
+        decode_into(
+            gpu,
+            &layer.w_gate,
+            &s.tmp,
+            &s.gate_ffn,
+            escha_u,
+            escha_partial,
+        )?;
         decode_into(gpu, &layer.w_up, &s.tmp, &s.up, escha_u, escha_partial)?;
         gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-        decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o, escha_u, escha_partial)?;
+        decode_into(
+            gpu,
+            &layer.w_down,
+            &s.ffn_hidden,
+            &s.o,
+            escha_u,
+            escha_partial,
+        )?;
         gpu.add_f32(&s.x, &s.o, &s.x)?;
         return Ok(());
     }
@@ -429,7 +491,11 @@ pub fn fullattn_escha_layer_forward(
         &ctx, gpu, kv_cache, s, config, None, layer_idx, pos,
     )?;
     debug_assert!(!fused_epilogue, "escha-dense FA must be unfused");
-    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FA_GATE").ok().as_deref() != Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FA_GATE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
     }
 
@@ -443,10 +509,24 @@ pub fn fullattn_escha_layer_forward(
 
     // ── FFN ──
     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-    decode_into(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn, escha_u, escha_partial)?;
+    decode_into(
+        gpu,
+        &layer.w_gate,
+        &s.tmp,
+        &s.gate_ffn,
+        escha_u,
+        escha_partial,
+    )?;
     decode_into(gpu, &layer.w_up, &s.tmp, &s.up, escha_u, escha_partial)?;
     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-    decode_into(gpu, &layer.w_down, &s.ffn_hidden, &s.o, escha_u, escha_partial)?;
+    decode_into(
+        gpu,
+        &layer.w_down,
+        &s.ffn_hidden,
+        &s.o,
+        escha_u,
+        escha_partial,
+    )?;
     gpu.add_f32(&s.x, &s.o, &s.x)?;
     stats(gpu, "post FFN residual (FA)", &s.x);
     Ok(())
@@ -466,22 +546,23 @@ pub fn escha_dense_decode_proj_batch(
     let oc = proj.out_p;
     let k = proj.k as i32;
     let nit = ic / 16;
-    // R = rows per block. The kernel accumulates R rows in a block; choosing
-    // R = min(n_rows, 64) avoids wasted work when n_rows < 64 (the old R=64
-    // default did 64x the accumulator work for n_rows=4). R must be a power
-    // of 2 for the Hadamard-friendly tiling, and <= 64 (kernel acc[64] size).
-    let r = if n_rows <= 1 {
-        1
-    } else {
-        n_rows.next_power_of_two().min(64) as i32
-    };
+    // R = rows per block. The kernel is instantiated per R so its accumulators
+    // stay in registers; `escha_dense_prefill_r` picks the largest power of two
+    // that fits both n_rows and the instantiation ceiling, and the grid's
+    // blockIdx.x carries the rest.
+    let r = rdna_compute::escha_dense::escha_dense_prefill_r(n_rows);
     let n_slices = rdna_compute::escha_dense::escha_dense_n_slices_prefill(nit, oc, n_rows, r);
     debug_assert!(n_slices >= 1);
 
     // Rotate: u = T128(x . in_scale)
     let u = gpu.alloc_tensor(&[n_rows * ic], DType::F32)?;
     rdna_compute::escha_dense::escha_dense_rotate_in_dense(
-        gpu, &proj.in_scale, x_batch, &u, n_rows, ic,
+        gpu,
+        &proj.in_scale,
+        x_batch,
+        &u,
+        n_rows,
+        ic,
     )?;
 
     // Matmul: partial = u @ decode(code)
@@ -492,7 +573,12 @@ pub fn escha_dense_decode_proj_batch(
 
     // Finalize: y = T128_col(sum_slices) . out_scale
     rdna_compute::escha_dense::escha_dense_finalize_dense(
-        gpu, &proj.out_scale, &partial, y_batch, n_rows, n_slices,
+        gpu,
+        &proj.out_scale,
+        &partial,
+        y_batch,
+        n_rows,
+        n_slices,
     )?;
 
     let _ = gpu.free_tensor(u);
@@ -519,7 +605,14 @@ pub fn deltanet_escha_layer_prefill(
     let qkv_dim = k_dim * 2 + v_dim;
 
     // ── attention input norm + coded projections ──
-    gpu.rmsnorm_batched(&pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, n_rows, config.dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        &layer.attn_norm,
+        &pbs.x_rot_batch,
+        n_rows,
+        config.dim,
+        config.norm_eps,
+    )?;
     escha_dense_decode_proj_batch(gpu, &layer.qkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n_rows)?;
     escha_dense_decode_proj_batch(gpu, &layer.z, &pbs.x_rot_batch, &pbs.dn_z_batch, n_rows)?;
 
@@ -608,8 +701,16 @@ pub fn deltanet_escha_layer_prefill(
             n_rows,
         )?;
     } else {
-        gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n_rows * k_dim * 4)?;
-        gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n_rows * k_dim * 4)?;
+        gpu.memcpy_dtod_auto(
+            &pbs.dn_q_batch.buf,
+            &pbs.dn_q_raw_batch.buf,
+            n_rows * k_dim * 4,
+        )?;
+        gpu.memcpy_dtod_auto(
+            &pbs.dn_k_batch.buf,
+            &pbs.dn_k_raw_batch.buf,
+            n_rows * k_dim * 4,
+        )?;
     }
     match dn_state.quant {
         super::weights::StateQuant::FP32 => {
@@ -658,15 +759,40 @@ pub fn deltanet_escha_layer_prefill(
     )?;
 
     // ── wo coded projection + residual ──
-    escha_dense_decode_proj_batch(gpu, &layer.wo, &pbs.dn_normed_batch, &pbs.x_rot_batch, n_rows)?;
+    escha_dense_decode_proj_batch(
+        gpu,
+        &layer.wo,
+        &pbs.dn_normed_batch,
+        &pbs.x_rot_batch,
+        n_rows,
+    )?;
     gpu.add_f32(&pbs.x_batch, &pbs.x_rot_batch, &pbs.x_batch)?;
 
     // ── FFN (gate/up/down coded) ──
-    gpu.rmsnorm_batched(&pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, n_rows, config.dim, config.norm_eps)?;
-    escha_dense_decode_proj_batch(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n_rows)?;
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        &layer.ffn_norm,
+        &pbs.x_rot_batch,
+        n_rows,
+        config.dim,
+        config.norm_eps,
+    )?;
+    escha_dense_decode_proj_batch(
+        gpu,
+        &layer.w_gate,
+        &pbs.x_rot_batch,
+        &pbs.gate_ffn_batch,
+        n_rows,
+    )?;
     escha_dense_decode_proj_batch(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n_rows)?;
     gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
-    escha_dense_decode_proj_batch(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &pbs.x_rot_batch, n_rows)?;
+    escha_dense_decode_proj_batch(
+        gpu,
+        &layer.w_down,
+        &pbs.ffn_hidden_batch,
+        &pbs.x_rot_batch,
+        n_rows,
+    )?;
     gpu.add_f32(&pbs.x_batch, &pbs.x_rot_batch, &pbs.x_batch)?;
 
     Ok(())
@@ -683,9 +809,15 @@ fn stats(gpu: &Gpu, label: &str, t: &GpuTensor) {
         let mut ninf = 0usize;
         let mut n = 0usize;
         for &v in &vals {
-            if v.is_nan() { nn += 1; }
-            else if v.is_infinite() { ninf += 1; }
-            else { n += 1; mn = mn.min(v); mx = mx.max(v); }
+            if v.is_nan() {
+                nn += 1;
+            } else if v.is_infinite() {
+                ninf += 1;
+            } else {
+                n += 1;
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
         }
         eprintln!("[escha-dense] {label}: n={n} nan={nn} inf={ninf} range=[{mn:.4e},{mx:.4e}] first3={:?}", &vals[..3.min(vals.len())]);
     }
@@ -746,7 +878,11 @@ fn small_probe(gpu: &Gpu, label: &str, t: &GpuTensor) {
             mn = mn.min(x);
             mx = mx.max(x);
         }
-        eprintln!("[escha-dense] {label}: n={} range=[{mn:.3e},{mx:.3e}] first4={:?}", v.len(), &v[..4.min(v.len())]);
+        eprintln!(
+            "[escha-dense] {label}: n={} range=[{mn:.3e},{mx:.3e}] first4={:?}",
+            v.len(),
+            &v[..4.min(v.len())]
+        );
     }
 }
 
