@@ -291,18 +291,24 @@ plumbing; the open question is whether the MTP layer's projections can be loaded
 | 2 | `lm_head` as int8 + W8A16 GEMV | low–med | tg +35–40% | todo — **now the top item**, decode is untouched at 3.4 tok/s |
 | 3 | Compile-time `R` (+ `K`) in `matmul_prefill` | med | pp +2–4× on top of 1 | ✅ done and verified on GPU — `private_segment_fixed_size` **272 → 0** |
 | 4 | Drop `n_slices ≥ R`; partial scratch bound | low | pp +10–20%, −GB VRAM | ✅ done, but the floor was load-bearing → replaced by an explicit smem bound (`b8dcefcb9`) |
-| 5 | Batch the 16 `FullAttnEscha` layers inside the chunk loop | med | pp ~2× on top | todo |
-| 6 | Fuse `rotate_in`+GEMV+`finalize`; multi-shard (K-grouped) merge | med–high | tg +50–100% | todo |
-| 7 | `LDS.64` overlapping-pair payload + compile-time `NW` | med | tg +20–40% | ✅ half done — `NW`/`NB` are now `constexpr` per K instantiation; the overlapping-pair `LDS.64` staging is still open |
-| 8 | hipGraph AR capture for escha-dense | med | tg +10–25% (post-6/7) | todo |
-| 9 | WMMA/MFMA coded prefill GEMM | high | pp → O(100–500) tok/s | todo |
-| 10 | MTP speculation from `mtp/` | med | tg ×1.8 | todo |
+| 5 | Batch the 16 `FullAttnEscha` layers inside the chunk loop | med | pp ~2× on top | **NOW THE TOP PREFILL ITEM** — FA is still per-token inside the batched chunk, and the chunk's GDN half is already batched, so FA ≈ 16/64 × 58 tokens of full-speed decode is the bulk of the remaining 3.47 s |
+| 6 | ~~Fuse `rotate_in`+GEMV+`finalize`~~ | tg +50–100% | ❌ **PREMISE WRONG (measured).** rotate = 9.4 µs, finalize = 3.8 µs: **13 µs of a 570 µs projection (2%)**. Fusing them cannot matter. Launch count still matters via hipGraph (8), not here. |
+| 7 | `LDS.64` overlapping-pair payload | tg +20–40% | ✅ 0.63 → 0.57 ms; **tg 4.6 → 5.0**, bit-identical vs the host reference. Overlapping `uint2` pairs staged once per tile. |
+| 7b | *found here:* the non-folding `% NW` | — | ✅ **biggest decode win.** `(w0+NW-1)%NW` → `w0 ? w0-1 : NW-1`: 36 `s_mul_hi_u32` + 39 `s_addc_u32` were a *division* in the inner loop. 1.10 → 0.63 ms, **tg 3.4 → 4.6**. |
+| 8 | hipGraph AR capture for escha-dense | tg +10–25% | todo, but demoted: per-launch cost is now small against gemv time. |
+| 9 | WMMA/MFMA coded prefill GEMM | pp → O(100–500) | todo — still the real ceiling-raiser. gemv is at 156 G weights/s vs ~515 G that measured bandwidth implies, so ~3× is on the table. |
+| 10 | MTP speculation from `mtp/` | tg ×1.8 | **DOES NOT ENGAGE.** `--spec mtp` measured 5.0 tok/s, identical to `off`. The on-disk draft is silently falling back — investigate before valuing it; it is the only tg lever that doesn't require beating the gemv. |
+| — | *tested and reverted:* split accumulator ×4 | — | ❌ 0.63 → 0.83 ms, **worse**. The FFMA dependency chain is not the limiter; the flat `n_slices` sweep (952→43520 blocks all ≈0.65 ms) says occupancy isn't either. |
 
-**Actionable order given the above:** the prefill items (1, 5, 9) are all blocked
-behind row 0, because there is currently no way to tell a correct batched coded
-GEMM from an incorrect one — that is exactly how the present bug stayed hidden.
-Row **2 (`lm_head` int8)** is fully independent of the batched path, is the
-largest single remaining win, and is unblocked now.
+**Cumulative measured, gfx1151, 58-token prompt, warm:**
+
+| | start of round | now |
+|---|---|---|
+| decode | 3.4 tok/s | **5.0 tok/s** (+47%) |
+| prefill | 3.5 tok/s (16.8 s TTFT) | **16.7 tok/s (3.47 s)** (4.8×) |
+
+**Revised order:** 5 → 10 → 9 → 8. Items 2 and 6 are dropped for the reasons
+above; item 2 (`lm_head` int8) still buys ~3.8 GB of VRAM, just not speed.
 
 ### GPU validation (done on the cloud box, gfx1151, same hardware)
 
