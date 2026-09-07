@@ -22,10 +22,11 @@ use rdna_compute::GpuTensor;
 use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
 use super::config::Qwen35Config;
+use super::config::TreeVerifyCtx;
 use super::escha_dense_decode::escha_dense_decode_proj;
 use super::forward::Qwen35Scratch;
 use super::weights::DeltaNetEschaLayerWeights;
-use super::weights::FullAttnEschaLayerWeights;
+use hipfire_runtime::llama::KvCacheExt;use super::weights::FullAttnEschaLayerWeights;
 
 /// Decode one projection whose output is `[out_p]` into `dst` (caller scratch
 /// sized `>= out_p`), allocating only the transient decode temporaries.
@@ -775,6 +776,240 @@ pub fn deltanet_escha_layer_prefill(
         &pbs.x_rot_batch,
         n_rows,
         config.dim,
+        config.norm_eps,
+    )?;
+    escha_dense_decode_proj_batch(
+        gpu,
+        &layer.w_gate,
+        &pbs.x_rot_batch,
+        &pbs.gate_ffn_batch,
+        n_rows,
+    )?;
+    escha_dense_decode_proj_batch(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n_rows)?;
+    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+    escha_dense_decode_proj_batch(
+        gpu,
+        &layer.w_down,
+        &pbs.ffn_hidden_batch,
+        &pbs.x_rot_batch,
+        n_rows,
+    )?;
+    gpu.add_f32(&pbs.x_batch, &pbs.x_rot_batch, &pbs.x_batch)?;
+
+    Ok(())
+}
+
+/// Batched prefill forward for one FullAttnEscha layer.
+///
+/// Mirrors `fullattn_escha_layer_forward` kernel-for-kernel but every launch
+/// covers all N chunk rows at once (the same inside-a-chunk order the MQ path
+/// uses in `batch_chunk_full_attn_attn` + `batch_chunk_full_attn_ffn`):
+/// rmsnorm → coded q/k/v → deinterleave → per-head q/k norms → RoPE → KV
+/// write + flash attention (via the shared dispatch plan) → sigmoid gate →
+/// coded wo + residual → FFN.
+///
+/// All coded projections run through [`escha_dense_decode_proj_batch`]; the
+/// norm/RoPE/attention kernels already have batched forms consumed by the MQ
+/// path through the same `pbs` buffers, so no new scratch is allocated here.
+/// `pbs.positions` (uploaded once per chunk by `batch_chunk_upload_positions`)
+/// feeds both RoPE and the batched KV write, matching the MQ batched FA arm.
+#[allow(clippy::too_many_arguments)]
+pub fn fullattn_escha_layer_prefill(
+    gpu: &mut Gpu,
+    layer: &FullAttnEschaLayerWeights,
+    config: &Qwen35Config,
+    n_rows: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    layer_idx: usize,
+    _kv_layer_idx: usize,
+    kv_cache: &mut hipfire_runtime::llama::KvCache,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    flash_mode: u8,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+) -> HipResult<()> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::attention::AttnParams;
+    use hipfire_dispatch::families::kv_tier::KvTierInputs;
+    use hipfire_dispatch::families::kv_tier::KvTierPlan;
+    use hipfire_dispatch::pipeline::{execute_steps, Step};
+
+    let dim = config.dim;
+    let _ = (config.n_kv_heads * config.head_dim, config.n_heads * config.head_dim);
+
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_ATTN")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        // B1 debug: full-attention passthrough (only FFN acts), batched form.
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.ffn_norm,
+            &pbs.x_rot_batch,
+            n_rows,
+            dim,
+            config.norm_eps,
+        )?;
+        escha_dense_decode_proj_batch(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n_rows)?;
+        escha_dense_decode_proj_batch(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n_rows)?;
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        escha_dense_decode_proj_batch(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &pbs.x_rot_batch, n_rows)?;
+        gpu.add_f32(&pbs.x_batch, &pbs.x_rot_batch, &pbs.x_batch)?;
+        return Ok(());
+    }
+
+    // ── q/k/v coded projections from the normed input ──
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        &layer.attn_norm,
+        &pbs.x_rot_batch,
+        n_rows,
+        dim,
+        config.norm_eps,
+    )?;
+    escha_dense_decode_proj_batch(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n_rows)?;
+    escha_dense_decode_proj_batch(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n_rows)?;
+    escha_dense_decode_proj_batch(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n_rows)?;
+
+    // Batched deinterleave Q + gate, then per-head Q/K rmsnorm.
+    gpu.deinterleave_f32_batched(
+        &pbs.fa_q_full_batch,
+        &pbs.fa_q_batch,
+        &pbs.fa_gate_batch,
+        config.n_heads,
+        config.head_dim,
+        n_rows,
+    )?;
+    gpu.rmsnorm_batched(
+        &pbs.fa_q_batch,
+        &layer.q_norm,
+        &pbs.fa_q_batch,
+        n_rows * config.n_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+    gpu.rmsnorm_batched(
+        &pbs.fa_k_batch,
+        &layer.k_norm,
+        &pbs.fa_k_batch,
+        n_rows * config.n_kv_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+
+    // Batched partial-interleaved RoPE (per-row positions), same convention
+    // as the MQ batched FA arm: depth-based rope_positions under tree verify,
+    // flat physical positions otherwise.
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    let rope_pos_buf = if tree_verify.is_some() {
+        &pbs.rope_positions
+    } else {
+        &pbs.positions
+    };
+    gpu.rope_partial_interleaved_f32_batched(
+        &pbs.fa_q_batch,
+        &pbs.fa_k_batch,
+        rope_pos_buf,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+        n_rows,
+        kv_cache.compact_offset as i32,
+    )?;
+
+    // Batched KV write + flash attention via the shared dispatch plan.
+    let ctx = DispatchCtx::new(gpu);
+    let is_tree = tree_verify.is_some();
+    let (block_start, block_cols) = match tree_verify.as_ref() {
+        Some(_) => (start_pos, n_rows),
+        None => (0, 0),
+    };
+    let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+    let plan = KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n_rows,
+        is_tree,
+        ..kv_cache.tier_inputs()
+    })
+    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    // NOTE: k_cache/v_cache are indexed by MODEL layer index (`layer_idx`),
+    // not the FA counter (`kv_layer_idx`): the filtered KV constructor keeps
+    // one Vec entry per model layer with real buffers only on FA layers and
+    // 256-byte placeholders elsewhere. Indexing by kv_layer_idx wrote the
+    // first FA layer (model 3) into k_gpu[0]'s placeholder → fault at the
+    // cache base address (2026-09-07). Matches the per-token body and the MQ
+    // batched arm, which both index by layer_idx.
+    let io = AttnParams {
+        q: &pbs.fa_q_batch,
+        k: &pbs.fa_k_batch,
+        v: &pbs.fa_v_batch,
+        k_cache: &kv_cache.k_gpu[layer_idx],
+        v_cache: &kv_cache.v_gpu[layer_idx],
+        k_scales: None,
+        v_scales: None,
+        pos_buf: &s.pos_buf,
+        pos: start_pos,
+        positions: Some(&pbs.positions),
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        physical_cap: kv_cache.physical_cap,
+        batch_size: n_rows,
+        max_ctx_len,
+        flash_partials: Some(&s.flash_partials),
+        givens_cos: kv_cache.givens_cos.as_ref(),
+        givens_sin: kv_cache.givens_sin.as_ref(),
+        tree_bias,
+        block_start,
+        block_cols,
+        output_gate: None,
+        output: &pbs.fa_attn_out_batch,
+    };
+    if batch_semantics.is_independent() {
+        return Err(HipError::new(
+            0,
+            "FullAttnEscha batched prefill does not support independent batch semantics",
+        ));
+    }
+    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+        .map_err(|e| HipError::new(0, &e.to_string()))?;
+
+    // Escha-dense FA runs UNFUSED (coded wo is not a WeightTensor), so the
+    // attention kernel always leaves fa_attn_out pre-gate; apply sigmoid(gate).
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FA_GATE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+    }
+
+    // ── wo coded projection + residual ──
+    escha_dense_decode_proj_batch(gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.x_rot_batch, n_rows)?;
+    gpu.add_f32(&pbs.x_batch, &pbs.x_rot_batch, &pbs.x_batch)?;
+
+    // ── FFN (gate/up/down coded) ──
+    if hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_NO_FFN")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        // B1 debug: skip the FFN contribution entirely.
+        return Ok(());
+    }
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        &layer.ffn_norm,
+        &pbs.x_rot_batch,
+        n_rows,
+        dim,
         config.norm_eps,
     )?;
     escha_dense_decode_proj_batch(

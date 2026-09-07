@@ -1257,7 +1257,7 @@ impl PrefillBatchScratch {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum BatchSemantics<'a> {
+pub enum BatchSemantics<'a> {
     Sequential,
     Independent {
         positions: &'a [usize],
@@ -1268,11 +1268,11 @@ pub(crate) enum BatchSemantics<'a> {
 
 impl BatchSemantics<'_> {
     #[inline]
-    pub(crate) fn is_independent(self) -> bool {
+    pub fn is_independent(self) -> bool {
         matches!(self, Self::Independent { .. })
     }
     #[inline]
-    pub(crate) fn active_mask(self) -> Option<u64> {
+    pub fn active_mask(self) -> Option<u64> {
         match self {
             Self::Independent { active_mask, .. } => Some(active_mask),
             Self::Sequential => None,

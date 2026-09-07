@@ -7610,48 +7610,30 @@ pub(crate) fn forward_batch_chunk_impl(
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
             (LayerWeights::FullAttnEscha(layer), LayerType::FullAttention) => {
-                // Per-token fallback for Escha-dense FA layers (gather/scatter).
-                // The batched attention kernel cannot yet be exercised on this
-                // model shape, so each row runs the single-token Escha FA body —
-                // ONE layer, the same body the per-token decode path runs.
-                //
-                // This used to call `forward_scratch_layers`, which iterates
-                // `0..config.n_layers`. That replayed the ENTIRE model once per
-                // FA layer per token (16 x n full-stack forwards per chunk), and
-                // the outer loop then carried on applying the remaining layers on
-                // top of the result. It was neither correct nor merely slow; it
-                // was only unreachable, because the eligibility gate below
-                // refused escha-dense before any of this could run.
-                for i in 0..n {
-                    let pos = start_pos + i;
-                    gpu.hip.memcpy_dtod_at(
-                        &s.x.buf,
-                        0,
-                        &pbs.x_batch.buf,
-                        i * dim_row_bytes,
-                        dim_row_bytes,
-                    )?;
-                    let pos_i32 = pos as i32;
-                    gpu.memcpy_htod_auto(&s.pos_buf, &pos_i32.to_ne_bytes())?;
-                    super::escha_dense_forward::fullattn_escha_layer_forward(
-                        gpu,
-                        layer,
-                        config,
-                        pos,
-                        layer_idx,
-                        kv_cache,
-                        s,
-                        s.escha_dense_u.as_ref().expect("escha-dense scratch"),
-                        s.escha_dense_partial.as_ref().expect("escha-dense scratch"),
-                    )?;
-                    gpu.hip.memcpy_dtod_at(
-                        &pbs.x_batch.buf,
-                        i * dim_row_bytes,
-                        &s.x.buf,
-                        0,
-                        dim_row_bytes,
-                    )?;
-                }
+                // Batched prefill for Escha-dense FA layers: coded q/k/v/wo
+                // projections via the in-kernel trellis decode path, with the
+                // norm/RoPE/KV-write/attention stages running the same batched
+                // kernels as the MQ FA arm (see `batch_chunk_full_attn_attn`
+                // for the reference shape). Replaces the per-token
+                // gather/scatter loop below the old whole-model fallback
+                // (`forward_scratch_layers`, fixed to the single-layer
+                // `fullattn_escha_layer_forward` as an interim).
+                super::escha_dense_forward::fullattn_escha_layer_prefill(
+                    gpu,
+                    layer,
+                    config,
+                    n,
+                    start_pos,
+                    max_ctx_len,
+                    layer_idx,
+                    kv_layer_idx,
+                    kv_cache,
+                    s,
+                    pbs,
+                    s.flash_mode,
+                    batch_semantics,
+                    tree_verify,
+                )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
                         rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;

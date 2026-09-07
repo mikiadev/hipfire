@@ -22,7 +22,7 @@ pub mod weights;
 
 pub use batch::{
     forward_decode_batch, forward_decode_batch_prepared, prepare_decode_batch_inputs,
-    PrefillBatchScratch, Qwen35DecodeBatchState,
+    BatchSemantics, PrefillBatchScratch, Qwen35DecodeBatchState,
 };
 pub use config::{
     apply_reap_plan, config_from_hfq, config_from_metadata_json, config_from_safetensors,
