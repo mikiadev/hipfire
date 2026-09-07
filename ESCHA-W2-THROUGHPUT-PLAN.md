@@ -270,6 +270,15 @@ Astrea artifacts: `kld-27b/result-data.json` (reduce), `kld-27b/astrea-armD.json
   applied at runtime, or per-projection bias-ablation KLD) is still open.
   Coherence spot-check passes (Paris), so the damage is distributional, not
   collapse — consistent with 400 small additive corrections going missing.
+  - **Update 2026-09-07 (bias-dropout probe, `bias_dropout.py`):** zeroing all
+    400 `.bias` payloads (7.8 MB) in a copy of Arm B and scoring vs the same
+    F16 reference gives **KLD 0.0311 (CI 0.028–0.034), PPL 11.059 (+0.10)**.
+    So of Arm C's 0.148: **~0.031 is the bias drop, ~0.117 is the fold+MQ6
+    itself.** The fold is NOT exonerated — it carries ~80% of the damage.
+    (Caveat: zero-bias ≠ absent-bias is numerically identical here since the
+    runtime ADDS the bias; the probe is exact for the bias-drop component.
+    Remaining confound inside the 0.117: fold-vs-MQ6 split is still joined —
+    the `FOLD=f16` attribution would separate them but needs ~50 GB disk.)
 - **F3: Arm B self-control is 0.0000000.** The verbatim `.hfq` served through
   the PR runtime reproduces the F16 reference bit-exactly at the KLD level —
   the repack path is verified clean end-to-end (their G1 `memcmp` + our KLD
