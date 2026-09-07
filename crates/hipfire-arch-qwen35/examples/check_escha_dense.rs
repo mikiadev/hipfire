@@ -168,10 +168,24 @@ fn main() {
         eprintln!("no gpu"); return;
     };
 
-    // upload projection
+    // upload projection, loader-identically (nt-major transpose).
+    let tile_bytes = 16 * k * 2;
+    let (nti, nto) = (in_p / 16, out_p / 16);
+    let code_raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len() * 2)
+    };
+    let mut nt_major = vec![0u8; code_raw.len()];
+    for ti in 0..nti {
+        for tj in 0..nto {
+            let src = (ti * nto + tj) * tile_bytes;
+            let dst = (tj * nti + ti) * tile_bytes;
+            nt_major[dst..dst + tile_bytes]
+                .copy_from_slice(&code_raw[src..src + tile_bytes]);
+        }
+    }
     let code_gpu = gpu.upload_raw(
-        unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len() * 2) },
-        &[in_p / 16, out_p / 16, k * 16],
+        &nt_major,
+        &[out_p / 16, in_p / 16, k * 16],
     ).expect("code upload");
     let in_scale_gpu = gpu.upload_f32(&in_scale, &[in_p]).expect("in upload");
     let out_scale_gpu = gpu.upload_f32(&out_scale, &[out_p]).expect("out upload");

@@ -172,11 +172,23 @@ fn upload_proj(
     gpu: &mut rdna_compute::Gpu,
     p: &RawProj,
 ) -> EschaDenseProjWeights {
+    // Loader-identical: nt-major transpose + [out/16, in/16, 16*K] shape tag.
+    let tile_bytes = 16 * p.k * 2;
+    let (nti, nto) = (p.in_p / 16, p.out_p / 16);
+    let code_raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(p.code.as_ptr() as *const u8, p.code.len() * 2)
+    };
+    let mut nt_major = vec![0u8; code_raw.len()];
+    for ti in 0..nti {
+        for tj in 0..nto {
+            let src = (ti * nto + tj) * tile_bytes;
+            let dst = (tj * nti + ti) * tile_bytes;
+            nt_major[dst..dst + tile_bytes]
+                .copy_from_slice(&code_raw[src..src + tile_bytes]);
+        }
+    }
     let code_gpu = gpu
-        .upload_raw(
-            unsafe { std::slice::from_raw_parts(p.code.as_ptr() as *const u8, p.code.len() * 2) },
-            &[p.in_p / 16, p.out_p / 16, p.k * 16],
-        )
+        .upload_raw(&nt_major, &[p.out_p / 16, p.in_p / 16, p.k * 16])
         .expect("code upload");
     let in_scale_gpu = gpu.upload_f32(&p.in_scale, &[p.in_p]).expect("in_scale");
     let out_scale_gpu = gpu.upload_f32(&p.out_scale, &[p.out_p]).expect("out_scale");

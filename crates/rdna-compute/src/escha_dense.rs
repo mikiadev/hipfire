@@ -109,6 +109,12 @@ pub fn escha_dense_rotate_in(
 ///   y = T128_col(sum_slices) . out_scale       (finalize)
 ///
 /// `u` and `y` are caller scratch; the kernel launches allocate nothing.
+///
+/// NOTE on grid order: `code.shape` is `[out/16, in/16, 16*K]` (nt-major,
+/// transposed at load). IC/OC below are read SWAPPED to match (ic =
+/// shape[1]*16, oc = shape[0]*16); K is order-free. The kernels index
+/// `tj*nit + ti`. Reverting any one of the three (load transpose, shape
+/// read, kernel index) without the other two decodes wrong tiles.
 #[allow(clippy::too_many_arguments)]
 pub fn escha_dense_decode_gemv(
     gpu: &mut Gpu,
@@ -120,8 +126,9 @@ pub fn escha_dense_decode_gemv(
     partial: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    let ic = code.shape[0] as usize * 16;
-    let oc = code.shape[1] as usize * 16;
+    // nt-major shape [out/16, in/16, 16*K]: ic = shape[1]*16, oc = shape[0]*16.
+    let oc = code.shape[0] as usize * 16;
+    let ic = code.shape[1] as usize * 16;
     let k = (code.shape[2] as usize / 16) as i32;
     let nit = ic / 16;
     let n_ocb = oc / 128;
@@ -340,8 +347,9 @@ pub fn escha_dense_matmul_prefill(
             ),
         )
     })?;
-    let ic = code.shape[0] as usize * 16;
-    let oc = code.shape[1] as usize * 16;
+    // nt-major shape (see decode_gemv above): shape = [out/16, in/16, 16*K].
+    let oc = code.shape[0] as usize * 16;
+    let ic = code.shape[1] as usize * 16;
     let nit = ic / 16;
     let n_ocb = oc / 128;
 

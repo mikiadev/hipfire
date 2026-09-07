@@ -110,6 +110,9 @@ fn audit_decode(
         (Ok(x), Ok(i), Ok(o)) => (x, i, o),
         _ => return,
     };
+    // Grid order: device holds nt-major [out/16, in/16]; the host reference
+    // decodes kt-major [in/16, out/16]. Un-transpose (whole tiles) before
+    // comparing — otherwise every audit FAILs on a correct kernel.
     let n_bytes = proj.code.buf.size();
     let mut code_bytes = vec![0u8; n_bytes];
     if gpu
@@ -119,7 +122,19 @@ fn audit_decode(
     {
         return;
     }
-    let code_i16: Vec<i16> = code_bytes
+    let k = proj.k as usize;
+    let (nti, nto) = (proj.in_p / 16, proj.out_p / 16);
+    let tile_bytes = 16 * k * 2;
+    let mut kt_major = vec![0u8; n_bytes];
+    for tj in 0..nto {
+        for ti in 0..nti {
+            let src = (tj * nti + ti) * tile_bytes;
+            let dst = (ti * nto + tj) * tile_bytes;
+            kt_major[dst..dst + tile_bytes]
+                .copy_from_slice(&code_bytes[src..src + tile_bytes]);
+        }
+    }
+    let code_i16: Vec<i16> = kt_major
         .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();

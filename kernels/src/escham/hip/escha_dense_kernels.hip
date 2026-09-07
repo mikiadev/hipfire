@@ -180,8 +180,11 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
     __syncthreads();
 
     for (int ti = lo; ti < hi; ++ti) {
+        // nt-major grid [nct][nit] (transposed at load): tj*nit + ti.
+        // Was ti*nct + tj in kt-major order — the transpose and this index
+        // land atomically (see escha_load.rs).
         const int16_t* tile =
-            code + ((size_t)(ti * nct + tj)) * (size_t)(16 * K);
+            code + ((size_t)(tj * nit + ti)) * (size_t)(16 * K);
         // Stage this tile as overlapping pairs: pair w needs word w and word
         // w-1, so each lane takes one extra global read for the predecessor.
         // The tile is only NW words, it is L1-hot, and this runs once per tile
@@ -397,7 +400,8 @@ __device__ __forceinline__ void escha_dense_matmul_prefill_body(
             }
         }
 
-        const uint32_t* src = (const uint32_t*)(code + (int64_t)(ti * nct + tj) * (16 * K));
+        // nt-major grid (see decode_gemv above): tj*nit + ti.
+        const uint32_t* src = (const uint32_t*)(code + (int64_t)(tj * nit + ti) * (16 * K));
         for (int w = cc; w < N_WD; w += ESCHA_DTILE) {
             pay[w] = src[w];
         }

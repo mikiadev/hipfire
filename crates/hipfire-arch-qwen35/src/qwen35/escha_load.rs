@@ -495,19 +495,44 @@ impl<'a> EschaSource<'a> {
         let out_scale_f32: Vec<f32> = rout.iter().zip(sout.iter()).map(|(&r, &s)| r * s).collect();
 
         // Code upload (bitwise F16 = i16 2-byte elements), typed F16 like the MoE path.
-        // NOTE (2026-09-07): kt-major order preserved — an nt-major transpose
-        // (PR #694 `bb77ff87d`, +24% on their decode GEMV) was attempted and
-        // reverted: our decode kernels address tiles as ti*nct + tj, so a
-        // transposed grid without a matching tj*nit + ti kernel index decodes
-        // wrong tiles (oracle FAIL rel ~15 on gate_proj, then a fault on
-        // down_proj from the shape-tag/probe mismatch). The transpose + index
-        // change must land atomically; until then the checkpoint order is the
-        // only correct order.
-        let buf = gpu.hip.malloc(code_data.len())?;
-        gpu.hip.memcpy_htod(&buf, code_data)?;
+        //
+        // Tile-grid transpose kt-major -> nt-major at load (cf. PR #694
+        // `bb77ff87d`, +24% on their decode GEMV). Our decode gemv holds one
+        // output tile column `tj` fixed and walks input tiles `ti`; in the
+        // checkpoint's `[in/16, out/16]` order consecutive `ti` are a full
+        // tile-row (`nct` tiles) apart — 139 KB on gate_proj — so each step
+        // is a fresh line. Transposed to `[out/16, in/16]`, consecutive `ti`
+        // are adjacent. Whole tiles move, contents untouched: every decoded
+        // weight is identical.
+        //
+        // ATOMICITY (learned 2026-09-07 — a transpose-only landing was
+        // reverted): the shape tag travels WITH the data (`code.shape` becomes
+        // `[out/16, in/16, 16*K]`), the decode + prefill kernels index
+        // `tj*nit + ti`, `audit_decode` un-transposes before the host
+        // reference, and the oracles upload loader-identically. Every consumer
+        // of the grid changes in this same commit; a transpose without its
+        // kernel index decodes wrong tiles (oracle FAIL rel ~15).
+        let tile_bytes = 16 * k as usize * 2;
+        let (nti, nto) = (in_p / 16, out_p / 16);
+        assert_eq!(
+            code_data.len(),
+            nti * nto * tile_bytes,
+            "{code_name}: code bytes vs tile grid"
+        );
+        let mut nt_major = vec![0u8; code_data.len()];
+        for ti in 0..nti {
+            for tj in 0..nto {
+                let src = (ti * nto + tj) * tile_bytes;
+                let dst = (tj * nti + ti) * tile_bytes;
+                nt_major[dst..dst + tile_bytes]
+                    .copy_from_slice(&code_data[src..src + tile_bytes]);
+            }
+        }
+        let buf = gpu.hip.malloc(nt_major.len())?;
+        gpu.hip.memcpy_htod(&buf, &nt_major)?;
         let code = GpuTensor {
             buf,
-            shape: vec![in_p / 16, out_p / 16, k as usize * 16],
+            shape: vec![out_p / 16, in_p / 16, k as usize * 16],
             dtype: DType::F16,
         };
         let in_scale = gpu.upload_f32(&in_scale_f32, &[in_p])?;
