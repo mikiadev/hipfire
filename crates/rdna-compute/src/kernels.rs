@@ -6544,6 +6544,11 @@ const ESCHAM_MOE_GROUPED_SRC_RAW: &str =
 /// rotate-in (T128 of x.in_scale), in-kernel decode-gemm, finalize (WHT+scale).
 const ESCHA_DENSE_SRC_RAW: &str =
     include_str!("../../../kernels/src/escham/hip/escha_dense_kernels.hip");
+/// Escha H128 activation transforms (ported from PR #694
+/// `kernels/src/escha_h128.hip`, verbatim): unnormalised 128-pt
+/// Walsh-Hadamard on both sides with RS=1/sqrt(128), f16-RNE staging.
+/// Single (`escha_h128_in`/`out`) + batched + swiglu forms.
+const ESCHA_H128_SRC_RAW: &str = include_str!("../../../kernels/src/escha_h128.hip");
 
 fn strip_esham_include(src: &str) -> String {
     src.replace("#include \"esham_device_utils.hip\"\n", "")
@@ -6573,6 +6578,11 @@ pub fn escham_moe_grouped_src() -> String {
 /// Escha code-quant dense decode module (self-contained).
 pub fn escha_dense_src() -> String {
     ESCHA_DENSE_SRC_RAW.to_string()
+}
+
+/// Escha H128 activation-transform module (self-contained).
+pub fn escha_h128_src() -> String {
+    ESCHA_H128_SRC_RAW.to_string()
 }
 
 /// Native gfx942 wave64 MFMA grouped-GEMM for DeepSeek4 MQ2-Lloyd prefill.

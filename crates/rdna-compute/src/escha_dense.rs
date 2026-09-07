@@ -684,3 +684,91 @@ mod tests {
         assert!(prefill_kernel_sym(2, 64).is_none());
     }
 }
+
+/// H128 input transform, single row: `out = f16round(H128(x . rin) * RS)`
+/// widened to f32 (matches the batched kernel's value set). `n` must be a
+/// multiple of 128. Ported entry `escha_h128_in` from PR #694
+/// `kernels/src/escha_h128.hip` (verbatim); the batched forms are open work.
+///
+/// NOTE: `out` is an F32 tensor holding widened f16 values — do NOT pass an
+/// F16 tensor here. The kernel writes `__half` (2 bytes/element); with an F16
+/// `out` the wrapper's `numel()`-based size check passes but the kernel
+/// writes half the bytes the caller expects. The batched kernel writes f32
+/// directly; this single form inherits the F16 staging from G3 parity.
+pub fn escha_h128_in(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    rin: &GpuTensor,
+    out: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    escha_h128_single(gpu, "escha_h128_in", x, rin, out, n)
+}
+
+/// H128 output transform, single row: `out = f16round(H128(mid) * RS . rout)`
+/// widened to f32. `rout` carries the per-channel prune mask (exact zeros stay
+/// exact zero — see the kernel comment). Same provenance as above.
+pub fn escha_h128_out(
+    gpu: &mut Gpu,
+    mid: &GpuTensor,
+    rout: &GpuTensor,
+    out: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    escha_h128_single(gpu, "escha_h128_out", mid, rout, out, n)
+}
+
+fn escha_h128_single(
+    gpu: &mut Gpu,
+    entry: &str,
+    a: &GpuTensor,
+    vec_in: &GpuTensor,
+    out: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    use std::ffi::c_void;
+    gpu.bind_thread()?;
+    if n % 128 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("escha_h128_single: n={n} is not a multiple of 128"),
+        ));
+    }
+    if a.numel() < n || vec_in.numel() < n || out.numel() < n {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "escha_h128_single: tensors too small (a={} vec={} out={} need {n})",
+                a.numel(),
+                vec_in.numel(),
+                out.numel(),
+            ),
+        ));
+    }
+    gpu.ensure_kernel("escha_h128", &kernels::escha_h128_src(), entry)?;
+    let mut a_ptr = a.buf.as_ptr();
+    let mut v_ptr = vec_in.buf.as_ptr();
+    let mut o_ptr = out.buf.as_ptr();
+    let mut n_val = n as i32;
+    let mut params: Vec<*mut c_void> = vec![
+        &mut a_ptr as *mut _ as *mut c_void,
+        &mut v_ptr as *mut _ as *mut c_void,
+        &mut o_ptr as *mut _ as *mut c_void,
+        &mut n_val as *mut _ as *mut c_void,
+    ];
+    gpu.launch_maybe_blob(
+        entry,
+        [(n / 128) as u32, 1, 1],
+        [128, 1, 1],
+        0,
+        &mut params,
+        || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(v_ptr);
+            b.push_ptr(o_ptr);
+            b.push_i32(n_val);
+            b
+        },
+    )
+}
