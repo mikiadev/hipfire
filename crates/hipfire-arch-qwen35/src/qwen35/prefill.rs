@@ -1951,16 +1951,19 @@ pub fn qwen35_layer_batch_admissible(
         // `WeightTensor` and no `gpu_dtype` to gate on — admit on shape.
         //
         // History: `70d860bb9` closed this gate to dodge a prefill attractor.
-        // The attractor's root cause — `escha_dense_matmul_prefill_kernel`
-        // staging `R * 16` floats into an `s_u` sized only for `tiles_max * 16`,
-        // which overflowed whenever the old `n_slices >= R` heuristic drove
-        // `tiles_max` below `R` — was fixed in `9daf925bf`, but the gate was
-        // never re-opened. Closed, `prefill_batch_pbs_eligible()` is false for
-        // the WHOLE model and prefill silently takes the per-token fallback
-        // ("byte-identical to decode"), which is why pp == tg on the 27B: 58
-        // tokens x 285 ms reproduced the measured 16.8 s TTFT to within 1.5%.
+        // One cause was root-caused in `9daf925bf` — `escha_dense_matmul_prefill
+        // _kernel` staging `R * 16` floats into an `s_u` sized only for
+        // `tiles_max * 16` — but the gate was never re-opened afterwards, so
+        // that fix was never exercised end-to-end. While it is shut,
+        // `prefill_batch_pbs_eligible()` is false for the WHOLE model and
+        // prefill silently takes the per-token fallback ("byte-identical to
+        // decode"), which is why pp == tg on the 27B: 58 tokens x 285 ms
+        // reproduced the measured 16.8 s TTFT to within 1.5%.
         //
-        // `HIPFIRE_ESCHA_DENSE_BATCHED=0` restores the per-token fallback.
+        // Re-opening it measures 3.5x on prefill but breaks greedy equivalence
+        // with the per-token path — see `escha_dense_batched_admit_enabled`,
+        // which is why this is shape-checked yet DEFAULT OFF. Opt in with
+        // `HIPFIRE_ESCHA_DENSE_BATCHED=1`.
         LayerWeights::DeltaNetEscha(l) => {
             if !escha_dense_batched_admit_enabled(
                 hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE_BATCHED")
@@ -2044,13 +2047,27 @@ pub fn qwen35_layer_batch_admissible(
     }
 }
 
-/// Kill-switch for admitting Escha code-quant DENSE layers to batched prefill.
-/// Default ON (the attractor that motivated the refusal was root-caused and
-/// fixed in `9daf925bf`).
+/// Admit Escha code-quant DENSE layers to batched prefill. DEFAULT OFF.
+///
+/// The batched body is a measured 3.5x on prefill (16.8 s -> 4.8 s TTFT on a
+/// 58-token prompt, gfx1151, Qwen3.8-27B-Escha-W2) and 10.8x on a long prompt,
+/// but it is NOT numerically equivalent to the per-token path. At `--temp 0`
+/// with byte-identical prompt bytes the two arms disagree from the FIRST
+/// generated token ("We need answer user:" vs "The user asks a simple
+/// question:"), and the greedy divergence reproduces on the ORIGINAL
+/// `matmul_prefill` kernel with the ORIGINAL slice heuristic — so it is not a
+/// regression introduced by the R/K specialization, it is latent in the batched
+/// path itself, unreachable since `70d860bb9` closed the eligibility gate.
+///
+/// That history matters: `9daf925bf`'s shared-memory fix landed while the gate
+/// was shut, so it was never exercised end-to-end, and the attractor it
+/// addressed is evidently not the only defect. Until the batched and per-token
+/// paths agree under a greedy A/B, opting in (`HIPFIRE_ESCHA_DENSE_BATCHED=1`)
+/// is an explicit trade of output correctness for TTFT.
 fn escha_dense_batched_admit_enabled(value: Option<&str>) -> bool {
     match value.map(str::trim) {
-        Some("0") | Some("off") | Some("false") => false,
-        _ => true,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => false,
     }
 }
 
