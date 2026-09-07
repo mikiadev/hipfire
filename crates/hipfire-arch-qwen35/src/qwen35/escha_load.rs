@@ -495,7 +495,14 @@ impl<'a> EschaSource<'a> {
         let out_scale_f32: Vec<f32> = rout.iter().zip(sout.iter()).map(|(&r, &s)| r * s).collect();
 
         // Code upload (bitwise F16 = i16 2-byte elements), typed F16 like the MoE path.
-        let code_elems = code_data.len() / 2;
+        // NOTE (2026-09-07): kt-major order preserved — an nt-major transpose
+        // (PR #694 `bb77ff87d`, +24% on their decode GEMV) was attempted and
+        // reverted: our decode kernels address tiles as ti*nct + tj, so a
+        // transposed grid without a matching tj*nit + ti kernel index decodes
+        // wrong tiles (oracle FAIL rel ~15 on gate_proj, then a fault on
+        // down_proj from the shape-tag/probe mismatch). The transpose + index
+        // change must land atomically; until then the checkpoint order is the
+        // only correct order.
         let buf = gpu.hip.malloc(code_data.len())?;
         gpu.hip.memcpy_htod(&buf, code_data)?;
         let code = GpuTensor {
