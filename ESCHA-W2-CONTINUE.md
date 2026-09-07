@@ -1,15 +1,19 @@
 # Escha-W2 — continue here (fresh-context handoff)
 
-Branch: **`feat/escha-w2`** in `/home/mika/git/hipfire` (66+ commits vs upstream
-master 8cd15a62). Working tree clean; last **code** change is `82637504f`
-(decode gemv `LDS.64`), after which only docs moved. Verify with
+Branch: **`feat/escha-w2`** in `/home/mika/git/hipfire` (73 commits vs upstream
+master 8cd15a62). Working tree clean except untracked `./escha-runtime-qwen3dense/`
+(left untracked on purpose); last commit is `22aa0f820`
+(nt-major tile grid, atomic landing). Verify with
 `git log --oneline -8` — and note `cargo check` does not build binaries, so
 rebuild `target/release` before measuring anything.
 
 This is the one-file entry point for a fresh session. Read **this file first**,
 then `ESCHA-W2-PERF-PLAN.md` (repo root) for the ranked perf work with measured
-evidence and the withdrawn-estimate post-mortems. The full investigation trail
-lives in `escha-port-status.md` (repo root, committed); perf evidence in
+evidence and the withdrawn-estimate post-mortems, then
+`ESCHA-W2-THROUGHPUT-PLAN.md` (repo root) for the PR-#694 comparison, the
+locally-measured quality table (Arms A/B/C/D), and the beat conditions.
+The full investigation trail lives in `escha-port-status.md` (repo root,
+committed); perf evidence in
 `docs/perf-checkpoints/2026-09-04-escha-w2-moe-qwen36-35b-a3b-gfx1151.md` and
 `docs/perf-checkpoints/2026-09-04-escha-w2-dense-qwen38-27b-gfx1151.md`.
 
@@ -39,7 +43,7 @@ host/EschaLabs (rel ≤ 6e-4).
 
 | | 2026-09-05 | now |
 |---|---|---|
-| decode (tg) | 1.9 → 3.4 tok/s | **5.0 tok/s** |
+| decode (tg) | 1.9 → 3.4 tok/s | **4.6–4.7 tok/s** (was 5.0 pre-nt-major; transpose landed, oracles green, NO gain — see § nt-major) |
 | prefill (pp) | 3.4 tok/s ≡ decode (16.8 s TTFT) | **~29 tok/s, ~0.61 s TTFT** (27×; 4.8× GDN batch + 1.75× FA batch) |
 
 Prefill finally separated from decode this session. Output coherent, verified
@@ -168,7 +172,10 @@ another scalar micro-optimisation.
    is a *format* gap, not a dispatch bug. Work is: write an HF-safetensors-MTP →
    HFQM converter (or teach the loader to read the directory). Worth it — it's
    the only tg lever that doesn't require beating the gemv, and the reference
-   runtime reports 1.77–1.92×.
+   runtime reports 1.77–1.92×. (Update: PR #694's in-trunk `mtp.*` resolver
+   `e1d2d55` measures accept 0.568 / 2.685 tok-per-window on THEIR 27B build —
+   see THROUGHPUT-PLAN §7. Our branch's gap is unchanged: their resolver reads
+   converted `.hfq` trunks, our loader reads the safetensors dir.)
 3. **WMMA/MFMA coded prefill GEMM** (plan item 9) — the real ceiling-raiser for
    pp, and probably for decode too. gemv is at 157 G weights/s vs ~515 G implied
    by measured bandwidth. The reference's `escham_code_gemm` reaches 146 TFLOPS
@@ -177,6 +184,26 @@ another scalar micro-optimisation.
    is now small against gemv time. Prereq (scratch hoisting) is already done.
 5. MoE throughput: beyond 10.6 tok/s requires the fp16/int8 dense attention path
    (dense attention is int8→f32 at load, ~4.5 GB/token f32 traffic on the MoE).
+6. **NEW — non-uniform recipe + IU4-hardware-aware quant (outside-the-box
+   thread, 2026-09-08).** The GSQ-RCO IQ3_S result (task-lossless at 3.5 bpw,
+   KRW table in survey § above) shows the losslessness comes substantially from
+   per-tensor RCO allocation, not the grid alone. Two work items, ordered:
+   (a) **I-quant loader support**: extend `GgmlType`/`tensor_to_f32` past
+   Q1_0/Q2_0 with IQ3_S (and IQ2_S/IQ1_S as needed) ported from
+   `llama.cpp-escha/ggml/src/ggml-cpu/quants.c` + `ggml-common.h` grid tables,
+   following the Ternary/Binary precedent — unblocks dequant-then-MQ4V2/MQ6
+   evaluation of ANY I-quant file with zero kernel work, and is prerequisite
+   to everything below. (b) **Astrea hardware-aware policy**: RCO's search
+   optimizes size-only; our probes (`decode_stage_probe`, `mem_bw`) supply the
+   missing per-tensor bandwidth axis — implement `policy --objective`
+   extended with measured tok/s-per-byte so allocation optimizes tok/s under
+   a KLD budget, not bytes under a size budget. (c) **IU4 research arm** only
+   after (a–b) show a recipe worth accelerating: IU4-uniform recipe + W4A4
+   gate + kernels + `has_wmma_iu4` predicate + Dual-View-style router. NOT
+   started; explicitly behind MTP + WMMA-decode in priority until a recipe
+   exists that needs it. Requires BF16 base (not on disk) for any GSQ/RCO run
+   — until then, work with released I-quant files or imatrix-guided promotion
+   of existing formats.
 
 ---
 
@@ -458,7 +485,138 @@ portable codebook spelling is exact under HIP. Packaged reference with kernels:
 
 ---
 
-*Last updated 2026-09-07 (FA layers batched: pp ~29 tok/s, ~0.61 s TTFT;
-batched prefill on: 4.8× pp; decode gemv modulo + LDS.64: 3.4 → 5.0 tok/s;
-oracles added incl. check_escha_fa_batched; two plan premises refuted by
-measurement; KV-index fault root-caused to kv_layer_idx vs layer_idx).*
+*Last updated 2026-09-08 (decode now 4.6–4.7 post-nt-major: transpose landed,
+oracles green, NO gain — +24% closed as not-applicable; KLD table + bias-dropout
+probe committed in THROUGHPUT-PLAN §7; H128 kernels/wrappers/parity landed
+`38a6013d6`; native-GEMV v1/v2 reverted with rotation-convention notes).*
+
+---
+
+## nt-major post-mortem (2026-09-07, commit `22aa0f820`) — read before retrying
+
+The transpose LANDED atomically and correctly — and measured **no gain**.
+`decode_stage_probe` gate_proj: 0.587 vs 0.561 ms (ns=7), 3-kernel total
+0.634 vs 0.575 ms, end-to-end decode 4.6–4.7 vs 5.0 tok/s (within noise,
+slightly negative). WHY: their kernel reduces layout to two loop-invariant
+strides (`strip`/`colstride`) where nt-major shrinks a 139 KB stride to one
+tile; OUR scalar kernel indexes `ti*nct + tj` per tile, so the transpose only
+changes WHICH address each `ti` resolves to, not the walk's locality class.
+The landing is KEPT (revert re-breaks oracles for zero benefit). Do NOT
+re-attempt the transpose alone — the only version that could pay is one paired
+with a kernel rewrite that strides `kt` the way theirs does.
+
+Prior attempt history (same section, condensed): transpose-without-index was
+tried first and reverted (oracle FAIL rel ~15 on gate_proj, then a fault on
+down_proj from the shape-tag/probe mismatch: `upload_raw` is bytes +
+`DType::Raw`, so a transposed buffer under a kt-major shape tag silently
+mis-describes the grid AND the unit test's smem math reads the wrong order).
+The atomic commit fixes all of these together: load transpose + `[out/16,
+in/16]` shape tag + `tj*nit + ti` in both kernels + swapped IC/OC shape reads
++ audit un-transpose + all three oracles loader-identical.
+
+---
+
+## Outside-the-box quant survey (2026-09-08) — IU4 / GSQ / RCO / IQ3_S
+
+Owner asked whether the Kairic IU4 lane, GSQ, RCO, or the "practically
+lossless" IQ3_S could speed up hipfire inference generally (not just Escha).
+Surveyed with primary sources; full notes in this section, decision in Next
+steps item 6.
+
+### IU4 (`V_WMMA_I32_16X16X16_IU4`, Kairic `.pfs` sidecars)
+
+- The lane is REAL and proven: Kairic Edge routes packed u4-activations × i4
+  weights through RDNA 3.5's native instruction (104.66 TOPS harness, 1.94×
+  FP16; FFN operator 2.52–3.48×; details in `/data/rocmfpx/Qwen38-27b/README.md`).
+  Sidecars are on local disk (`/data/rocmfpx/Qwen38-27b/`, `PFSIU4{F,G,O}`
+  magic, Dual View: GGUF authoritative + `.pfs` accelerator copies).
+- **Cannot serve Escha codes** (mathematical, not engineering): integer MMA
+  computes Σqᵢ·xᵢ over the codes — only uniform-affine decomposes. Escha's
+  65,536-value hash codebook is not linear in q (own survey
+  `docs/investigations/2026-08-16-rocm-unexploited-capability-survey.md:43-54`
+  says the same for GL/Lloyd: fp8 matrix path only). Rotated-domain weights
+  are a second mismatch. Would need a repack that destroys exactly the quality
+  being preserved.
+- General use needs THREE things hipfire lacks: (a) IU4-uniform weight recipe
+  (nothing in tree produces one), (b) W4A4 activation quantization + quality
+  gate (unproven anywhere in tree), (c) kernels + router (zero IU4 usage in
+  tree; iu8 WMMA in 16 files is the template; no `has_wmma_iu4` predicate in
+  `arch_caps.rs`). AND it only accelerates prefill/verify — Kairic's own scope
+  statement excludes M1 decode (`README.md:322-325`), which is our 5 tok/s
+  problem. Verdict: research arm (Arm E), not the decode-beating lever.
+- Note: the survey's Tier-1 `iu4`/`swmmac` entries say "verified available on
+  **gfx1201**" — the builtins exist in THIS toolchain too
+  (`BuiltinsAMDGPU.inc:797-806`), but availability ≠ measured win, and on
+  gfx1151 the plain (non-`gfx12`) `16x16x16_iu4_w32` form is what would need
+  a compile probe before any claim.
+
+### GSQ (`~/git/GSQ`, Apache-2.0) / RCO (`~/git/RCO`, Apache-2.0)
+
+- **GSQ output is NOT GGUF.** Grids are symmetric uniform int (1/2/3/4/ternary
+  only, `src/trainer.py:46-58`); output is compressed-tensors `pack-quantized`
+  (`src/models/base.py:72-102`, `.weight_packed/.weight_scale/.weight_shape`
+  via `PackedQuantizationCompressor`, `save_model.py:183-202`). "Refine GGUF
+  in-format" is README prose only (`README.md:14,30-32`) — zero GGUF code in
+  `src/` (only a transitive `uv.lock` pin). No qwen3.8 configs anywhere;
+  Hopper/H200-only serving (vLLM+Marlin; Triton fallback crashes). Grid is
+  locked — a 3-bit uniform non-GGUF target is NOT addressable as-is.
+- **RCO cost model is size-only, zero hardware awareness.** Allocation file is
+  `#`-comment header + `name: bits` rows (`rco_search_quant.py:342-365`); budget
+  B = param-weighted average bits (`src/manifold.py`, `src/search/quant.py`);
+  candidates default 2–8. No per-tensor bandwidth/compute cost, no AMD/ROCm/HIP/
+  WMMA. "In-format GGUF refine" likewise absent. No example allocation file
+  ships in-repo (the `tensor-allocation/*.rco-allocation.txt` naming is
+  downstream HF packaging).
+- **Neither repo contains any GPU-kernel or AMD content**: no iu4/wmma/rocm/hip/
+  gfx/triton/gemm-kernel sources; CUDA/Marlin/Humming only. Both are CPU-side
+  recipe code (GPTQ db + manifold search + checkpoint assembly).
+- Calibration reality: GSQ 4096×4096 + GPTQ-512 (open_thoughts/fineweb_edu),
+  RCO 256×2048; NO imatrix in either repo (raw calibration + KL/CE vs teacher
+  / layer-MSE). No BF16 Qwen3.8-27B base on local disk (largest candidates are
+  LagunaS21 219G / Qwen3.8-Flash 92G dirs — unverified contents), so neither
+  pipeline can run here today regardless.
+
+### IQ3_S ("practically loss-less" at 3.5 bpw) — the actually-actionable one
+
+- The claim is REAL and load-bearing: IQ3_S reproduces BF16 exactly on AIME25
+  (100.00) and LiveCodeBench v6 (85.71), −0.51 on GPQA-D, at 11.8 GB
+  (release card `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF`, fetched 2026-09-08).
+  No IQ3_S file is on local disk (only Laguna FP4 + Ornith FPX7 GGUFs found);
+  slow link means NO downloads — evaluation must come from files we can make.
+- **Why it matters for hipfire/AMD specifically** (three independent reasons):
+  1. **Grid shape**: IQ3_S is a uniform-affine codebook (not Lloyd — values
+     `01/03/05/...` in `iq3s_grid[512]`, `ggml-common.h:1052`), hence
+     integer-MMA-compatible per the survey's own linearity rule — the exact
+     property Escha lacks. This is what "would make sense to use for this
+     hardware during quanting" means concretely.
+  2. **Non-uniform (RCO) allocation**: the losslessness comes substantially
+     from per-tensor type assignment under a size budget, NOT from IQ3_S alone
+     (UD-IQ3_S trails by 3.33 AIME25 / 1.71 LCB at same size). hipfire's
+     Astrea `policy`/`promote` verbs are the in-tree analogue of RCO's search
+     (both size-budgeted selectors); RCO's size-only cost model ports directly,
+     EXTENDED with per-tensor bandwidth cost from our own probes — the
+     hardware-awareness RCO lacks, we can supply.
+  3. **No custom kernel needed on day one**: IQ3_S dequants to f32 on CPU
+     (`ggml/src/ggml-cpu/quants.c:1120`); hipfire's GGUF pipeline already
+     ingests dequanted f32 (`pipeline_gguf.rs:420,428,439`) — an IQ3_S GGUF is
+     consumable TODAY via dequant-then-MQ4V2/MQ6, isolating the *recipe*
+     question (which tensors at which types) from the *kernel* question.
+- **What is NOT shown**: no decode-speed claim exists for IQ3_S (it's a quality
+  result; tok/s comes from the kernel that serves it). The 4.6× size cut
+  (53.8→11.8 GB) buys VRAM/context, not speed, until a kernel serves the
+  format or it is transcoded into one hipfire serves fast.
+- Loader gap (concrete): hipfire's `GgmlType` (`gguf_input.rs:21-39`) stops at
+  Q1_0/Q2_0 (41/42) — NO I-quant types (`tensor_to_f32` covers only
+  F32/F16/BF16/Q4_0/Q8_0/Q2_0/Q1_0/Q4K/Q5K/Q6K). `GgufFormat` has
+  Ternary/Binary (TQ2/BQ1) but no IQ variants. So even dequant-then-requant
+  needs a `gguf_input` extension first. Ternary/Binary precedent
+  (`pipeline_gguf.rs:496,523`) shows the shape of that work.
+- Licenses are clean (both Apache-2.0).
+
+### Decision (owner question 4, decided)
+
+The `FOLD=f16` attribution build (~50 GB, doesn't fit disk) is SKIPPED: it
+would split "codec vs re-quantisation" inside the ALREADY-REJECTED fold arm
+(0.117 of 0.148 is fold+M6 proper per the bias-dropout probe). Answering the
+wrong question at unaffordable disk cost is declined; the bias isolation
+(zero-cost, exact for the bias component) already settled what mattered.
