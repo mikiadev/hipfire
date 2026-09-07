@@ -464,12 +464,41 @@ pub fn escha_dense_n_slices_prefill(nit: usize, oc: usize, n_rows: usize, r: i32
     // Target total blocks ≈ 512-1024 for the whole grid.
     let target_blocks = if n_rows <= 4 { 1024 } else { 512 };
     let mut n_slices = target_blocks / n_rb.max(1) as usize / n_ocb.max(1);
+
+    // Shared-memory bound, replacing what the deleted `>= R` floor was
+    // accidentally providing. Computed against the widest payload (K=3) so it
+    // holds for every projection, not just the one being sliced.
+    let payload_bytes = 8 * (8 * 3) * 4;
+    let max_tiles = ((ESCHA_DENSE_SMEM_BUDGET - payload_bytes) / (16 * 4)).max(1);
+    n_slices = n_slices.max(nit.div_ceil(max_tiles));
+
     n_slices = n_slices.max(1).min(nit);
     // Ensure nit is divisible by n_slices
     while n_slices < nit && nit % n_slices != 0 {
         n_slices += 1;
     }
     n_slices
+}
+
+/// Per-block dynamic shared-memory ceiling we refuse to cross.
+///
+/// The prefill matmul sizes its dynamic smem as `payload + tiles_per_slice * 16
+/// * 4`, because the R==1/gen path stages `u` for the WHOLE slice at once. A
+/// slice that is too wide therefore asks for more shared memory than the device
+/// allows and `hipModuleLaunchKernel` fails with `invalid argument` — a hard
+/// crash, not a wrong answer. 64 KB is gfx1151's per-block limit. Held
+/// statically rather than queried, and enforced in the *heuristic* so the two
+/// cannot drift apart.
+const ESCHA_DENSE_SMEM_BUDGET: usize = 64 * 1024;
+
+/// Dynamic smem a prefill launch requests, mirroring the kernel layout so the
+/// bound above can be asserted rather than assumed. Keep in sync with
+/// `escha_dense_matmul_prefill`.
+pub fn escha_dense_prefill_smem(nit: usize, n_slices: usize, k: i32, r: i32) -> usize {
+    let nw = 8 * k as usize;
+    let tiles_max = nit.div_ceil(n_slices);
+    let s_u_floats = tiles_max.max(r as usize) * 16;
+    8 * nw * 4 + s_u_floats * 4
 }
 
 /// Diagnostic stage launch: decode-gemm only (rotate + partial). Exposed for
@@ -535,6 +564,41 @@ pub fn escha_dense_decode_gemv_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Removing the `>= R` floor must not remove the shared-memory bound it
+    /// was accidentally providing: an unbounded `n_slices` collapses to 1 on
+    /// wide chunks and the launch asks for more dynamic smem than the device
+    /// has (`hipModuleLaunchKernel: invalid argument`, reproduced on gfx1151
+    /// with `down_proj` at n_rows=600).
+    #[test]
+    fn prefill_smem_stays_under_the_device_limit() {
+        // Every projection shape in Qwen3.8-27B-Escha-W2, at every chunk size
+        // the prefill driver can produce.
+        let shapes: [(usize, usize); 8] = [
+            (320, 10_240), // in_proj_qkv
+            (320, 6_144),  // in_proj_z
+            (384, 5_120),  // out_proj / o_proj
+            (1088, 5_120), // down_proj  (nit is widest here)
+            (320, 17_408), // gate_proj / up_proj
+            (320, 12_288), // q_proj
+            (320, 1_024),  // k_proj / v_proj
+            (320, 5_120),
+        ];
+        for n_rows in [2usize, 4, 8, 17, 58, 128, 256, 600, 1024, 2048] {
+            let r = escha_dense_prefill_r(n_rows);
+            for (nit, oc) in shapes {
+                let ns = escha_dense_n_slices_prefill(nit, oc, n_rows, r);
+                for k in [2i32, 3] {
+                    let smem = escha_dense_prefill_smem(nit, ns, k, r);
+                    assert!(
+                        smem <= ESCHA_DENSE_SMEM_BUDGET,
+                        "nit={nit} oc={oc} n_rows={n_rows} R={r} K={k} n_slices={ns} \
+                         asks for {smem} B of dynamic smem (limit {ESCHA_DENSE_SMEM_BUDGET})"
+                    );
+                }
+            }
+        }
+    }
 
     /// The prefill slice heuristic must NOT floor `n_slices` at `R`.
     ///
