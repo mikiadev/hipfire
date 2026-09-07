@@ -101,6 +101,10 @@ performance.
 
 ## Part B — Prefill: root cause found
 
+> **Status as of 2026-09-07:** B1 was confirmed and fixed (batched prefill is now
+> ON and measures 4.8×), B2 and B3 are done, **B4 is the remaining prefill work**
+> and B6 is the ceiling-raiser. See "Suggested execution order" for current numbers.
+
 ### B1. **Batched prefill is switched off for this model.** ← this is the whole story
 
 `qwen35_layer_batch_admissible()` (`prefill.rs:1946-1951`) returns
@@ -205,6 +209,13 @@ same treatment. This is the ceiling-raiser for pp (hipfire's WMMA quants reach
 
 ## Part C — Decode
 
+> **Status as of 2026-09-07:** C1 and C2 are **refuted as tg levers** by
+> measurement — decode is not DRAM-bound (39 GB/s used of ~104 GB/s sustained)
+> and the two extra launches are 2% of a projection. C3 is partially done (the
+> `% NW` division and the double LDS are gone: tg 3.4 → 5.0). C4 is demoted.
+> C5 (MTP) is now the top decode item, and blocked on a container-format gap.
+> See the retraction section below for the numbers.
+
 Traffic model per token (verified against the header):
 
 | bytes | source |
@@ -271,6 +282,9 @@ decisive once C2/C3 cut the kernels to a few ms each. Sequence it **after** C2.
 Per `CLAUDE.md`, anything touching graphs owes `scripts/redline_daemon_harness.py`.
 
 ### C5. MTP draft is already on disk — ~1.8× multiplier
+> **Update:** the draft is a safetensors *directory*; the loader wants a
+> `<trunk>.mtp` HFQM file or a bundled trailer, so `--spec mtp` silently runs AR
+> (measured 5.0 tok/s, same as `off`). Needs an HF-safetensors → HFQM converter.
 
 `/data/rocmfpx/Qwen3.8-27B-Escha-W2/mtp/model.safetensors` (849 MB) + `mtp/config.json`.
 The reference's `serve.sh` gets **1.77–1.92× decode** from it. hipfire has `--spec mtp`
@@ -285,12 +299,12 @@ plumbing; the open question is whether the MTP layer's projections can be loaded
 
 | # | change | risk | expected | status |
 |---|---|---|---|---|
-| 0 | **Batched-vs-decode projection oracle at real activations** | low | prerequisite for 1/5/9 | ❌ **missing — do this first** |
-| 1 | Re-open `qwen35_layer_batch_admissible` for `DeltaNetEscha`/`FullAttnEscha` | low | pp ≥ 2.7× | ⚠️ code landed, **default OFF** — measured 3.5× but path is not equivalent (see below) |
-| 1b | FA-escha fallback inside the batched chunk replayed the **whole model** per token | — | prerequisite for 1 | ✅ fixed (was latent; unreachable only because the gate was shut) |
-| 2 | `lm_head` as int8 + W8A16 GEMV | low–med | tg +35–40% | todo — **now the top item**, decode is untouched at 3.4 tok/s |
-| 3 | Compile-time `R` (+ `K`) in `matmul_prefill` | med | pp +2–4× on top of 1 | ✅ done and verified on GPU — `private_segment_fixed_size` **272 → 0** |
-| 4 | Drop `n_slices ≥ R`; partial scratch bound | low | pp +10–20%, −GB VRAM | ✅ done, but the floor was load-bearing → replaced by an explicit smem bound (`b8dcefcb9`) |
+| 0 | Batched-path oracles at real activations | low | prerequisite for 1/5/9 | ✅ `check_escha_dense_batched` + `check_gdn_batched`. They refuted my own "batched is broken" claim — see the retraction below. |
+| 1 | Re-open `qwen35_layer_batch_admissible` for `DeltaNetEscha`/`FullAttnEscha` | low | pp ≥ 2.7× | ✅ **DEFAULT ON**. Measured **4.8×** (16.8 s → 3.47 s TTFT). `HIPFIRE_ESCHA_DENSE_BATCHED=0` reverts. |
+| 1b | FA-escha fallback inside the batched chunk replayed the **whole model** per token | — | prerequisite for 1 | ✅ fixed — was latent, unreachable only because the gate was shut. |
+| 2 | ~~`lm_head` as int8 + W8A16 GEMV~~ | tg +35–40% | ❌ **PREMISE WRONG.** Decode is not DRAM-bound (39 GB/s used vs ~104 GB/s sustained), so fewer bytes cannot buy tg. Still ~3.8 GB of VRAM for context length. |
+| 3 | Compile-time `R` (+ `K`) in `matmul_prefill` | pp +2–4× on top of 1 | ✅ `private_segment_fixed_size` **272 → 0**, VGPR 19 → 48 @ R=16. But K compile-time did **not** fold the modulo (see 7b) — the range proof was the blocker, not the constant. |
+| 4 | Drop `n_slices ≥ R`; partial scratch bound | pp +10–20%, −GB VRAM | ✅ done; the floor was accidentally capping smem → crash at 600 rows, replaced by an explicit bound (`b8dcefcb9`), test shown non-vacuous (8 violating shapes → 0). **Prefill scratch is still alloc'd per projection per chunk** — hoisting into `PrefillBatchScratch` is open. |
 | 5 | Batch the 16 `FullAttnEscha` layers inside the chunk loop | med | pp ~2× on top | **NOW THE TOP PREFILL ITEM** — FA is still per-token inside the batched chunk, and the chunk's GDN half is already batched, so FA ≈ 16/64 × 58 tokens of full-speed decode is the bulk of the remaining 3.47 s |
 | 6 | ~~Fuse `rotate_in`+GEMV+`finalize`~~ | tg +50–100% | ❌ **PREMISE WRONG (measured).** rotate = 9.4 µs, finalize = 3.8 µs: **13 µs of a 570 µs projection (2%)**. Fusing them cannot matter. Launch count still matters via hipGraph (8), not here. |
 | 7 | `LDS.64` overlapping-pair payload | tg +20–40% | ✅ 0.63 → 0.57 ms; **tg 4.6 → 5.0**, bit-identical vs the host reference. Overlapping `uint2` pairs staged once per tile. |
@@ -310,42 +324,49 @@ plumbing; the open question is whether the MTP layer's projections can be loaded
 **Revised order:** 5 → 10 → 9 → 8. Items 2 and 6 are dropped for the reasons
 above; item 2 (`lm_head` int8) still buys ~3.8 GB of VRAM, just not speed.
 
-### GPU validation (done on the cloud box, gfx1151, same hardware)
+### GPU validation (gfx1151, measured — including a retraction of my own conclusion)
 
-Everything below is measured, not inferred. `--temp 0` greedy A/B with
-byte-identical prompt bytes is the oracle: batched and per-token prefill **must**
-produce identical tokens, and they do not.
+Everything here is measured, not inferred. Two earlier drafts of this section
+were wrong and are corrected below; the corrections matter more than the
+numbers.
 
-| change | verdict |
-|---|---|
-| R/K compile-time specialization | **Works as designed.** `priv 272 → 0`, prefill 3.5×, no functional change. |
-| `n_slices` floor removal | **Introduced a crash.** Floor was accidentally capping dynamic smem. Replaced by an explicit bound (`b8dcefcb9`). |
-| Re-open batched prefill | **Path is not equivalent → default OFF** (`f37f5264b`). |
+Final numbers, warm, 3-run, 58-token prompt:
 
-Measured, warm, 3-run medians, 58-token prompt:
-
-| | prefill | ttft | decode |
+| | per-token | batched prefill | after both decode fixes |
 |---|---|---|---|
-| per-token (default) | 17 080–17 537 ms | 17.5 s | 3.3–3.4 tok/s |
-| batched (`=1`) | 4 767–4 821 ms | 4.8 s | 3.3–3.4 tok/s |
+| prefill | 17 080–17 537 ms | 4 767–4 821 ms | **3 465–3 536 ms** (4.8×) |
+| decode | 3.3–3.4 tok/s | 3.3–3.4 tok/s | **5.0 tok/s** |
+| pp vs tg | identical | separated | separated |
 
-**3.5× on prefill**, and pp finally separates from tg (12.1 vs 3.4 tok/s). On a
-600-token prompt the batched path measures **10.8×**. Those numbers are real —
-they are just bought with wrong output.
+#### Retraction: "the batched path is wrong" was a bad inference
 
-Facts established about the divergence, so the next pass does not redo them:
+I first concluded batched prefill was numerically broken because at `--temp 0`
+it diverges from per-token on the **first generated token**, and I flipped the
+eligibility gate back off on that basis. The oracles say that reasoning was
+backwards — per-token is not ground truth, it is just a different summation
+order:
 
+| probe | result |
+|---|---|
+| `check_escha_dense_batched` (batched projection vs **host** reference) | ≤ 4.07e-4 rel, **identical at every R 1→32** |
+| `check_gdn_batched` (batched conv carry vs N per-token calls) | **bit-exact (0.0)** |
+| `check_gdn_batched` (batched GDN S-matrix carry) | 1–2e-7 |
+| **control** — two *batched* runs differing only in chunk size (R=64 vs R=2) | disagree with each other as much as either disagrees with per-token (L0 5.5e-3 vs 9.8e-3; L63 2.1e-1 vs 2.5e-1) |
+
+The control row is decisive: a difference that appears between two batched runs
+of identical kernels is reshuffling, not error. At 2e-3 per layer through 64
+residual layers, 2e-3 at layer output is exactly the expected size. This repo
+documents elsewhere that ~1 ULP flips an argmax over 2k greedy tokens, so greedy
+divergence is the most sensitive metric available for the least information.
+Gate is **DEFAULT ON**; `HIPFIRE_ESCHA_DENSE_BATCHED=0` reverts in one env var.
+
+Still worth knowing, from the same investigation (all still true):
 * **Not the R/K specialization.** A control build reverting to the *original*
-  `matmul_prefill` kernel **and** the original slice heuristic diverges
-  identically. The defect is latent in the batched body and has been unreachable
-  since `70d860bb9` shut the gate.
+  `matmul_prefill` kernel and the original slice heuristic behaves identically.
 * **Not a chunk-carry bug.** `HIPFIRE_PREFILL_MAX_BATCH` ∈ {2,4,8,16,32,default}
-  all diverge at layer 0 by 2e-3…6e-2 relative. Two-row chunks are as wrong as
-  58-row chunks.
-* **Layer 0 diverges on its own** — so it is inside a batched projection or the
-  batched GDN arm, not error compounded from upstream layers.
+  all show the same magnitude of difference.
 * `9daf925bf`'s shared-memory fix landed while the gate was shut, so it was
-  never exercised end-to-end. The attractor it removed was not the only defect.
+  never exercised end-to-end — which is why nobody knew the path's status.
 
 **Measurement trap, learned the hard way:** the per-token `dump_hidden_localize`
 call site records `s.x` under `layer_idx - 1`, the batched site under
@@ -355,28 +376,75 @@ embedding-vs-embedding and looks *identical*. That produced a confidently wrong
 "exact at row 0, ramps with position" conclusion; only prompt-internal rows give
 an aligned comparison.
 
-**The real gap is the missing oracle.** `check_escha_dense` validates the decode
-gemv against the host reference and has no batched-path coverage at all, which is
-why a wrong batched body survived both its authoring and its "fix". Step 0 of any
-retry is a batched-vs-decode projection comparison at real activations; bisection
-inside `deltanet_escha_layer_prefill` is step 1. That oracle is also a
-prerequisite for step 9 (WMMA coded prefill) — without it there is no way to tell
-a correct batched GEMM from an incorrect one.
+**The missing oracle was the real gap.** `check_escha_dense` validated the decode
+gemv only; the batched path had zero coverage, which is how it could be assumed
+broken for a day. Both new examples exit nonzero on FAIL and should be wired into
+a gate — they are also the prerequisite for verifying any WMMA prefill GEMM
+(item 9), where the same silent-corruption class is on tap.
 
-Sweep `R ∈ {8,16,32}` on the next attempt: register cost of the new
-instantiations is R=8 → 40 VGPR, R=16 → 48, R=32 → 82, all at
-`private_segment_fixed_size = 0`. R=16 is the likely sweet spot.
+#### Two premises I wrote into this plan and then measured against
 
-Note on the earlier `open think span at end of generation` validation errors:
-this model always reasons, and `reasoning.mode off` only zeroes the budget and
-hides the trace, so truncating a run mid-`think` is a config artifact, not
-evidence about output quality.
+* ~~"`lm_head` int8 → **+35–40% tg**"~~ — assumed decode is DRAM-bound. It is
+  not: the gemv reads 22.3 MB in 0.566 ms = **39 GB/s** against **~104 GB/s**
+  measured sustained (`rdna-compute/examples/mem_bw.rs`: 208 GB/s D2D at 2 GiB
+  = 81% of theoretical; 718 GB/s at 8 MiB is L2, so the 2 GiB figure is real
+  DRAM). Fewer bytes cannot buy tg here. Still saves ~3.8 GB of VRAM.
+* ~~"fuse `rotate_in`+gemv+`finalize` → **+50–100% tg**"~~ — per-stage
+  measurement: rotate **9.4 µs**, finalize **3.8 µs**, gemv **566 µs**. Those two
+  launches are **2%** of a projection.
+* **Tested and reverted:** splitting the accumulator 4 ways to shorten the FFMA
+  dependency chain made the kernel **30% slower** (0.63 → 0.83 ms). And the
+  `n_slices` sweep is **flat from 952 to 43 520 blocks** (0.63–0.70 ms), ruling
+  out occupancy. So the remaining ~3× gap to bandwidth-limited is neither chain
+  latency nor block parallelism, and **I do not know what it is** — which is
+  exactly why item 9 (WMMA) is next rather than another scalar tweak.
 
+What *did* work was found by reading the disassembly instead of reasoning: the
+`% NW` in the per-weight loop emitted a full integer division (36
+`s_mul_hi_u32` + 39 `s_addc_u32`) because the compiler cannot prove `w0 < NW`;
+one select took the gemv 1.10 → 0.63 ms (tg 3.4 → 4.6), and a single `LDS.64` per
+weight (overlapping `uint2` pairs, as this file's kernel header always described
+but never used) took it to 0.566 ms (tg 5.0). Both bit-identical vs the host
+reference.
 
+#### Caveats to carry forward
 
-Targets on this hardware: **tg 3.5 → 10–15 tok/s** (roofline ~29),
-**pp 3.5 → 100+ tok/s** (hipfire's WMMA quants already prefill 27B at ~10³ tok/s on
-this card class, so the ceiling is engine-internal, not hardware).
+* Under greedy at 1500 tokens **both** arms degenerate (per-token 6-gram repeat
+  count 33, batched 213). Greedy cannot adjudicate quality either way — but note
+  batched is not obviously *better*. Ship acceptance is the owner's 10+ prompt
+  battery at serving temperature on both arms, not my three prompts.
+* `open think span at end of generation`: this model always reasons and
+  `reasoning.mode off` only zeroes the budget and hides the trace, so a run
+  truncated mid-`think` is a config artifact. `-n ≥ 400` with reasoning on, or
+  set `off`. Several of my early "failures" were this.
+* A whole round was spent on unchanged numbers because `cargo check` does not
+  build binaries — `target/release` predated the commits. Rebuild before
+  measuring, and run inside `nix develop .#therock` so the JIT recompile of a
+  changed `.hip` has a working hipcc.
 
-Housekeeping: correct the `escha_config` "6 floats near 1.0" comment (A3) and record
-the bias decision (A1) so neither gets re-litigated.
+R sweep for the next attempt: register cost of the new instantiations is R=8 →
+40 VGPR, R=16 → 48, R=32 → 82, all at `private_segment_fixed_size = 0`. R=16 is
+the likely sweet spot.
+
+---
+
+## Updated targets for this hardware
+
+Decode is **not** DRAM-bound (39 GB/s used vs ~104 GB/s sustained), so the tg
+ceiling is per-kernel efficiency, not bytes:
+
+* **tg 5.0 → 8–12 tok/s** by getting the gemv from 157 G weights/s toward the
+  ~515 G/s that measured bandwidth implies (WMMA/MMA decode, as the reference's
+  `escham_decode_gemv` does — it decodes straight into MMA B-fragments).
+* **MTP on top of that**, ~1.77–1.92× per the reference, once the draft is
+  convertible (see handoff Next steps 2). It multiplies tg without requiring any
+  kernel to get faster, so it is the highest-leverage remaining tg item.
+* **pp 16.7 → 60+ tok/s** by batching the 16 FA layers (now the dominant term),
+  then a WMMA coded prefill GEMM for the ceiling. hipfire's WMMA quants already
+  prefill 27B near 10^3 tok/s on this card class, so pp is engine-limited, not
+  hardware-limited.
+
+Housekeeping from the parity round is **done**: the `escha_config` field layout and
+the dead-`.bias` decision are recorded in `ESCHA-W2-CONTINUE.md` § "Corrected field
+notes", and the dense loader's own comment (`escha_load.rs:378,423`) already had
+`escha_config` right.
