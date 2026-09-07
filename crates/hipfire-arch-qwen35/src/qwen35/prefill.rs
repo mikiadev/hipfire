@@ -2047,27 +2047,38 @@ pub fn qwen35_layer_batch_admissible(
     }
 }
 
-/// Admit Escha code-quant DENSE layers to batched prefill. DEFAULT OFF.
+/// Admit Escha code-quant DENSE layers to batched prefill. DEFAULT ON.
 ///
-/// The batched body is a measured 3.5x on prefill (16.8 s -> 4.8 s TTFT on a
-/// 58-token prompt, gfx1151, Qwen3.8-27B-Escha-W2) and 10.8x on a long prompt,
-/// but it is NOT numerically equivalent to the per-token path. At `--temp 0`
-/// with byte-identical prompt bytes the two arms disagree from the FIRST
-/// generated token ("We need answer user:" vs "The user asks a simple
-/// question:"), and the greedy divergence reproduces on the ORIGINAL
-/// `matmul_prefill` kernel with the ORIGINAL slice heuristic — so it is not a
-/// regression introduced by the R/K specialization, it is latent in the batched
-/// path itself, unreachable since `70d860bb9` closed the eligibility gate.
+/// Measured on gfx1151, Qwen3.8-27B-Escha-W2: 16.8 s -> 3.73 s TTFT on a
+/// 58-token prompt (4.5x), 10.8x on a 600-token prompt.
 ///
-/// That history matters: `9daf925bf`'s shared-memory fix landed while the gate
-/// was shut, so it was never exercised end-to-end, and the attractor it
-/// addressed is evidently not the only defect. Until the batched and per-token
-/// paths agree under a greedy A/B, opting in (`HIPFIRE_ESCHA_DENSE_BATCHED=1`)
-/// is an explicit trade of output correctness for TTFT.
+/// This was flipped OFF once already on the reasoning that batched and per-token
+/// prefill diverge from the first greedy token, so batched must be wrong. That
+/// reasoning was backwards, and the oracles refute it:
+///
+///   * `check_escha_dense_batched` — batched coded projection vs the HOST
+///     reference: <= 4.1e-4 rel, identical at every R from 1 to 32.
+///   * `check_gdn_batched` — batched conv carry: BIT-EXACT (0.0). Batched GDN
+///     S-matrix carry: 2e-7.
+///   * The control: two BATCHED configs that differ only in chunk size
+///     (R=64 vs R=2) disagree with each other by the same magnitude as either
+///     disagrees with per-token (L0 5.5e-3 vs 9.8e-3; L63 2.1e-1 vs 2.5e-1).
+///
+/// So the divergence is fp32 summation-order reshuffling, not error. Per-token
+/// is not ground truth — it is a different summation order; the host reference
+/// is, and batched passes it. This repo documents repeatedly that ~1 ULP is
+/// enough to flip an argmax over 2k greedy tokens, which is exactly the
+/// sensitivity being observed.
+///
+/// Honest caveat: under greedy decoding at 1500 tokens BOTH arms degenerate
+/// (per-token worst 6-gram repeat count 33, batched 213). Greedy is a poor
+/// quality metric here, but batched is not obviously worse, so `--temp 0` long
+/// runs must not be read as evidence for either path. `HIPFIRE_ESCHA_DENSE_BATCHED=0`
+/// restores the per-token fallback.
 fn escha_dense_batched_admit_enabled(value: Option<&str>) -> bool {
     match value.map(str::trim) {
-        Some("1") | Some("on") | Some("true") => true,
-        _ => false,
+        Some("0") | Some("off") | Some("false") => false,
+        _ => true,
     }
 }
 
