@@ -189,7 +189,16 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
             if (sp < 0) sp += NB;
             const int g0 = sp >> 5;
             const int w0 = g0 ? (NW - g0) : 0;
-            const int wh = (w0 + NW - 1) % NW;   // hi word = w0 - 1 (circular)
+            // hi word = w0 - 1, circular. Written as a select rather than
+            // `(w0 + NW - 1) % NW`: w0 is provably in [0, NW-1] (g0 = sp>>5 is
+            // in [0, NW-1], so NW - g0 is in [1, NW-1], and the g0==0 branch
+            // yields 0), which makes the modulo a pure wrap-by-one. The `%`
+            // form does not fold: NW is runtime in this kernel and even with
+            // K baked in, clang cannot prove the range and emits a
+            // reciprocal-multiply sequence — the gfx1151 build showed 36
+            // s_mul_hi_u32 + 39 s_addc_u32 for exactly this expression, about
+            // 20% of the inner loop's instruction budget.
+            const int wh = w0 ? (w0 - 1) : (NW - 1);
 
             uint32_t hi = pay[wh];
             uint32_t lo = pay[w0];
@@ -390,7 +399,8 @@ __device__ __forceinline__ void escha_dense_matmul_prefill_body(
             if (sp < 0) sp += NB;
             const int g0 = sp >> 5;
             const int w0 = g0 ? (NW - g0) : 0;
-            const int wh = (w0 + NW - 1) % NW;
+            const int wh = w0 ? (w0 - 1) : (NW - 1);  // see decode_gemv: the
+            //   % form cannot fold because clang cannot prove w0 < NW.
 
             uint32_t hi = pay[wh];
             uint32_t lo = pay[w0];

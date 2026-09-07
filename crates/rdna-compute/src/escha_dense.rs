@@ -34,6 +34,16 @@ const NT: u32 = 128; // threads per block (one per output column)
 /// of the GPU idle at batch 1; slicing the IC reduction multiplies the block
 /// count. The u-stage per block is `ceil(nit/n_slices)*16` floats, so also cap
 /// the shared memory at 48 KB.
+///
+/// The ~1024-block target is a measured plateau, not a guess
+/// (`examples/decode_stage_probe.rs`, gfx1151, gate_proj 5120x17408 K=2,
+/// 22.3 MB of code): n_slices=1 (136 blocks) takes 2.78 ms, n_slices=7 (952
+/// blocks) takes 1.10 ms for the SAME bytes, and pushing further regresses
+/// (ns=30 -> 1.8 ms, ns=120 -> 1.8 ms, ns=320 -> 2.9 ms). So the gemv is
+/// latency/parallelism-bound below ~1000 blocks and split-K-overhead-bound
+/// above it. Corollary: 22.3 MB in 1.10 ms is only 20 GB/s against the ~104
+/// GB/s this device sustains (examples/mem_bw.rs), i.e. the decode gemv leaves
+/// ~5x of DRAM on the table, and the ceiling is occupancy, not bandwidth.
 pub fn escha_dense_n_slices(nit: usize, oc: usize) -> usize {
     let n_ocb = (oc / 128).max(1);
     // Target ~1024 blocks at batch 1 (enough to fill a gfx1151 CU array).
