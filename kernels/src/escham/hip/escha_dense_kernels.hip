@@ -135,8 +135,14 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
     int OC,
     int n_slices,
     int K) {
+    // Payload is staged as OVERLAPPING uint2 pairs (llama.cpp's dense escha
+    // layout): pair[w] = { lo = word w, hi = word w-1 mod NW }. The inner loop
+    // needs exactly that 64-bit quantity for its w0, so ONE LDS.64 replaces two
+    // LDS.32 per weight — halving the loop's shared-memory instruction count at
+    // identical byte volume (an LDS.64 moves the same 8 B the two LDS.32 did, so
+    // this buys issue slots, not bandwidth).
     extern __shared__ char s_raw[];
-    uint32_t* s_pay = (uint32_t*)s_raw;               // [ESCHA_DGROUPS][NW words]
+    uint2* s_pay = (uint2*)s_raw;                      // [ESCHA_DGROUPS][NW pairs]
     float* s_u     = (float*)(s_pay + ESCHA_DGROUPS * (8 * K));  // [tiles_max*16]
 
     const int NW  = 8 * K;
@@ -164,7 +170,7 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
         s_u[j] = u_row[j];
     }
 
-    uint32_t* pay = s_pay + grp * NW;
+    uint2* pay = s_pay + grp * NW;
 
     // start bit for this column lane, r = 0
     int s0 = ((32 - K) - K * (32 * cc + 4 * (cc >> 3))) % NB;
@@ -176,9 +182,14 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
     for (int ti = lo; ti < hi; ++ti) {
         const int16_t* tile =
             code + ((size_t)(ti * nct + tj)) * (size_t)(16 * K);
-        // load this tile's payload words (plain, little-endian u32)
+        // Stage this tile as overlapping pairs: pair w needs word w and word
+        // w-1, so each lane takes one extra global read for the predecessor.
+        // The tile is only NW words, it is L1-hot, and this runs once per tile
+        // against ESCHA_DTILE consumptions per tile.
         for (int w = cc; w < n_wd; w += ESCHA_DTILE) {
-            pay[w] = ((const uint32_t*)tile)[w];
+            const uint32_t lo = ((const uint32_t*)tile)[w];
+            const uint32_t prev = ((const uint32_t*)tile)[w ? w - 1 : n_wd - 1];
+            pay[w] = make_uint2(lo, prev);
         }
         __syncthreads();
 
@@ -198,12 +209,12 @@ extern "C" __global__ void escha_dense_decode_gemv_kernel(
             // reciprocal-multiply sequence — the gfx1151 build showed 36
             // s_mul_hi_u32 + 39 s_addc_u32 for exactly this expression, about
             // 20% of the inner loop's instruction budget.
-            const int wh = w0 ? (w0 - 1) : (NW - 1);
-
-            uint32_t hi = pay[wh];
-            uint32_t lo = pay[w0];
+            // One LDS.64 yields exactly the (hi, lo) the two LDS.32 did; `wh`
+            // is folded into the pair index, so the wrap-by-one select and the
+            // second address computation both disappear.
+            const uint2 pr = pay[w0];
             uint32_t idx =
-                ((uint64_t)hi << 32 | (uint64_t)lo) >> (sp & 31);
+                ((uint64_t)pr.y << 32 | (uint64_t)pr.x) >> (sp & 31);
             idx &= 0xffffu;
             acc += uu[r] * escha_dense_codebook(idx);
         }

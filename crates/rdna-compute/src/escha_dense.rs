@@ -169,10 +169,11 @@ pub fn escha_dense_decode_gemv(
         "escha_dense_decode_gemv",
         n_slices * ic * oc / n_slices * 4,
     );
-    // shared: 8*NW u32 payload words (K=3: 8*24*4 = 768 B) + tiles*16 floats
+    // shared: 8*NW uint2 payload PAIRS (K=3: 8*24*8 = 1536 B) + tiles*16 floats.
+    // Pairs, not words: see the staging comment in escha_dense_decode_gemv_kernel.
     let tiles_max = nit.div_ceil(n_slices);
     let nw = 8 * (k as usize);
-    let smem = (8 * nw * 4 + tiles_max * 16 * 4) as u32;
+    let smem = (8 * nw * 8 + tiles_max * 16 * 4) as u32;
     gpu.launch_maybe_blob(
         "escha_dense_decode_gemv_kernel",
         [1, n_ocb as u32, n_slices as u32],
@@ -550,7 +551,7 @@ pub fn escha_dense_decode_gemv_stage(
     ];
     let tiles_max = nit.div_ceil(n_slices);
     let nw = 8 * (k as usize);
-    let smem = (8 * nw * 4 + tiles_max * 16 * 4) as u32;
+    let smem = (8 * nw * 8 + tiles_max * 16 * 4) as u32;
     gpu.launch_maybe_blob(
         "escha_dense_decode_gemv_kernel",
         [1, n_ocb as u32, n_slices as u32],
