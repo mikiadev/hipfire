@@ -40,7 +40,7 @@ host/EschaLabs (rel ≤ 6e-4).
 | | 2026-09-05 | now |
 |---|---|---|
 | decode (tg) | 1.9 → 3.4 tok/s | **5.0 tok/s** |
-| prefill (pp) | 3.4 tok/s ≡ decode (16.8 s TTFT) | **16.7 tok/s, 3.47 s TTFT** (4.8×) |
+| prefill (pp) | 3.4 tok/s ≡ decode (16.8 s TTFT) | **~29 tok/s, ~0.61 s TTFT** (27×; 4.8× GDN batch + 1.75× FA batch) |
 
 Prefill finally separated from decode this session. Output coherent, verified
 factual (Canberra), correct arithmetic (17×23=391) at serving temperature.
@@ -144,13 +144,20 @@ another scalar micro-optimisation.
 
 ## Next steps, in priority order
 
-1. **Batch the 16 `FullAttnEscha` layers inside the chunk loop** — *now the
-   dominant prefill cost*. The chunk's GDN half is batched and fast; FA is still
-   a per-token gather/scatter loop, so FA ≈ 16/64 of weights × 58 tokens of
-   full-speed decode is essentially all of the remaining 3.47 s. The MQ path
-   already solves this shape in `batch_chunk_full_attn_attn` (`prefill.rs:5146`) /
-   `batch_chunk_full_attn_ffn` (`prefill.rs:5597`), dispatched at `prefill.rs:7457` — mirror it for coded
-   wq/wk/wv/wo. Task #71.
+1. ~~**Batch the 16 `FullAttnEscha` layers inside the chunk loop**~~ — **DONE
+   (`e63add0ec`, 2026-09-07).** New `fullattn_escha_layer_prefill` mirrors the
+   per-token FA body kernel-for-kernel with every launch covering all N chunk
+   rows (coded q/k/v/wo via `escha_dense_decode_proj_batch`, shared batched
+   norm/RoPE/KV-write/attend through the same `pbs` buffers + `KvTierPlan`
+   dispatch). Measured gfx1151: prefill **16.7 → ~29 tok/s** (3.47 s →
+   ~0.61 s TTFT on the 58-token prompt; 5.6× cumulative from the 16.8 s
+   start). Oracle `examples/check_escha_fa_batched` passes (rel ≤ 3.8e-4 vs
+   per-token at n_rows 2..58, layers 3+7). France→Paris, sky coherent.
+   Root cause on the way in: the new body indexed `k_cache`/`v_cache` by
+   `kv_layer_idx` (FA counter 0..15) but the filtered KV vec is per-model-layer
+   with 256-byte placeholders off-FA — first FA layer wrote into `k_gpu[0]`'s
+   placeholder and `kv_cache_write_q8_0_batched` faulted at the cache base.
+   Index by `layer_idx` like the per-token body and the MQ arm.
 2. **MTP does not engage, and the reason is now known.** `--spec mtp` measured
    **5.0 tok/s, identical to `--spec off`**. The loader
    (`hipfire-loader/src/lib.rs:2007,2032`) looks only for a bundled `.mq4-mtp`
@@ -451,5 +458,7 @@ portable codebook spelling is exact under HIP. Packaged reference with kernels:
 
 ---
 
-*Last updated 2026-09-07 (batched prefill on: 4.8× pp; decode gemv modulo +
-LDS.64: 3.4 → 5.0 tok/s; oracles added; two plan premises refuted by measurement).*
+*Last updated 2026-09-07 (FA layers batched: pp ~29 tok/s, ~0.61 s TTFT;
+batched prefill on: 4.8× pp; decode gemv modulo + LDS.64: 3.4 → 5.0 tok/s;
+oracles added incl. check_escha_fa_batched; two plan premises refuted by
+measurement; KV-index fault root-caused to kv_layer_idx vs layer_idx).*
