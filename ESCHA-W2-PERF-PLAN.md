@@ -285,11 +285,12 @@ plumbing; the open question is whether the MTP layer's projections can be loaded
 
 | # | change | risk | expected | status |
 |---|---|---|---|---|
-| 1 | Re-open `qwen35_layer_batch_admissible` for `DeltaNetEscha`/`FullAttnEscha` | low | pp ≥ 2.7× | ✅ done, `HIPFIRE_ESCHA_DENSE_BATCHED=0` kill-switch |
-| 1b | FA-escha fallback inside the batched chunk replayed the **whole model** per token | — | prerequisite for 1 | ✅ fixed (was latent, unreachable only because the gate was shut) |
-| 2 | `lm_head` as int8 + W8A16 GEMV | low–med | tg +35–40% | todo |
-| 3 | Compile-time `R` (+ `K`) in `matmul_prefill` | med | pp +2–4× on top of 1 | ✅ done — `private_segment_fixed_size` **272 → 0** measured |
-| 4 | Drop `n_slices ≥ R`; partial scratch bound | low | pp +10–20%, −GB VRAM | ✅ done (scratch hoisting still open) |
+| 0 | **Batched-vs-decode projection oracle at real activations** | low | prerequisite for 1/5/9 | ❌ **missing — do this first** |
+| 1 | Re-open `qwen35_layer_batch_admissible` for `DeltaNetEscha`/`FullAttnEscha` | low | pp ≥ 2.7× | ⚠️ code landed, **default OFF** — measured 3.5× but path is not equivalent (see below) |
+| 1b | FA-escha fallback inside the batched chunk replayed the **whole model** per token | — | prerequisite for 1 | ✅ fixed (was latent; unreachable only because the gate was shut) |
+| 2 | `lm_head` as int8 + W8A16 GEMV | low–med | tg +35–40% | todo — **now the top item**, decode is untouched at 3.4 tok/s |
+| 3 | Compile-time `R` (+ `K`) in `matmul_prefill` | med | pp +2–4× on top of 1 | ✅ done and verified on GPU — `private_segment_fixed_size` **272 → 0** |
+| 4 | Drop `n_slices ≥ R`; partial scratch bound | low | pp +10–20%, −GB VRAM | ✅ done, but the floor was load-bearing → replaced by an explicit smem bound (`b8dcefcb9`) |
 | 5 | Batch the 16 `FullAttnEscha` layers inside the chunk loop | med | pp ~2× on top | todo |
 | 6 | Fuse `rotate_in`+GEMV+`finalize`; multi-shard (K-grouped) merge | med–high | tg +50–100% | todo |
 | 7 | `LDS.64` overlapping-pair payload + compile-time `NW` | med | tg +20–40% | ✅ half done — `NW`/`NB` are now `constexpr` per K instantiation; the overlapping-pair `LDS.64` staging is still open |
@@ -297,25 +298,74 @@ plumbing; the open question is whether the MTP layer's projections can be loaded
 | 9 | WMMA/MFMA coded prefill GEMM | high | pp → O(100–500) tok/s | todo |
 | 10 | MTP speculation from `mtp/` | med | tg ×1.8 | todo |
 
-### Done in this round — what to validate on the next GPU run
+**Actionable order given the above:** the prefill items (1, 5, 9) are all blocked
+behind row 0, because there is currently no way to tell a correct batched coded
+GEMM from an incorrect one — that is exactly how the present bug stayed hidden.
+Row **2 (`lm_head` int8)** is fully independent of the batched path, is the
+largest single remaining win, and is unblocked now.
 
-1. `HIPFIRE_DEBUG_BATCH=1` should now print `all_layers_ok=true` for
-   Qwen3.8-27B-Escha-W2, and `pp` must separate from `tg` immediately. If it
-   does not, the gate is not the (only) blocker and this whole section needs
-   re-deriving.
-2. **Attractor check is mandatory** — the gate was closed for an attractor and
-   `9daf925bf` is only believed to have fixed it. Generate well past the prefill
-   horizon (≥2× prompt length) on a plain factual prompt and read the text;
-   a verbatim echo means the batched path is still corrupting weights. Per
-   `docs/VALIDATION.md` this is a kernel/dispatch change, so it also owes
-   `scripts/redline_daemon_harness.py`.
-3. Sweep `R ∈ {8, 16, 32}` (`escha_dense_prefill_r` ceiling is
-   `ESCHA_DENSE_PREFILL_R_MAX = 32`). Measured register cost of the new
-   instantiations: R=8 → 40 VGPR, R=16 → 48, R=32 → 82, all at
-   `private_segment_fixed_size = 0`. R=16 is the likely sweet spot.
-4. Re-dump `radiowave.json` for the new symbols; the old
-   `escha_dense_matmul_prefill_kernel` entry is dead (source-hash invalidation
-   handles the cache correctly — verified, the JIT keys on source+arch+flags+toolchain).
+### GPU validation (done on the cloud box, gfx1151, same hardware)
+
+Everything below is measured, not inferred. `--temp 0` greedy A/B with
+byte-identical prompt bytes is the oracle: batched and per-token prefill **must**
+produce identical tokens, and they do not.
+
+| change | verdict |
+|---|---|
+| R/K compile-time specialization | **Works as designed.** `priv 272 → 0`, prefill 3.5×, no functional change. |
+| `n_slices` floor removal | **Introduced a crash.** Floor was accidentally capping dynamic smem. Replaced by an explicit bound (`b8dcefcb9`). |
+| Re-open batched prefill | **Path is not equivalent → default OFF** (`f37f5264b`). |
+
+Measured, warm, 3-run medians, 58-token prompt:
+
+| | prefill | ttft | decode |
+|---|---|---|---|
+| per-token (default) | 17 080–17 537 ms | 17.5 s | 3.3–3.4 tok/s |
+| batched (`=1`) | 4 767–4 821 ms | 4.8 s | 3.3–3.4 tok/s |
+
+**3.5× on prefill**, and pp finally separates from tg (12.1 vs 3.4 tok/s). On a
+600-token prompt the batched path measures **10.8×**. Those numbers are real —
+they are just bought with wrong output.
+
+Facts established about the divergence, so the next pass does not redo them:
+
+* **Not the R/K specialization.** A control build reverting to the *original*
+  `matmul_prefill` kernel **and** the original slice heuristic diverges
+  identically. The defect is latent in the batched body and has been unreachable
+  since `70d860bb9` shut the gate.
+* **Not a chunk-carry bug.** `HIPFIRE_PREFILL_MAX_BATCH` ∈ {2,4,8,16,32,default}
+  all diverge at layer 0 by 2e-3…6e-2 relative. Two-row chunks are as wrong as
+  58-row chunks.
+* **Layer 0 diverges on its own** — so it is inside a batched projection or the
+  batched GDN arm, not error compounded from upstream layers.
+* `9daf925bf`'s shared-memory fix landed while the gate was shut, so it was
+  never exercised end-to-end. The attractor it removed was not the only defect.
+
+**Measurement trap, learned the hard way:** the per-token `dump_hidden_localize`
+call site records `s.x` under `layer_idx - 1`, the batched site under
+`layer_idx`. Pairing dumps by recorded layer index therefore compares batched
+layer L with per-token layer L−1, which at sequence row 0 degenerates to
+embedding-vs-embedding and looks *identical*. That produced a confidently wrong
+"exact at row 0, ramps with position" conclusion; only prompt-internal rows give
+an aligned comparison.
+
+**The real gap is the missing oracle.** `check_escha_dense` validates the decode
+gemv against the host reference and has no batched-path coverage at all, which is
+why a wrong batched body survived both its authoring and its "fix". Step 0 of any
+retry is a batched-vs-decode projection comparison at real activations; bisection
+inside `deltanet_escha_layer_prefill` is step 1. That oracle is also a
+prerequisite for step 9 (WMMA coded prefill) — without it there is no way to tell
+a correct batched GEMM from an incorrect one.
+
+Sweep `R ∈ {8,16,32}` on the next attempt: register cost of the new
+instantiations is R=8 → 40 VGPR, R=16 → 48, R=32 → 82, all at
+`private_segment_fixed_size = 0`. R=16 is the likely sweet spot.
+
+Note on the earlier `open think span at end of generation` validation errors:
+this model always reasons, and `reasoning.mode off` only zeroes the budget and
+hides the trace, so truncating a run mid-`think` is a config artifact, not
+evidence about output quality.
+
 
 
 Targets on this hardware: **tg 3.5 → 10–15 tok/s** (roofline ~29),
