@@ -219,6 +219,9 @@ impl MetaValue {
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,
+    /// Torch-order dims [rows, cols]: GGUF stores dims reversed
+    /// (`gguf_writer.py` writes `shape[n_dims-1-j]`), so the reader
+    /// un-reverses at parse. `shape[0]` = rows (M), `shape[1]` = cols (K).
     pub shape: Vec<usize>,
     pub dtype: GgmlType,
     pub offset: usize,
@@ -297,10 +300,15 @@ impl GgufFile {
         for _ in 0..tensor_count {
             let name = read_string(&mut cursor)?;
             let n_dims = cursor.read_u32::<LittleEndian>()? as usize;
-            let mut shape = Vec::with_capacity(n_dims);
+            let mut raw_shape = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
-                shape.push(cursor.read_u64::<LittleEndian>()? as usize);
+                raw_shape.push(cursor.read_u64::<LittleEndian>()? as usize);
             }
+            // GGUF stores dims reversed (gguf_writer.py writes
+            // shape[n_dims-1-j]); un-reverse to torch order so
+            // shape[0]=rows(M), shape[1]=cols(K) like safetensors.
+            raw_shape.reverse();
+            let shape = raw_shape;
             let dtype_raw = cursor.read_u32::<LittleEndian>()?;
             let dtype = GgmlType::from_u32(dtype_raw).ok_or_else(|| {
                 io::Error::new(
@@ -997,7 +1005,8 @@ mod real_file_offset_tests {
         let g = GgufFile::open(std::path::Path::new(&path)).unwrap();
         assert_eq!(g.tensors.len(), 851);
         let info = g.tensors.iter().find(|t| t.name == "output.weight").unwrap();
-        assert_eq!(info.shape, vec![5120, 248320]);
+        // Torch order (reader un-reverses GGUF dims): [vocab, dim].
+        assert_eq!(info.shape, vec![248320, 5120]);
         let raw = g.tensor_data(info);
         // mmap ground truth: first 8 bytes 6206bf10ae7fe9b7 (d=9.7e-05, dmin sane).
         assert_eq!(&raw[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), "6206bf10ae7fe9b7");
@@ -1037,5 +1046,48 @@ mod real_file_stats_tests {
         }
         eprintln!("output.weight: blocks={nb} wild-d={wild}/2000");
         assert!(wild < 20, "Q4_K lm_head wild-d={wild}/2000 (ground truth ~0)");
+    }
+}
+
+#[cfg(test)]
+mod shape_order_tests {
+    use super::*;
+
+    /// GGUF stores dims reversed (gguf_writer.py writes shape[n_dims-1-j]);
+    /// the reader must un-reverse to torch order [rows, cols].
+    /// Synthetic table: file-order [248320, 5120] must parse as [248320, 5120]
+    /// torch... i.e. file bytes [5120, 248320] -> shape [248320, 5120].
+    /// Build a minimal GGUF blob in memory and check TensorInfo.shape.
+    #[test]
+    fn dims_unreversed_to_torch_order() {
+        use byteorder::WriteBytesExt;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.write_u32::<byteorder::LittleEndian>(3).unwrap();
+        buf.write_u64::<byteorder::LittleEndian>(1).unwrap(); // 1 tensor
+        buf.write_u64::<byteorder::LittleEndian>(0).unwrap(); // 0 metadata
+        // tensor entry: name "w", 2 dims in FILE order [K, M] = [5120, 248320]
+        let name = b"w";
+        buf.write_u64::<byteorder::LittleEndian>(name.len() as u64).unwrap();
+        buf.extend_from_slice(name);
+        buf.write_u32::<byteorder::LittleEndian>(2).unwrap();
+        buf.write_u64::<byteorder::LittleEndian>(5120).unwrap();
+        buf.write_u64::<byteorder::LittleEndian>(248320).unwrap();
+        buf.write_u32::<byteorder::LittleEndian>(0).unwrap(); // F32
+        buf.write_u64::<byteorder::LittleEndian>(0).unwrap(); // offset
+        // pad to alignment 32
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        let n_elements = 5120usize * 248320usize;
+        buf.extend(std::iter::repeat(0u8).take(n_elements * 4));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.gguf");
+        std::fs::write(&path, &buf).unwrap();
+        let g = GgufFile::open(&path).unwrap();
+        assert_eq!(g.tensors.len(), 1);
+        // Torch order: [rows=M=248320, cols=K=5120].
+        assert_eq!(g.tensors[0].shape, vec![248320, 5120]);
+        assert_eq!(g.tensors[0].numel(), n_elements);
     }
 }

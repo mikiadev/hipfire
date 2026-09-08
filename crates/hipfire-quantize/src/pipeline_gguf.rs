@@ -405,7 +405,8 @@ pub(crate) fn run_gguf_pipeline(
         let is_norm = gguf_is_norm_tensor(&info.name);
         let is_embed = gguf_is_embed_tensor(&info.name);
         let is_2d = info.shape.len() == 2;
-        let k_dim = if is_2d { info.shape[0] } else { n_elements };
+        // Torch order (reader un-reversed): shape[0]=rows(M), shape[1]=cols(K).
+        let k_dim = if is_2d { info.shape[1] } else { n_elements };
 
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
@@ -439,6 +440,7 @@ pub(crate) fn run_gguf_pipeline(
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             if let Some(dt) = crate::model_filter::fixed_tier_dtype_for(&out_name) {
+                // Torch order: shape[0]=M (rows), shape[1]=K (cols).
                 let m = info.shape[0] as usize;
                 let k = info.shape[1] as usize;
                 if k % 256 != 0 && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2") {

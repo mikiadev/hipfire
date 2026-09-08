@@ -743,12 +743,13 @@ pub(crate) fn config_json_from_gguf(
     let n_heads = read_u(&format!("{prefix}.attention.head_count"));
     let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv")).or(n_heads);
     let hidden_dim = read_u(&format!("{prefix}.feed_forward_length"));
-    // vocab_size: prefer metadata, fall back to token_embd shape[1].
+    // vocab_size: prefer metadata, fall back to token_embd rows
+    // (torch order [vocab, dim] after the reader's un-reverse).
     let vocab_size = read_u(&format!("{prefix}.vocab_size")).or_else(|| {
         gguf.tensors
             .iter()
             .find(|t| t.name == "token_embd.weight")
-            .and_then(|t| t.shape.get(1).map(|&s| s as u64))
+            .and_then(|t| t.shape.first().map(|&s| s as u64))
     });
     let max_seq_len = read_u(&format!("{prefix}.context_length"));
     let rope_theta = read_f(&format!("{prefix}.rope.freq_base"));
@@ -1235,7 +1236,8 @@ mod gemma4_config_tests {
 
         let mut tensors = vec![TensorInfo {
             name: "token_embd.weight".into(),
-            shape: vec![3840, 262144],
+            // Torch order [vocab, dim] (post-un-reverse convention).
+            shape: vec![262144, 3840],
             ..fake_tensor()
         }];
         for i in 0..48 {
@@ -1428,7 +1430,8 @@ mod gemma4_config_tests {
 
         let mut tensors = vec![TensorInfo {
             name: "token_embd.weight".into(),
-            shape: vec![3840, 262144],
+            // Torch order [vocab, dim] (post-un-reverse convention).
+            shape: vec![262144, 3840],
             ..fake_tensor()
         }];
         for i in 0..48 {
@@ -1572,7 +1575,8 @@ mod qwen35_hybrid_config_tests {
         );
         let mut tensors = vec![TensorInfo {
             name: "token_embd.weight".into(),
-            shape: vec![5120, 248320],
+            // Torch order [vocab, dim] (post-un-reverse convention).
+            shape: vec![248320, 5120],
             offset: 0,
             dtype: crate::gguf_input::GgmlType::F32,
         }];
