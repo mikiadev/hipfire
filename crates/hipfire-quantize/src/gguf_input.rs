@@ -643,6 +643,12 @@ fn dequant_q1_0(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Test-only entry to the Q4_K decoder for the C-oracle differential test.
+#[cfg(test)]
+pub(crate) fn dequant_q4_k_for_oracle(data: &[u8], n: usize) -> Vec<f32> {
+    dequant_q4_k(data, n)
+}
+
 fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 144;
@@ -971,5 +977,65 @@ mod iq3_s_tests {
         blk[2] = 0x01; // qs[0] = 1 -> grid1 = iq3s_grid[1], byte0 = 0x03
         let out = dequant_iq3_s(&blk, 256);
         assert!((out[0] - 3.0).abs() < 1e-6, "got {}", out[0]);
+    }
+}
+
+#[cfg(test)]
+mod real_file_offset_tests {
+    use super::*;
+
+    /// Ground-truth anchor: output.weight block 0 bytes from mmap walk
+    /// (table end 10994817, data_start 10994848, off=0). If the reader's
+    /// metadata/table parse diverges by even one byte, tensor_data lands
+    /// on header text and this fails loudly.
+    /// Ignored by default (needs the 11.8 GB production file); run with
+    /// `GGUF_REAL_FILE=/data/rocmfpx/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf`.
+    #[test]
+    #[ignore]
+    fn reader_lands_on_true_data() {
+        let path = std::env::var("GGUF_REAL_FILE").expect("GGUF_REAL_FILE");
+        let g = GgufFile::open(std::path::Path::new(&path)).unwrap();
+        assert_eq!(g.tensors.len(), 851);
+        let info = g.tensors.iter().find(|t| t.name == "output.weight").unwrap();
+        assert_eq!(info.shape, vec![5120, 248320]);
+        let raw = g.tensor_data(info);
+        // mmap ground truth: first 8 bytes 6206bf10ae7fe9b7 (d=9.7e-05, dmin sane).
+        assert_eq!(&raw[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(), "6206bf10ae7fe9b7");
+        // Must NOT be header text: 'output_norm.weight' would indicate an offset bug.
+        assert!(!raw[..144].windows(11).any(|w| w == b"output_norm"));
+    }
+}
+
+#[cfg(test)]
+mod real_file_stats_tests {
+    use super::*;
+
+    /// Full-tensor dequant stats on TRUE bytes via the real reader.
+    /// output.weight (Q4_K): samples 2000 blocks' super-scale d, asserts the
+    /// pinned wild fraction (ground truth ~0/2000 — the 47% "wild" reading
+    /// came from a dead probe script's diverged offset, not the file).
+    /// Run with GGUF_REAL_FILE set.
+    #[test]
+    #[ignore]
+    fn real_file_scale_survey() {
+        let path = std::env::var("GGUF_REAL_FILE").expect("GGUF_REAL_FILE");
+        let g = GgufFile::open(std::path::Path::new(&path)).unwrap();
+        let info = g.tensors.iter().find(|t| t.name == "output.weight").unwrap();
+        let raw = g.tensor_data(info);
+        let bs = info.dtype.block_bytes();
+        let nb = raw.len() / bs;
+        let mut wild = 0usize;
+        for i in 0..2000 {
+            let bi = (i * 7919) % nb;
+            let d = hipfire_quantize::float16::f16_to_f32(u16::from_le_bytes([
+                raw[bi * bs],
+                raw[bi * bs + 1],
+            ]));
+            if d.abs() > 1.0 {
+                wild += 1;
+            }
+        }
+        eprintln!("output.weight: blocks={nb} wild-d={wild}/2000");
+        assert!(wild < 20, "Q4_K lm_head wild-d={wild}/2000 (ground truth ~0)");
     }
 }

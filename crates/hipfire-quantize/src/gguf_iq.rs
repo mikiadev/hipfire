@@ -1626,4 +1626,49 @@ mod full_tensor_oracle_tests {
             expect[mdi]
         );
     }
+
+    /// Q4_K lm_head blocks 0–2 (mmap-anchored TRUE bytes): all sane
+    /// (std ~0.016). Pins the decoder against the C reference on real
+    /// lm_head data. (An earlier revision of this test used bytes from a
+    /// diverged probe script — header text, not tensor data — and pinned
+    /// garbage-in/garbage-out agreement including a "wild" block; the
+    /// fixtures here are re-derived from mmap-walked offsets. The reader
+    /// offset itself is pinned by `real_file_offset_tests`.)
+    #[test]
+    fn q4_k_matches_c_on_lm_head_prefix() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/c_oracle/");
+        let mut concat = Vec::new();
+        for b in 0..3 {
+            let hx = std::fs::read_to_string(format!("{dir}true_lm_{b}.hex"))
+                .unwrap_or_else(|_| panic!("true_lm_{b}.hex missing"));
+            concat.extend_from_slice(&hex_to_bytes(hx.trim()));
+        }
+        let rust = crate::gguf_input::dequant_q4_k_for_oracle(&concat, 768);
+        assert_eq!(rust.len(), 768);
+        let mut expect = Vec::with_capacity(768);
+        for b in 0..3 {
+            let txt = std::fs::read_to_string(format!("{dir}true_lm_{b}.txt"))
+                .unwrap_or_else(|_| panic!("true_lm_{b}.txt missing"));
+            let v: Vec<f32> = txt.split_whitespace().map(|s| s.parse().unwrap()).collect();
+            assert_eq!(v.len(), 256);
+            expect.extend_from_slice(&v);
+        }
+        let mut md = 0.0f32;
+        let mut mdi = 0usize;
+        for (i, (a, b)) in rust.iter().zip(expect.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > md {
+                md = d;
+                mdi = i;
+            }
+        }
+        // Wild block 2 has huge magnitudes; use relative tolerance there.
+        let rel = md / expect[mdi].abs().max(1e-9);
+        assert!(
+            md <= 1e-5 || rel <= 1e-5,
+            "q4k MISMATCH max_abs_diff={md:.2e} (rel {rel:.2e}) at idx {mdi}: rust={} c={}",
+            rust[mdi],
+            expect[mdi]
+        );
+    }
 }
