@@ -486,6 +486,13 @@ const KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 /// Whole tiles move: this is a line-for-line port, not a re-derivation. Any
 /// divergence from the C is a bug; verify with the unit test below against
 /// vectors produced by the C decoder.
+/// Test-only entry to the IQ3_S decoder for the C-oracle differential test
+/// (`gguf_iq::c_oracle_diff_tests`). Same function the dispatcher calls.
+#[cfg(test)]
+pub(crate) fn dequant_iq3_s_for_oracle(data: &[u8], n: usize) -> Vec<f32> {
+    dequant_iq3_s(data, n)
+}
+
 fn dequant_iq3_s(data: &[u8], n: usize) -> Vec<f32> {
     const QK: usize = 256;
     const BLK: usize = 110;
