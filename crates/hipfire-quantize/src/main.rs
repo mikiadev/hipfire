@@ -19,6 +19,7 @@ mod diagnostics;
 mod e8;
 mod e8_gptq;
 mod gguf_input;
+mod gguf_iq;
 mod hfq;
 mod maple;
 mod model_filter;

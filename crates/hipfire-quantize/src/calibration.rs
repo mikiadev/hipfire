@@ -116,6 +116,20 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
         _ => {}
     }
     // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
+    // NOTE: ssm_a has NO suffix (`blk.N.ssm_a`) and ssm_dt carries `.bias`
+    // (`blk.N.ssm_dt.bias`) — both are llama.cpp SSM 1D tensors. Handle them
+    // before the `.weight`-suffixed parse below.
+    if let Some(rest) = gguf_name.strip_prefix("blk.") {
+        let dot = rest.find('.')?;
+        let layer_idx = &rest[..dot];
+        let slot_full = &rest[dot + 1..];
+        if slot_full == "ssm_a" {
+            return Some(format!("model.layers.{layer_idx}.linear_attn.A_log"));
+        }
+        if slot_full == "ssm_dt.bias" {
+            return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias"));
+        }
+    }
     if let Some(rest) = gguf_name.strip_prefix("blk.") {
         // rest = "{N}.<slot>.weight"
         let dot = rest.find('.')?;
@@ -155,6 +169,11 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
             "ffn_norm" => "post_attention_layernorm".to_string(),
+            // Qwen3.5/3.8 hybrid GGUFs name the second norm
+            // `post_attention_norm` (llama.cpp slot); the loader reads
+            // `post_attention_layernorm` (HF name). Caught on the first
+            // real-file conversion (all 64 ffn_norms landed untranslated).
+            "post_attention_norm" => "post_attention_layernorm".to_string(),
             "attn_q" => "self_attn.q_proj".to_string(),
             "attn_k" => "self_attn.k_proj".to_string(),
             "attn_v" => "self_attn.v_proj".to_string(),
@@ -164,6 +183,38 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
             "ffn_gate" => "mlp.gate_proj".to_string(),
             "ffn_up" => "mlp.up_proj".to_string(),
             "ffn_down" => "mlp.down_proj".to_string(),
+            // Qwen3.5/3.8 hybrid LinearAttention layers (llama.cpp SSM naming;
+            // see layer_driver.rs DeltaNet arms — the raw GGUF slots are
+            // authoritative, so every slot here maps 1:1 to a loader name).
+            "attn_qkv" => "linear_attn.in_proj_qkv".to_string(),
+            "attn_gate" => "linear_attn.in_proj_z".to_string(),
+            "ssm_alpha" => "linear_attn.in_proj_a".to_string(),
+            "ssm_beta" => "linear_attn.in_proj_b".to_string(),
+            "ssm_out" => "linear_attn.out_proj".to_string(),
+            // NOTE: the loader expects conv1d/norm WITH the `.weight`
+            // suffix (HF tensor names `linear_attn.conv1d.weight`,
+            // `linear_attn.norm.weight`), so these need an early return —
+            // the generic `{translated}.weight` suffix below would double
+            // it to `.weight.weight` (caught in the first conversion run).
+            "ssm_conv1d" => {
+                return Some(format!(
+                    "model.layers.{layer_idx}.linear_attn.conv1d.weight"
+                ));
+            }
+            "ssm_norm" => {
+                return Some(format!(
+                    "model.layers.{layer_idx}.linear_attn.norm.weight"
+                ));
+            }
+            // Unreachable via the `.weight`-suffixed parse above (ssm_a has no
+            // suffix, ssm_dt carries `.bias` — both handled by the early arm
+            // before this block). Kept as documentation; do not delete.
+            "ssm_a" => {
+                return Some(format!("model.layers.{layer_idx}.linear_attn.A_log"));
+            }
+            "ssm_dt" => {
+                return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias"));
+            }
             other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
         };
         return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
@@ -756,9 +807,130 @@ pub(crate) fn config_json_from_gguf(
     if arch_id == 13 {
         apply_gemma4_fields(gguf, prefix, &mut cfg);
     }
+    if arch_id == 5 {
+        apply_qwen35_hybrid_fields(gguf, prefix, &mut cfg);
+    }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
     serde_json::Value::Object(cfg)
+}
+
+/// Translate Qwen3.5/3.8 hybrid (DeltaNet + full-attention) GGUF metadata into
+/// the loader fields `Qwen35Config` needs beyond the Llama-style scalars.
+///
+/// GGUF keys (verified on `Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf`, arch `qwen35`):
+/// - `ssm.inner_size` (6144) → `linear_num_value_heads` = inner/128, and
+///   `linear_num_key_heads` = value_heads/3 (3:1 DeltaNet ratio enforced in
+///   `qwen35/config.rs:validate_gdn_config`). `ssm.group_count` (16) and
+///   `ssm.time_step_rank` (48) cross-check the derivation but are not loaded.
+/// - `ssm.conv_kernel` (4) → `linear_conv_kernel_dim`.
+/// - `rope.dimension_sections` [11,11,10] → `rope_parameters.mrope_section`;
+///   `rope.dimension_count` (64) + `partial_rotary_factor` 0.25 stay default.
+/// - `layer_types`: GGUF has no key — derived from the tensor table (layers
+///   carrying `attn_q` are full-attention, layers with `attn_qkv` are linear).
+///   `full_attention_interval` (4) is the cross-check, not the source.
+fn apply_qwen35_hybrid_fields(
+    gguf: &gguf_input::GgufFile,
+    prefix: &str,
+    cfg: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let read_u = |k: &str| -> Option<u64> {
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::U8(x) => Some(*x as u64),
+            gguf_input::MetaValue::I8(x) => Some(*x as u64),
+            gguf_input::MetaValue::U16(x) => Some(*x as u64),
+            gguf_input::MetaValue::I16(x) => Some(*x as u64),
+            gguf_input::MetaValue::U32(x) => Some(*x as u64),
+            gguf_input::MetaValue::I32(x) => Some(*x as u64),
+            gguf_input::MetaValue::U64(x) => Some(*x),
+            gguf_input::MetaValue::I64(x) => Some(*x as u64),
+            _ => None,
+        })
+    };
+    // Linear head counts: value heads from ssm.inner_size / 128, key heads
+    // at the 3:1 ratio the loader enforces (16/48 on Qwen3.8-27B).
+    if let Some(inner) = read_u(&format!("{prefix}.ssm.inner_size")) {
+        let value_heads = inner / 128;
+        if value_heads > 0 {
+            cfg.insert(
+                "linear_num_value_heads".to_string(),
+                serde_json::Value::from(value_heads),
+            );
+            cfg.insert(
+                "linear_num_key_heads".to_string(),
+                serde_json::Value::from(value_heads / 3),
+            );
+        }
+    }
+    if let Some(conv) = read_u(&format!("{prefix}.ssm.conv_kernel")) {
+        cfg.insert(
+            "linear_conv_kernel_dim".to_string(),
+            serde_json::Value::from(conv),
+        );
+    }
+    // Head dims stay at the loader defaults (128/128) — GGUF carries no
+    // per-tower key/value lengths beyond attention.key/value_length (256,
+    // the FULL tower). Do not copy those into linear_*_head_dim.
+    // MROPE section from rope.dimension_sections (array of 4: [11,11,10,0]).
+    if let Some(gguf_input::MetaValue::Array(arr)) =
+        gguf.metadata.get(&format!("{prefix}.rope.dimension_sections"))
+    {
+        let sec: Vec<serde_json::Value> = arr
+            .iter()
+            .filter_map(|v| match v {
+                gguf_input::MetaValue::U8(x) => Some(serde_json::Value::from(*x as u64)),
+                gguf_input::MetaValue::I8(x) => Some(serde_json::Value::from(*x as u64)),
+                gguf_input::MetaValue::U16(x) => Some(serde_json::Value::from(*x as u64)),
+                gguf_input::MetaValue::I16(x) => Some(serde_json::Value::from(*x as u64)),
+                gguf_input::MetaValue::U32(x) => Some(serde_json::Value::from(*x as u64)),
+                gguf_input::MetaValue::I32(x) => Some(serde_json::Value::from(*x as u64)),
+                gguf_input::MetaValue::U64(x) => Some(serde_json::Value::from(*x)),
+                gguf_input::MetaValue::I64(x) => Some(serde_json::Value::from(*x as u64)),
+                _ => None,
+            })
+            .collect();
+        if sec.len() >= 3 {
+            cfg.insert(
+                "rope_parameters".to_string(),
+                serde_json::json!({
+                    "rope_theta": 10_000_000.0,
+                    "mrope_interleaved": true,
+                    "mrope_section": [sec[0].clone(), sec[1].clone(), sec[2].clone()],
+                    "partial_rotary_factor": 0.25,
+                }),
+            );
+        }
+    }
+    // layer_types from the tensor table: attn_q ⇒ full, attn_qkv ⇒ linear.
+    let n_layers = cfg
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    if n_layers > 0 {
+        let mut is_full = vec![false; n_layers];
+        for t in &gguf.tensors {
+            if let Some(rest) = t.name.strip_prefix("blk.") {
+                if let Some(dot) = rest.find('.') {
+                    if let Ok(idx) = rest[..dot].parse::<usize>() {
+                        if idx < n_layers && rest[dot + 1..].starts_with("attn_q.") {
+                            is_full[idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let types: Vec<serde_json::Value> = is_full
+            .iter()
+            .map(|f| {
+                serde_json::Value::from(if *f {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                })
+            })
+            .collect();
+        cfg.insert("layer_types".to_string(), serde_json::Value::Array(types));
+    }
 }
 
 /// Translate gemma4-specific GGUF metadata into the `text_config` fields the
@@ -1346,6 +1518,186 @@ mod gemma4_name_translation_tests {
         assert_eq!(
             gguf_to_safetensors_name("blk.2.layer_output_scale.weight", 13).unwrap(),
             "model.layers.2.layer_scalar"
+        );
+    }
+}
+#[cfg(test)]
+mod qwen35_hybrid_config_tests {
+    use crate::calibration::config_json_from_gguf;
+    use crate::gguf_input::{GgufFile, MetaValue, TensorInfo};
+    use std::collections::HashMap;
+
+    /// Metadata + tensor table mirroring the real GSQ-RCO IQ3_S GGUF layout
+    /// (64 layers, full every 4th starting at 3, ssm.inner_size 6144).
+    /// Values taken from the metadump of the production file.
+    fn qwen38_gguf() -> GgufFile {
+        let mut m: HashMap<String, MetaValue> = HashMap::new();
+        m.insert("general.architecture".into(), MetaValue::String("qwen35".into()));
+        m.insert("qwen35.block_count".into(), MetaValue::U32(64));
+        m.insert("qwen35.embedding_length".into(), MetaValue::U32(5120));
+        m.insert("qwen35.feed_forward_length".into(), MetaValue::U32(17408));
+        m.insert("qwen35.attention.head_count".into(), MetaValue::U32(24));
+        m.insert("qwen35.attention.head_count_kv".into(), MetaValue::U32(4));
+        m.insert("qwen35.attention.key_length".into(), MetaValue::U32(256));
+        m.insert("qwen35.attention.value_length".into(), MetaValue::U32(256));
+        m.insert(
+            "qwen35.attention.layer_norm_rms_epsilon".into(),
+            MetaValue::F32(1e-6),
+        );
+        m.insert("qwen35.rope.freq_base".into(), MetaValue::F32(10_000_000.0));
+        m.insert("qwen35.rope.dimension_count".into(), MetaValue::U32(64));
+        m.insert(
+            "qwen35.rope.dimension_sections".into(),
+            MetaValue::Array(vec![
+                MetaValue::I32(11),
+                MetaValue::I32(11),
+                MetaValue::I32(10),
+                MetaValue::I32(0),
+            ]),
+        );
+        m.insert("qwen35.ssm.conv_kernel".into(), MetaValue::U32(4));
+        m.insert("qwen35.ssm.state_size".into(), MetaValue::U32(128));
+        m.insert("qwen35.ssm.group_count".into(), MetaValue::U32(16));
+        m.insert("qwen35.ssm.time_step_rank".into(), MetaValue::U32(48));
+        m.insert("qwen35.ssm.inner_size".into(), MetaValue::U32(6144));
+        m.insert("qwen35.full_attention_interval".into(), MetaValue::U32(4));
+        m.insert("qwen35.context_length".into(), MetaValue::U32(262144));
+        m.insert(
+            "tokenizer.ggml.bos_token_id".into(),
+            MetaValue::U32(248044),
+        );
+        m.insert(
+            "tokenizer.ggml.eos_token_id".into(),
+            MetaValue::U32(248046),
+        );
+        let mut tensors = vec![TensorInfo {
+            name: "token_embd.weight".into(),
+            shape: vec![5120, 248320],
+            offset: 0,
+            dtype: crate::gguf_input::GgmlType::F32,
+        }];
+        for i in 0..64usize {
+            let full = i % 4 == 3;
+            tensors.push(TensorInfo {
+                name: if full {
+                    format!("blk.{i}.attn_q.weight")
+                } else {
+                    format!("blk.{i}.attn_qkv.weight")
+                },
+                shape: vec![1, 1],
+                offset: 0,
+                dtype: crate::gguf_input::GgmlType::F32,
+            });
+        }
+        GgufFile::for_tests(m, tensors).unwrap()
+    }
+
+    #[test]
+    fn qwen38_gguf_config_has_hybrid_fields() {
+        let g = qwen38_gguf();
+        let cfg = config_json_from_gguf(&g, "qwen35", 5);
+        assert_eq!(cfg["linear_num_value_heads"], 48);
+        assert_eq!(cfg["linear_num_key_heads"], 16);
+        assert_eq!(cfg["linear_conv_kernel_dim"], 4);
+        let lt = cfg["layer_types"].as_array().expect("layer_types array");
+        assert_eq!(lt.len(), 64);
+        for (i, v) in lt.iter().enumerate() {
+            let expect = if i % 4 == 3 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            };
+            assert_eq!(v.as_str().unwrap(), expect, "layer {i}");
+        }
+        let rp = &cfg["rope_parameters"];
+        assert_eq!(rp["mrope_section"], serde_json::json!([11, 11, 10]));
+        assert_eq!(rp["mrope_interleaved"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn qwen38_gguf_config_is_admitted_by_loader_parser() {
+        // The loader's RawQwen35Config requires hidden_size / num_hidden_layers /
+        // num_attention_heads / vocab_size; hybrid fields must not break it.
+        let g = qwen38_gguf();
+        let cfg = config_json_from_gguf(&g, "qwen35", 5);
+        for k in [
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "vocab_size",
+            "head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "layer_types",
+        ] {
+            assert!(cfg.get(k).is_some(), "missing {k}");
+        }
+        // linear head dims stay defaulted (loader fills 128/128); the GGUF
+        // full-tower key_length=256 must NOT leak into linear dims.
+        assert!(cfg.get("linear_key_head_dim").is_none());
+        assert!(cfg.get("linear_value_head_dim").is_none());
+    }
+}
+
+#[cfg(test)]
+mod qwen35_hybrid_name_translation_tests {
+    use crate::calibration::gguf_to_safetensors_name;
+
+    #[test]
+    fn hybrid_linear_slots_map_to_loader_names() {
+        let f = |n: &str| gguf_to_safetensors_name(n, 5).unwrap();
+        // 2D proj slots → loader proj names (single `.weight` suffix).
+        assert_eq!(
+            f("blk.0.attn_qkv.weight"),
+            "model.layers.0.linear_attn.in_proj_qkv.weight"
+        );
+        assert_eq!(
+            f("blk.0.attn_gate.weight"),
+            "model.layers.0.linear_attn.in_proj_z.weight"
+        );
+        assert_eq!(
+            f("blk.0.ssm_alpha.weight"),
+            "model.layers.0.linear_attn.in_proj_a.weight"
+        );
+        assert_eq!(
+            f("blk.0.ssm_beta.weight"),
+            "model.layers.0.linear_attn.in_proj_b.weight"
+        );
+        assert_eq!(
+            f("blk.0.ssm_out.weight"),
+            "model.layers.0.linear_attn.out_proj.weight"
+        );
+        // conv1d/norm carry `.weight` in the HF name — no doubling.
+        assert_eq!(
+            f("blk.0.ssm_conv1d.weight"),
+            "model.layers.0.linear_attn.conv1d.weight"
+        );
+        assert_eq!(
+            f("blk.0.ssm_norm.weight"),
+            "model.layers.0.linear_attn.norm.weight"
+        );
+        // 1D SSM scalars (`blk.N.ssm_a`, `blk.N.ssm_dt.bias`) → raw_f32
+        // names (no `.weight` suffix). Also covers the suffixed spellings
+        // if an exporter ever ships them.
+        assert_eq!(f("blk.0.ssm_a"), "model.layers.0.linear_attn.A_log");
+        assert_eq!(
+            f("blk.0.ssm_dt.bias"),
+            "model.layers.0.linear_attn.dt_bias"
+        );
+        // Full-attention + MLP slots unchanged. The hybrid FFN norm slot
+        // (`post_attention_norm` in GGUF) maps to the loader's
+        // `post_attention_layernorm`.
+        assert_eq!(
+            f("blk.0.post_attention_norm.weight"),
+            "model.layers.0.post_attention_layernorm.weight"
+        );
+        assert_eq!(
+            f("blk.7.attn_q.weight"),
+            "model.layers.7.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            f("blk.7.ffn_down.weight"),
+            "model.layers.7.mlp.down_proj.weight"
         );
     }
 }
