@@ -36,6 +36,10 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 # loader parser (Gemma4Config::from_metadata_json) — the config-emission /
 # loader-admission boundary is where the GGUF gemma4 gap sat.
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+# Test-only: same boundary for the qwen3.5/3.8 hybrid GGUF path
+# (Qwen35Config::config_from_metadata_json) — layer_types, linear head
+# counts and rope sections must survive the emission → loader round-trip.
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 # Test-only: the MQ*-G256-GL codebooks (GL_CB2/GL_CB3) and SoA group sizes are
 # duplicated between this encoder and the runtime (the kernels take the codebook
 # as scalar args; it is NOT stored in the .hfq). `gl_codebooks_match_runtime` /

@@ -1616,26 +1616,40 @@ mod qwen35_hybrid_config_tests {
 
     #[test]
     fn qwen38_gguf_config_is_admitted_by_loader_parser() {
-        // The loader's RawQwen35Config requires hidden_size / num_hidden_layers /
-        // num_attention_heads / vocab_size; hybrid fields must not break it.
+        // Round-trip through the REAL arch-5 parser — the config-emission /
+        // loader-admission boundary. Field-presence asserts alone missed the
+        // shape the loader actually requires (cf. gemma4 precedent).
         let g = qwen38_gguf();
         let cfg = config_json_from_gguf(&g, "qwen35", 5);
-        for k in [
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "vocab_size",
-            "head_dim",
-            "linear_num_key_heads",
-            "linear_num_value_heads",
-            "layer_types",
-        ] {
-            assert!(cfg.get(k).is_some(), "missing {k}");
-        }
         // linear head dims stay defaulted (loader fills 128/128); the GGUF
         // full-tower key_length=256 must NOT leak into linear dims.
         assert!(cfg.get("linear_key_head_dim").is_none());
         assert!(cfg.get("linear_value_head_dim").is_none());
+        let metadata_json =
+            serde_json::to_string(&serde_json::json!({ "config": cfg })).unwrap();
+        let parsed =
+            hipfire_arch_qwen35::qwen35::config::config_from_metadata_json(&metadata_json)
+                .expect("loader parser must admit the generated config");
+        assert_eq!(parsed.n_layers, 64);
+        assert_eq!(parsed.dim, 5120);
+        assert_eq!(parsed.linear_num_key_heads, 16);
+        assert_eq!(parsed.linear_num_value_heads, 48);
+        assert_eq!(parsed.conv_kernel_dim, 4);
+        assert_eq!(parsed.layer_types.len(), 64);
+        let n_full = parsed
+            .layer_types
+            .iter()
+            .filter(|t| **t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
+            .count();
+        assert_eq!(n_full, 16, "16 full layers at i%4==3 expected");
+        assert_eq!(
+            parsed.layer_types[3],
+            hipfire_arch_qwen35::qwen35::LayerType::FullAttention
+        );
+        assert_eq!(
+            parsed.layer_types[0],
+            hipfire_arch_qwen35::qwen35::LayerType::LinearAttention
+        );
     }
 }
 
