@@ -1,0 +1,163 @@
+# GSQ-RCO IQ3_S plan: re-quant bridge (shipped) → native IQ3_S support (proposed)
+
+**Status:** execution trace + proposal (2026-09-09 / 2026-09-10). Branch
+`exp/gsq-rco-iq3s`. This file is the plan record, not a product claim.
+Quality numbers below are `measured` on the stated fixture; admission
+state is fail-closed (`docs/admissions.yml` empty).
+
+**Source under test:**
+[ISTA-DASLab `Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/raw/main/README.md)
+(11.77 GB, mixed-precision: Q4_K 10% / IQ3_S 32% / IQ3_XXS 20% / IQ4_XS 21% /
+IQ2_S 9% / BF16+F32 smalls; method:
+[GSQ](https://arxiv.org/abs/2604.18556) +
+[RCO](https://arxiv.org/abs/2605.00649)).
+Local copy: `/data/rocmfpx/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf`.
+
+**Question answered here:** can we *serve* it, and what does it cost.
+**Question proposed:** can we serve it *without re-quanting* (native
+IQ3_S decode), keeping its 11.8 GB size and its win over our MQ4.
+
+---
+
+## 1. What shipped (re-quant bridge, coherent)
+
+`/tmp/gsqrco-iq3s.hfq` (md5 `3c60064fb2d33f7153f69543511d7298`, 14.97 GB,
+arch 5, 851 tensors, `--format mq4v1`) serves coherently on gfx1151.
+Recipe: GGUF → dequant (`tensor_to_f32`, all 11 dtypes C-verified +
+NRMSE ~0.10 vs host kernel-rule decode) → MQ4 re-quant.
+
+Three conversion bugs found and fixed (commits below). All three were
+*convention mismatches between the GGUF release and the safetensors-born
+loader*, not decoder bugs:
+
+| # | Bug | Evidence | Fix | Commit |
+|---|---|---|---|---|
+| 1 | GGUF norms store TRUE γ (~1.0); loader adds `QWEN35_NORM_BIAS=1.0` (expects residuals) → every norm loaded ~2.0 → token soup | good-3.6 norms store ~0.0; ours stored ~1.0 | store TRUE−1 for the five `norm()`-read names | `9edc06ac9` |
+| 2 | GGUF DeltaNet V-heads sequential; engine consumes interleaved 3V/K (`escha-head j == gguf-head PERM[j]`, PERM=`[0,16,32,1,17,33,…]`) | good-3.6 dt_bias == Escha-3.8 dt_bias 48/48; GGUF matches 8/48; conv V-groups map identically | `maybe_interleave_deltanet_v_heads()` on dequantized f32 (A_log/dt/in_proj_a/b/z, conv/qkv-V segs, out_proj-V cols) | `9edc06ac9` |
+| 3 | GGUF `ssm_a` is raw decay A (−0.04); engine wants `ln(−A)` (kernel does `alpha *= -exp(a_log)`); without it decay≈1.0 | Escha-A_log[e] == ln(−ssm_a[PERM[e]]), 2304/2304 elems, 48 layers | `ln(−A)` in the same helper | `365ba3337` (PPL 35.6 → 10.3) |
+
+Falsified along the way (do not re-litigate): GGUF dim-order transpose
+(flat pipeline = no-op), FWHT sign mismatch, Q4_K/Q2_K/IQ decoder ports
+(C-verified), tokenizer divergence (ids identical to good-3.6),
+chat template, KV-mode, RoPE flag, MQ4V2-vs-MQ4V1 (both souped pre-fix).
+
+Serve-harness battery (`scripts/serve_harness.py --mode battery
+--thinking off`, daemon `27b78167`): 5/5 `finish=stop`, 0 runaway /
+0 empty / 0 attractor. Eyeballed: Rayleigh essay, Paris, coherent
+code fence. Per Astrea rules this is serve-semantics evidence only,
+not a KLD/PPL claim and not an admission.
+
+## 2. Size accounting (why ours is bigger than the release)
+
+| File | Bytes | Whole-file bpw |
+|---|---|---|
+| Release GGUF | 11.77 GB | ~3.5 |
+| Ours (`/tmp/gsqrco-iq3s.hfq`) | 14.97 GB | ~4.4 |
+| Local `qwen3.8-27b.mq4` | 15.66 GB | ~4.6 |
+| Local `qwen3.8-27b.mq3` | 12.62 GB | ~3.7 |
+| Local `qwen3.8-27b.mq6` (new) | 21.75 GB | ~6.5 |
+
+The growth is the 497 dense 2D projections (~25.6B params) going from
+~3.4 bpw mixed I-quant to flat 4.25 bpw MQ4 (+2.7 GB), plus embed→Q8
+(+0.5 GB). Ours < local mq4 because we carry 305 F16s + 1 Q8 table
+where mq4 carries 801 + 50 (AWQ sidecars etc.). Nothing is wasted;
+it is the format math. mq3 vs mq4 on disk is the clean one-variable
+pair (identical census, 496× qt49 vs qt44).
+
+## 3. Quality ladder (measured 2026-09-09/10, same slice+harness)
+
+Fixture: first 200 KB of
+`benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt`
+(md5 `83b0205a…`), `flash_prefill_quality` ctx512/chunks16/stride8
+(512 scored), except the GGUF row (llama-perplexity, own tokenizer —
+cross-engine caveat: tokenizers differ by 238 ids on the slice).
+
+| Model | PPL | Size | Source |
+|---|---|---|---|
+| GGUF release (llama.cpp) | **7.17** ± 0.12 | 11.8 GB | measured |
+| mq6 (`qwen3.8-27b.mq6`) | **9.16** | 21.8 GB | measured (new anchor) |
+| mq4 trunk | 9.23 | 15.7 GB | measured |
+| ours v5 | **10.32** | 15.0 GB | measured |
+| mq3 | 10.54 | 12.6 GB | measured |
+
+Registry teacher-KLD (same teacher/protocol, comparable): mq4 base
+WT2 0.039 / mq3 base 0.154 / mq6 base 0.0028. Both ladders agree:
+ours ≈ mq3-class, ~1.1 PPL behind mq4, ~1.2 behind mq6. The gap to
+the release is the expected double-quant cost (GSQ-RCO 3.5 bpw →
+MQ4 4.25 bpw); the release's own table claims IQ3_S ≈ BF16-lossless,
+and we are one more lossy hop down.
+
+## 4. Native IQ3_S: why it needs kernels, not a loader tweak
+
+Verified by inventory, not by reasoning from docs:
+
+- `kernels/src/` has exactly one kernel for this file's dtypes:
+  `gemv_q4k.hip` (10% of params). No `gemv_iq3s/iq4_xs/q2k`, no I-quant
+  GEMM, no fused prefill path. 87% of params have no compute behind them.
+- `qwen35/load.rs::load_weight_tensor_raw` has no Q4K arm and no
+  I-quant arms (unknown dtypes fall to `dequant_weight_raw`, which
+  only speaks F16/F32/BF16 + raw codecs).
+- Prefill is the wall even for Q4_K alone: the fused `qkvza` matcher
+  falls through to an HFQ4-stride kernel reading Q4_K blocks
+  (fluent garbage, no error). Each LA/FA/FFN matcher + the
+  `batched_gemm_single_weight` mixed-format arm needs a per-dtype case.
+- There is **no GGUF-serve path** in the tree (llama-arch GGUF code is
+  dequant-for-quantize tooling, not serving). Native support means HFQ
+  container + dispatch entries, same as every other format.
+
+Cost estimate: ~10 kernels (GEMV + batched-GEMM per dtype that matters)
++ loader/preflight arms + matcher routing + parity tests. Order by
+param share: IQ4_XS+Q2_K first (23%), then IQ3_S (31%), then the tail.
+Phase 0 (Q4_K only: passthrough + loader + `gemm_q4k_batched` +
+matchers) was prototyped to prove this analysis — it serves fluent
+garbage (PPL 2933) at exactly the predicted matcher gap, and is parked,
+not deleted (stash `gsqrco-native-phase0-wip`, patch `/tmp/phase0_wip.patch`,
+kernel `kernels/src/gemm_q4k_batched.hip` untracked). Per the
+kernel-tuning skill: correct micro-pieces, flat end-to-end → reject
+with evidence. Resume from the stash, don't restart.
+
+## 5. Suggested route (staged, each stage shippable)
+
+- **Stage 0 — land the bridge fixes (done, committed).** Norm residual,
+  V-head interleave, A_log domain. They are GGUF-path corrections any
+  native route inherits; the C-oracle gates + NRMSE audits stay as
+  regression cover.
+- **Stage 1 — IQ4_XS + Q2_K GEMV pair (23% of params).** Smallest kernels
+  that prove the I-quant pattern end-to-end: `gemv_iq4_xs` (+`gemm`
+  batched), `gemv_q2k` (+`gemm`), DType + table + `for_gemv` keys,
+  loader/preflight arms, unfused-matcher routing (TQ2 pattern),
+  `test_kernels` channel parity vs the CPU decoders in
+  `gguf_iq.rs`, then serve-harness + PPL delta on a hybrid file where
+  only these two dtypes go native. Success bar: hybrid PPL moves
+  10.32 → ~9.6 (half the gap, proportional to share).
+- **Stage 2 — IQ3_S (31%, the file's backbone).** Same pattern; grid
+  decode is already C-verified in-tree. Success bar: hybrid → ~8.5,
+  file shrinks toward ~12 GB.
+- **Stage 3 — tail (IQ3_XXS/IQ2_XS/IQ2_XXS/IQ2_S/IQ1_M/BF16-smalls).**
+  Smallest-first; BF16 smalls can stay host-F32 (0.09%, not worth a kernel).
+- **Stage 4 — full-native file + admission.** All-native `.hfq` at
+  ~11.8 GB, PPL within ~0.5 of the release row, `docs/admissions.yml`
+  row (fail-closed until then). Retire the re-quant bridge per model,
+  keep it per pipeline (other GSQ-RCO releases reuse it).
+
+Non-goals: Q4_K-embedding GEMV (embed stays Q8 — lookup path, no win),
+DFlash draft work (after AR is correct per the arch-port skill),
+changing the release's RCO allocation (take it as authoritative, same
+as the ternary precedent).
+
+## 6. Artifact index
+
+- Branch: `exp/gsq-rco-iq3s` @ `365ba3337` (bridge). Stash:
+  `gsqrco-native-phase0-wip` (+ `/tmp/phase0_wip.patch`,
+  `kernels/src/gemm_q4k_batched.hip` untracked).
+- Models: `/data/rocmfpx/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf` (source);
+  `/tmp/gsqrco-iq3s.hfq` == `/tmp/gsqrco-v5.hfq` (md5 `3c60064f…`,
+  serving artifact); `/tmp/gsqrco-native.hfq` (Phase-0 hybrid,
+  diagnostic only); `~/.hipfire/models/qwen3.8-27b.{mq3,mq4,mq6}`.
+- Eval: `/tmp/ppl_slice.txt` (200 KB slice head); `/tmp/fpq16_*.bin`
+  per-model records; `/tmp/llama_ppl.err` (release row);
+  `/tmp/gsqrco_harness3.err` (serve battery).
+- Reference export for the kernel work: `/data/rocmfpx/Qwen38-27b-Escha-W2`
+  (BF16 safetensors; norm-residual + dt/A_log ground truth) and
+  `/data/rocmfpx/Qwen3.8F/llama.cpp` (`ggml-quants.c` / `ggml-common.h`
+  C references all I-quant decoders were verified against).
