@@ -1030,6 +1030,16 @@ pub(crate) fn maybe_interleave_deltanet_v_heads(out_name: &str, mut v: Vec<f32>)
         for (e, &g) in PERM.iter().enumerate() {
             v[e] = src[g];
         }
+        // A_log domain (llama.cpp SSM convention): GGUF `ssm_a` stores the
+        // raw decay multiplier A (small negatives, e.g. -0.04); the engine
+        // consumes log-decay (`alpha *= -exp(a_log)`, i.e. a_log = ln(-A)).
+        // Verified 2304/2304 elems over all 48 linear layers:
+        // Escha-A_log[e] == ln(-GGUF-ssm_a[PERM[e]]). dt_bias passes through.
+        if out_name.ends_with("linear_attn.A_log") {
+            for x in v.iter_mut() {
+                *x = if *x < 0.0 { (-*x).ln() } else { *x };
+            }
+        }
         return v;
     }
     // in_proj_a/b/z rows (torch [48|6144,K]): 48 V-head groups.
