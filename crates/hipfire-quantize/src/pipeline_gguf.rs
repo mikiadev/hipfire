@@ -416,17 +416,47 @@ pub(crate) fn run_gguf_pipeline(
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
+        // DeltaNet V-head interleave (Qwen3.5/3.8 hybrid only): GGUF stores
+        // V-head-major tensors in sequential head order, but the engine's
+        // DeltaNet math consumes interleaved order (3 V-heads per K-head:
+        // escha-head j == gguf-head PERM[j], PERM[new]=[0,16,32,1,17,33,...]).
+        // Verified: good-3.6 dt_bias == Escha-3.8 dt_bias 48/48 positionally,
+        // while GGUF-3.8 matches only 8/48; conv V-groups map identically.
+        // Applied to the dequantized f32 BEFORE quantizing so every downstream
+        // format arm inherits it. K-head (16) tensors are untouched.
+        let f32_data = if arch_id == 5 {
+            maybe_interleave_deltanet_v_heads(&out_name, gguf_input::tensor_to_f32(info, raw))
+        } else {
+            gguf_input::tensor_to_f32(info, raw)
+        };
+
         let (data, quant_type, group_size, label) = if is_norm || !is_2d {
-            // Norms and 1D tensors always F16 (primary gate)
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            // Norms and 1D tensors always F16 (primary gate).
+            //
+            // RMSNorm convention (matches the safetensors pipeline, whose
+            // checkpoints store gamma-1 residuals): the qwen35/gemma loader
+            // adds QWEN35_NORM_BIAS=1.0 at load (`dequant_norm`), so the
+            // artifact must carry TRUE-1. GGUF stores TRUE gamma (~1.0);
+            // subtract 1.0 here so load restores the trained weight.
+            // Non-norm 1D tensors (A_log, dt_bias, ssm_norm, conv1d-adjacent
+            // scalars) pass through UNCHANGED — only names the loader reads
+            // via `norm()` (input_layernorm, post_attention_layernorm,
+            // q_norm, k_norm, norm) get the -1.0 shift.
+            let f32_data = f32_data.clone();
+            let is_rms_norm = out_name.ends_with("input_layernorm.weight")
+                || out_name.ends_with("post_attention_layernorm.weight")
+                || out_name.ends_with("q_norm.weight")
+                || out_name.ends_with("k_norm.weight")
+                || out_name.ends_with("model.norm.weight")
+                || out_name == "model.norm.weight";
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
-                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .flat_map(|&v| f32_to_f16(if is_rms_norm { v - 1.0 } else { v }).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = f32_data.clone();
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -437,7 +467,7 @@ pub(crate) fn run_gguf_pipeline(
             // Product tier lift and/or explicit --fixed-tier / HIPFIRE_FIXED_TIER
             // entry. Codec overrides (e.g. attn_full:mq6v2) apply even when the
             // ProductTier does not lift that class; missing override => Q8.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = f32_data.clone();
             quant_params += n_elements as u64;
             if let Some(dt) = crate::model_filter::fixed_tier_dtype_for(&out_name) {
                 // Torch order: shape[0]=M (rows), shape[1]=K (cols).
@@ -540,7 +570,7 @@ pub(crate) fn run_gguf_pipeline(
             (bytes, quant_type, group_size, "BQ1G128 (passthrough)")
         } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
             // K-map promote to 6-bit
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = f32_data.clone();
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Mq4
@@ -635,7 +665,7 @@ pub(crate) fn run_gguf_pipeline(
             // K-map says override (lm_head when --lm-head-format set).
             // GGUF pipeline has no AWQ wiring (AWQ is safetensors-only today),
             // so this is a plain quantize on the carried target format.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = f32_data.clone();
             quant_params += n_elements as u64;
             match override_fmt {
                 GgufFormat::Mq6 => {
@@ -771,7 +801,7 @@ pub(crate) fn run_gguf_pipeline(
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = f32_data.clone();
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Hfq4 => {
@@ -917,7 +947,7 @@ pub(crate) fn run_gguf_pipeline(
             // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
             // This branch fires for the rare ragged dim; ignores --format
             // (no G128 variant of mq4/mq6 exists).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f32_data = f32_data.clone();
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
@@ -962,6 +992,119 @@ pub(crate) fn run_gguf_pipeline(
     write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
     eprintln!("\nWrote: {}", output.display());
     Ok(())
+}
+
+/// GGUF escha-head order → engine head order for DeltaNet V-head-major
+/// tensors (Qwen3.5/3.8 hybrid, arch_id 5 only).
+///
+/// The released GSQ-RCO GGUF stores V-heads sequentially (head h at index
+/// h), while the engine consumes interleaved order (3 V-heads per K-head:
+/// engine-head j == gguf-head PERM[j], PERM=[0,16,32,1,17,33,...]).
+/// Evidence: good-3.6 dt_bias == Escha-3.8 dt_bias 48/48 positionally;
+/// GGUF-3.8 dt_bias matches 8/48; conv V-groups map identically.
+///
+/// Scope (verified by nearest-row matching against the Escha BF16 export):
+/// - `*.linear_attn.A_log` / `*.linear_attn.dt_bias` (48,): permute elems.
+/// - `*.linear_attn.in_proj_a/b.weight` (torch [48,K]): permute 48 rows.
+/// - `*.linear_attn.conv1d.weight` (torch [10240,4]): permute V segs —
+///   channels [4096,10240) as 48 groups of 128 channels (Q/K segs kept).
+/// - `*.linear_attn.in_proj_qkv.weight` (torch [10240,K]): permute V segs —
+///   rows [4096,10240) as 48 groups of 128 rows (Q/K segs kept).
+/// - `*.linear_attn.out_proj.weight` (torch [dim,6144]): permute V segs —
+///   cols [0,6144) as 48 groups of 128 cols.
+/// Everything else (K-head Q/K segs, full-attention, MLP, norms) passes
+/// through unchanged. Length mismatches fall through unchanged (fail-open:
+/// never corrupt silently-truncated tensors — the loader's preflight
+/// validates geometry downstream).
+pub(crate) fn maybe_interleave_deltanet_v_heads(out_name: &str, mut v: Vec<f32>) -> Vec<f32> {
+    const PERM: [usize; 48] = [
+        0, 16, 32, 1, 17, 33, 2, 18, 34, 3, 19, 35, 4, 20, 36, 5, 21, 37, 6, 22, 38, 7, 23, 39,
+        8, 24, 40, 9, 25, 41, 10, 26, 42, 11, 27, 43, 12, 28, 44, 13, 29, 45, 14, 30, 46, 15,
+        31, 47,
+    ];
+    if out_name.ends_with("linear_attn.A_log") || out_name.ends_with("linear_attn.dt_bias") {
+        if v.len() != 48 {
+            return v;
+        }
+        let src = v.clone();
+        for (e, &g) in PERM.iter().enumerate() {
+            v[e] = src[g];
+        }
+        return v;
+    }
+    // in_proj_a/b/z rows (torch [48|6144,K]): 48 V-head groups.
+    // a/b: 48 rows of K (one row per head). z: 6144 rows of K =
+    // 48 groups of 128 rows (matches the qkv V-seg grouping).
+    if out_name.ends_with("linear_attn.in_proj_a.weight")
+        || out_name.ends_with("linear_attn.in_proj_b.weight")
+    {
+        if v.len() % 48 != 0 {
+            return v;
+        }
+        let k = v.len() / 48;
+        let src = v.clone();
+        for (e, &g) in PERM.iter().enumerate() {
+            v[e * k..(e + 1) * k].copy_from_slice(&src[g * k..(g + 1) * k]);
+        }
+        return v;
+    }
+    if out_name.ends_with("linear_attn.in_proj_z.weight") {
+        if v.len() % 6144 != 0 {
+            return v;
+        }
+        let k = v.len() / 6144;
+        let src = v.clone();
+        for (e, &g) in PERM.iter().enumerate() {
+            let (dst0, src0) = ((e * 128) * k, (g * 128) * k);
+            v[dst0..dst0 + 128 * k].copy_from_slice(&src[src0..src0 + 128 * k]);
+        }
+        return v;
+    }
+    // conv1d (torch [10240,4] flat row-major): V channels [4096,10240) in
+    // 48 groups of 128 channels x 4 taps.
+    if out_name.ends_with("linear_attn.conv1d.weight") {
+        if v.len() != 10240 * 4 {
+            return v;
+        }
+        let src = v.clone();
+        for (e, &g) in PERM.iter().enumerate() {
+            let dst0 = (4096 + e * 128) * 4;
+            let src0 = (4096 + g * 128) * 4;
+            v[dst0..dst0 + 128 * 4].copy_from_slice(&src[src0..src0 + 128 * 4]);
+        }
+        return v;
+    }
+    // in_proj_qkv (torch [10240,K]): V rows [4096,10240) in 48 groups of
+    // 128 rows x K cols.
+    if out_name.ends_with("linear_attn.in_proj_qkv.weight") {
+        if v.len() % 10240 != 0 {
+            return v;
+        }
+        let k = v.len() / 10240;
+        let src = v.clone();
+        for (e, &g) in PERM.iter().enumerate() {
+            let (dst0, src0) = ((4096 + e * 128) * k, (4096 + g * 128) * k);
+            v[dst0..dst0 + 128 * k].copy_from_slice(&src[src0..src0 + 128 * k]);
+        }
+        return v;
+    }
+    // out_proj (torch [dim,6144]): V cols [0,6144) in 48 groups of 128
+    // cols x dim rows (column-major groups within each row).
+    if out_name.ends_with("linear_attn.out_proj.weight") {
+        if v.len() % 6144 != 0 {
+            return v;
+        }
+        let dim = v.len() / 6144;
+        let src = v.clone();
+        for r in 0..dim {
+            for (e, &g) in PERM.iter().enumerate() {
+                let (dst0, src0) = (r * 6144 + e * 128, r * 6144 + g * 128);
+                v[dst0..dst0 + 128].copy_from_slice(&src[src0..src0 + 128]);
+            }
+        }
+        return v;
+    }
+    v
 }
 
 pub(crate) fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {

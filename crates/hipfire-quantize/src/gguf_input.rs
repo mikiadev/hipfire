@@ -1091,3 +1091,81 @@ mod shape_order_tests {
         assert_eq!(g.tensors[0].numel(), n_elements);
     }
 }
+
+#[cfg(test)]
+mod real_file_dequant_gate {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Full dequant gate over every 2D tensor via the production
+    /// tensor_to_f32 path: asserts all-finite, prints per-dtype mean/std.
+    /// Ignored by default (needs the 11.8 GB file + ~1-2 min CPU).
+    /// Run: GGUF_REAL_FILE=... cargo test -p hipfire-quantize --bin hipfire-quantize -- --ignored real_file_dequant_gate --nocapture
+    #[test]
+    #[ignore]
+    fn full_dequant_finite_and_stats() {
+        let path = std::env::var("GGUF_REAL_FILE").expect("GGUF_REAL_FILE");
+        let g = GgufFile::open(std::path::Path::new(&path)).unwrap();
+        // (tensors, elems, sum, sumsq, nonfinite_tensors, zerostd_tensors, max_abs, max_abs_name)
+        let mut acc: BTreeMap<u32, (usize, u64, f64, f64, usize, usize, f32, String)> =
+            BTreeMap::new();
+        let mut done = 0usize;
+        let mut total_elems = 0u64;
+        for info in &g.tensors {
+            if info.shape.len() != 2 {
+                continue;
+            }
+            let raw = g.tensor_data(info);
+            let v = tensor_to_f32(info, raw);
+            total_elems += v.len() as u64;
+            let mut bad = 0u64;
+            let mut s = 0.0f64;
+            let mut s2 = 0.0f64;
+            let mut amax = 0.0f32;
+            for &x in &v {
+                if !x.is_finite() {
+                    bad += 1;
+                } else {
+                    s += x as f64;
+                    s2 += x as f64 * x as f64;
+                    amax = amax.max(x.abs());
+                }
+            }
+            let n = v.len() as f64;
+            let mean = s / n;
+            let std = ((s2 / n - mean * mean).max(0.0)).sqrt();
+            let e = acc.entry(info.dtype as u32).or_insert((0, 0, 0.0, 0.0, 0, 0, 0.0, String::new()));
+            e.0 += 1;
+            e.1 += v.len() as u64;
+            e.2 += s;
+            e.3 += s2;
+            if bad > 0 {
+                e.4 += 1;
+                eprintln!("NON-FINITE: {} dtype={:?} bad={bad}", info.name, info.dtype);
+            }
+            if std == 0.0 {
+                e.5 += 1;
+                eprintln!("ZERO-STD: {} dtype={:?}", info.name, info.dtype);
+            }
+            if amax > e.6 {
+                e.6 = amax;
+                e.7 = info.name.clone();
+            }
+            done += 1;
+            if done % 100 == 0 {
+                eprintln!("  ...{done} tensors ({total_elems} elems)");
+            }
+        }
+        eprintln!("=== per-dtype dequant stats ({done} 2D tensors) ===");
+        let mut fail = false;
+        for (dt, (nt, ne, s, s2, nbad, nzero, amax, aname)) in &acc {
+            let mean = s / (*ne as f64);
+            let std = ((s2 / (*ne as f64) - mean * mean).max(0.0)).sqrt();
+            eprintln!("dtype {dt:3}: tensors={nt:4} elems={ne:12} mean={mean:+.6} std={std:.6} nonfinite_tensors={nbad} zerostd={nzero} maxabs={amax:.4} ({aname})");
+            if *nbad > 0 {
+                fail = true;
+            }
+        }
+        assert!(!fail, "non-finite values found");
+    }
+}
