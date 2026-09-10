@@ -67,6 +67,20 @@ impl GgmlType {
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
+            16 => Some(Self::IQ2XXS),
+            17 => Some(Self::IQ2XS),
+            18 => Some(Self::IQ3XXS),
+            19 => Some(Self::IQ1S),
+            20 => Some(Self::IQ4NL),
+            21 => Some(Self::IQ3S),
+            22 => Some(Self::IQ2S),
+            23 => Some(Self::IQ4XS),
+            24 => Some(Self::I8),
+            25 => Some(Self::I16),
+            26 => Some(Self::I32),
+            27 => Some(Self::I64),
+            28 => Some(Self::F64),
+            29 => Some(Self::IQ1M),
             30 => Some(Self::BF16),
             _ => None,
         }
@@ -77,7 +91,9 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K
+            | Self::IQ2XXS | Self::IQ2XS | Self::IQ3XXS | Self::IQ1S | Self::IQ3S
+            | Self::IQ2S | Self::IQ4XS | Self::IQ4NL | Self::IQ1M => 256,
             _ => 32,
         }
     }
@@ -99,6 +115,15 @@ impl GgmlType {
             Self::Q5K => 2 + 2 + 12 + 128 + 32, // 176: d(2) + dmin(2) + scales(12) + qs(128) + qh(32)
             Self::Q6K => 128 + 64 + 16 + 2,     // ~210
             Self::Q8K => 256 + 2 + 32,          // ~290 (not commonly used)
+            Self::IQ4XS => 136,                 // 2 (d) + 2 (scales_h) + 4 (scales_l) + 128 (qs)
+            Self::IQ2S => 82,                   // 2 + 64 + 8 + 8
+            Self::IQ2XS => 74,                  // 2 + 64 + 8
+            Self::IQ2XXS => 66,                 // 2 + 64
+            Self::IQ3XXS => 98,                 // 2 + 64 + 32 + 8
+            Self::IQ3S => 110,                  // 2 + 64 + 36 + 8
+            Self::IQ1S => 50,                   // 2 + 32 + 16
+            Self::IQ1M => 56,                   // 32 + 16 + 8
+            Self::IQ4NL => 18,                  // 2 + 16 (QK4_NL=32)
             _ => 0,
         }
     }

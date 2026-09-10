@@ -47,6 +47,40 @@ pub fn populate(registry: &mut KernelRegistry) {
         tile: TileImpl::None,
     });
     registry.register(KernelVariant {
+        // Batched Q4_K GEMM (GSQ-RCO native): scalar one-wave-per-row,
+        // correct at any batch (chunked past 64 in the run-arm). No
+        // BatchGe gate — unlike the tiled TQ2 kernel it never loses to
+        // the GEMV loop (same math, fewer weight passes).
+        key: KernelKey::GemmQ4KBatched,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        // Batched IQ4_XS GEMM (GSQ-RCO native): same scalar pattern as
+        // GemmQ4KBatched (136 B/group, 8 groups of 32 via kvalues_iq4nl).
+        // Unrotated — Plain only, Always arch gate.
+        key: KernelKey::GemmIQ4XSBatched,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        // Batched Q2_K GEMM (GSQ-RCO native): same scalar pattern as
+        // GemmQ4KBatched (84 B/group, 2-bit with per-half scales).
+        // Unrotated — Plain only, Always arch gate.
+        key: KernelKey::GemmQ2KBatched,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0Wmma,
         arch_required: ArchPredicate::HasWmma,
         shape_gate: None,

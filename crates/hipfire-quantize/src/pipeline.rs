@@ -5331,6 +5331,18 @@ fn handle_main_quant(
                             let q = quantize_tq2g128(&f32_data);
                             (q, QuantType::TQ2G128, 128u32, "TQ2G128")
                         }
+                        // GSQ-RCO is a GGUF-path format; the safetensors
+                        // pipeline has no GGUF source dtypes to key a
+                        // passthrough on. Route to the MQ4V2 fallback.
+                        GgufFormat::Gsqrco => {
+                            let m = if meta.shape.len() == 2 {
+                                meta.shape[0]
+                            } else {
+                                1
+                            };
+                            let q = quantize_mq4g256v2(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                        }
                         GgufFormat::Binary => {
                             // Terminal low-bit: direct BQ1G128 — scale-only binary g128, 18 B/blk.
                             let q = quantize_bq1g128(&f32_data);

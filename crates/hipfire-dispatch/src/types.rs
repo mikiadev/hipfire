@@ -220,6 +220,8 @@ pub enum KernelKey {
     GemvBf16,
     GemvQ8_0,
     GemvQ4K,
+    GemvIQ4XS,
+    GemvQ2K,
     GemvQ6K,
     GemvHfq4G256,
     GemvHfq4G128,
@@ -331,6 +333,18 @@ pub enum KernelKey {
     GemmMq3G256V2BatchedLmhead,
     GemmMq2G256V2BatchedLmhead,
     GemmQ8_0BatchedChunked,
+    /// Batched Q4_K GEMM (GSQ-RCO native path): same math as `gemv_q4k`
+    /// with per-batch accumulators. Prefill LA/FA/FFN unfused arms route
+    /// Q4K here; decode keeps scalar `GemvQ4K`.
+    GemmQ4KBatched,
+    /// Batched IQ4_XS GEMM (GSQ-RCO native path): same math as `gemv_iq4_xs`
+    /// with per-batch accumulators. Prefill LA/FA/FFN unfused arms route
+    /// IQ4XS here; decode keeps scalar `GemvIQ4XS`.
+    GemmIQ4XSBatched,
+    /// Batched Q2_K GEMM (GSQ-RCO native path): same math as `gemv_q2k`
+    /// with per-batch accumulators. Prefill LA/FA/FFN unfused arms route
+    /// Q2K here; decode keeps scalar `GemvQ2K`.
+    GemmQ2KBatched,
     GemmQ8_0Wmma,
     GemmQ8_0Wmma4W,
     GemmHfq4G256Wmma,
@@ -684,6 +698,8 @@ impl KernelKey {
             (BF16, Plain) => Ok(Self::GemvBf16),
             (Q8_0, Plain) => Ok(Self::GemvQ8_0),
             (Q4K, Plain) => Ok(Self::GemvQ4K),
+            (IQ4XS, Plain) => Ok(Self::GemvIQ4XS),
+            (Q2K, Plain) => Ok(Self::GemvQ2K),
             (Q6K, Plain) => Ok(Self::GemvQ6K),
             (HFQ4G256, Plain) => Ok(Self::GemvHfq4G256),
             (HFQ4G128, Plain) => Ok(Self::GemvHfq4G128),
@@ -836,7 +852,7 @@ impl KernelKey {
     pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
         use DType::*;
         match dtype {
-            F32 | F16 | BF16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            F32 | F16 | BF16 | Q8_0 | Q4K | IQ4XS | Q2K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
             // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)

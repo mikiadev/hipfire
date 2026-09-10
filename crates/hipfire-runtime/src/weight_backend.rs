@@ -328,6 +328,14 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         dtype: DType::Q4K,
     },
     RawCodec {
+        quant_type: 42,
+        dtype: DType::IQ4XS,
+    },
+    RawCodec {
+        quant_type: 43,
+        dtype: DType::Q2K,
+    },
+    RawCodec {
         quant_type: 5,
         dtype: DType::Q8HFQ,
     },
@@ -1669,6 +1677,8 @@ mod tests {
             (0, DType::Q4F16G64),       // hfq:712
             (3, DType::Q8_0),           // wb:487 / hfq:725
             (4, DType::Q4K),            // hfq:738
+            (42, DType::IQ4XS),         // GSQ-RCO native (ggml IQ4_XS=23)
+            (43, DType::Q2K),           // GSQ-RCO native (ggml Q2_K=10)
             (5, DType::Q8HFQ),          // hfq:754
             (6, DType::HFQ4G256),       // wb:299 / hfq:767
             (7, DType::HFQ4G128),       // wb:311 / hfq:780

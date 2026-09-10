@@ -287,6 +287,14 @@ pub enum DType {
     F16,
     BF16,     // 2 bytes; native bf16 reference (KLD oracle). Widen→f32 = high-16-bit shift.
     Q4K,      // 144 bytes per 256 elements
+    /// IQ4_XS (ggml type 23): 136 B per 256 elements (4.25 bpw).
+    /// GSQ-RCO native passthrough — the release's own blocks, served by
+    /// `gemv_iq4_xs` / `gemm_iq4_xs_batched`. Unrotated (Plain), K%256==0.
+    IQ4XS,
+    /// Q2_K (ggml type 10): 84 B per 256 elements (2.625 bpw).
+    /// GSQ-RCO native passthrough — served by `gemv_q2k` / `gemm_q2k_batched`.
+    /// Unrotated (Plain), K%256==0.
+    Q2K,
     Q6K,      // 210 bytes per 256 elements
     Q8_0,     // 34 bytes per 32 elements
     Q4F16G64, // 36 bytes per 64 elements (RDNA-native FP16 dequant)
@@ -399,6 +407,8 @@ impl DType {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::Q4K
+            | DType::IQ4XS
+            | DType::Q2K
             | DType::Q6K
             | DType::Q8_0
             | DType::Q4F16G64
@@ -558,6 +568,8 @@ impl DType {
                 | DType::MQ5G256V2
                 | DType::MQ3G256V2
                 | DType::MQ2G256V2
+                | DType::IQ4XS
+                | DType::Q2K
         )
     }
 }

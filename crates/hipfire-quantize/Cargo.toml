@@ -87,3 +87,8 @@ required-features = ["lab"]
 [[example]]
 name = "poly_fit"
 required-features = ["lab"]
+
+# Stage-1 GSQ-RCO native parity: GPU gemv_iq4_xs/gemm_iq4_xs_batched and
+# gemv_q2k/gemm_q2k_batched vs the CPU decoders in gguf_iq.rs. GPU-only.
+[[example]]
+name = "test_gemv_iq_native"

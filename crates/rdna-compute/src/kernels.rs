@@ -4815,6 +4815,35 @@ pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip
 /// serial-GEMV loop for DFlash lm_heads.
 pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_batched.hip");
 
+/// Batched Q4_K GEMM (GSQ-RCO native path). Same per-row math as gemv_q4k
+/// (144 B groups, 8 sub-blocks, identical FMA order for greedy parity) with
+/// per-batch register accumulators. Prefill LA/FA/FFN matchers route Q4K
+/// layers here instead of the HFQ4-stride fused kernels.
+pub const GEMM_Q4K_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q4k_batched.hip");
+
+/// IQ4_XS GEMV (GSQ-RCO native path). 136 B groups, 8×32-element groups
+/// decoded via kvalues_iq4nl. Unrotated Plain — decode serves the release's
+/// IQ4_XS projections through this scalar kernel.
+pub const GEMV_IQ4_XS_SRC: &str = include_str!("../../../kernels/src/gemv_iq4_xs.hip");
+
+/// Batched IQ4_XS GEMM (GSQ-RCO native path). Same per-row math as
+/// gemv_iq4_xs (136 B groups, identical FMA order for greedy parity) with
+/// per-batch register accumulators. Prefill LA/FA/FFN matchers route IQ4XS
+/// layers here instead of the HFQ4-stride fused kernels.
+pub const GEMM_IQ4_XS_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iq4_xs_batched.hip");
+
+/// Q2_K GEMV (GSQ-RCO native path). 84 B groups, 2-bit codes with per-half
+/// scales. Unrotated Plain — decode serves the release's Q2_K projections
+/// through this scalar kernel.
+pub const GEMV_Q2K_SRC: &str = include_str!("../../../kernels/src/gemv_q2k.hip");
+
+/// Batched Q2_K GEMM (GSQ-RCO native path). Same per-row math as gemv_q2k
+/// (84 B groups, identical FMA order for greedy parity) with per-batch
+/// register accumulators. Prefill LA/FA/FFN matchers route Q2K layers here
+/// instead of the HFQ4-stride fused kernels.
+pub const GEMM_Q2K_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q2k_batched.hip");
+
 /// WMMA-accelerated 3-way fused QKV GEMM for Q8_0 weights. gfx1100+ wave32.
 /// Recipe-selected per docs/plans/q8-fused-prefill-kernels.md T3-1a microbench
 /// (FP16-WMMA, register-redundant dequant, no LDS).

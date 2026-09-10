@@ -100,7 +100,7 @@ fn dispatch_batched_gemm_epilogue(
     let is_mq3 = matches!(w.gpu_dtype, DType::MQ3G256);
     let is_fp4 = matches!(w.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
     let is_q8 = matches!(w.gpu_dtype, DType::Q8_0);
-    let is_lowbit = matches!(w.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let is_lowbit = matches!(w.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
     match epilogue {
         BatchEpilogue::Residual => {
             if is_6bit {
@@ -1376,6 +1376,10 @@ fn plain_gemm_key_for(dt: DType) -> hipfire_dispatch::types::KernelKey {
     match dt {
         DType::TQ2G128 => K::GemmTQ2G128Prefill,
         DType::BQ1G128 => K::GemmBQ1G128Prefill,
+        DType::Q4K => K::GemmQ4KBatched,
+        DType::IQ4XS => K::GemmIQ4XSBatched,
+        DType::Q2K => K::GemmQ2KBatched,
+        DType::HFQ4G256 => K::GemmHfq4G256,
         _ => K::GemmQ8_0BatchedChunked,
     }
 }
@@ -1410,8 +1414,10 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // plain_gemm_key_for to the tiled prefill GEMMs. Admitting them here is
         // only safe because every is_q8 unfused branch was widened to accept
         // them in the same change -- see the all-together rule in
-        // docs/plans/mq-lloyd-batched-prefill-followup.md.
-        | DType::TQ2G128 | DType::BQ1G128
+        // docs/plans/mq-lloyd-batched-prefill-followup.md. Q4K joins via
+        // the same unfused plain-GEMM strategy (GemmQ4KBatched) — the
+        // unfused matchers below were widened in the same change.
+        | DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K
         // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
         // on shisa-Qwen3.6-A3B-PARO. Dispatch in the DeltaNetMoe LA matcher
         // routes these through gemm_hfq4g128 (with per-weight Givens
@@ -4319,13 +4325,26 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    // GSQ-RCO Stage-1 hybrid: IQ4_XS/Q2_K are unrotated plain-GEMM dtypes
+    // with NO fused qkvza/gate_up/qkv kernel. A layer where ANY of the four
+    // LA weights (wqkv/wz/w_beta/w_alpha) is IQ4XS/Q2K must route the WHOLE
+    // layer through the mixed-format `batched_gemm_single_weight` fallback —
+    // the fused qkvza would read the other dtypes at the wrong stride
+    // (e.g. Q2_K 84 B/group as MQ4V2 136 B/group → memory fault / garbage).
+    let la_has_native_iq = matches!(layer.wqkv.gpu_dtype, DType::IQ4XS | DType::Q2K)
+        || matches!(layer.wz.gpu_dtype, DType::IQ4XS | DType::Q2K)
+        || matches!(layer.w_beta.gpu_dtype, DType::IQ4XS | DType::Q2K)
+        || matches!(layer.w_alpha.gpu_dtype, DType::IQ4XS | DType::Q2K);
 
     // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
     // we reuse x_rot_batch as the "normed, unrotated" output
     // so the subsequent GEMM can read it the same way.
-    if is_mq {
+    // For GSQ-RCO mixed layers (la_has_native_iq) we ALWAYS write the
+    // unrotated normed x here and rotate per-MQ-weight in the mixed
+    // dispatch below — the fused qkvza cannot span rotated+unrotated.
+    if is_mq && !la_has_native_iq {
         // AWQ-aware: next linear is LA's fused wqkv.
         fused_rmsnorm_rotate_mq_batched_for(
             gpu,
@@ -4399,11 +4418,15 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.wqkv.k,
             n,
         )?;
-    } else if is_q8 || is_lowbit {
+    } else if (is_q8 || is_lowbit) && !la_has_native_iq {
         // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
         // (wqkv/wz/w_beta/w_alpha) → GemmFamily::run_key with the
         // GemmQ8_0BatchedChunked dispatcher-entry key → identical
         // gpu.gemm_q8_0_batched_chunked method, byte-for-byte.
+        // GSQ-RCO Stage-1: la_has_native_iq layers (any LA weight is
+        // IQ4XS/Q2K) are excluded — they route through the mixed
+        // per-weight dispatch below, which gives MQ4V2 weights their
+        // FWHT-rotated x instead of reading them as Q8_0.
         run_plain_gemm_key(
             gpu,
             plain_gemm_key_for(layer.wqkv.gpu_dtype),
@@ -4448,6 +4471,32 @@ pub(crate) fn batch_chunk_delta_net_attn(
             layer.w_alpha.k,
             n,
         )?;
+    } else if la_has_native_iq {
+        // GSQ-RCO Stage-1 mixed LA layer: at least one of wqkv/wz/w_beta/
+        // w_alpha is IQ4_XS or Q2_K (unrotated plain-GEMM) and the rest are
+        // MQ4V2 (FWHT-rotated). The fused qkvza kernels assume all four
+        // weights share one stride+rotation, so a mixed layer must dispatch
+        // each weight independently: MQ4V2 weights consume FWHT-rotated x
+        // (rotated here from the unrotated normed x in x_rot_batch into
+        // dn_normed_rot_batch, which is free until the wo section below),
+        // IQ4XS/Q2K weights consume x_rot_batch directly.
+        // x_rot_batch holds the UNROTATED normed x (preamble skipped the MQ
+        // rotate for la_has_native_iq layers).
+        let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wqkv.k);
+        macro_rules! mixed_la_weight {
+            ($w:expr, $y:expr) => {{
+                if matches!($w.gpu_dtype, DType::MQ4G256V2) {
+                    rotate_x_mq_batched_for(gpu, &$w, &pbs.x_rot_batch, &scratch, $w.k, n)?;
+                    batched_gemm_single_weight(gpu, &$w, &scratch, $y, n)?;
+                } else {
+                    batched_gemm_single_weight(gpu, &$w, &pbs.x_rot_batch, $y, n)?;
+                }
+            }};
+        }
+        mixed_la_weight!(layer.wqkv, &pbs.dn_qkv_batch);
+        mixed_la_weight!(layer.wz, &pbs.dn_z_batch);
+        mixed_la_weight!(layer.w_beta, &pbs.dn_beta_batch);
+        mixed_la_weight!(layer.w_alpha, &pbs.dn_alpha_batch);
     } else if is_mq3_lloyd {
         // 112 B/group Lloyd-MQ3 stride; X is already FWHT-rotated.
         run_fused_qkvza_key(
@@ -4909,6 +4958,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         arch_has_wmma,
     )?;
 
+
     Ok(())
 }
 
@@ -4949,8 +4999,14 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
-    if ffn_is_mq {
+    let ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    // GSQ-RCO Stage-1 hybrid: gate and up must share a dtype for the fused
+    // gate+up kernel. When they differ (e.g. gate=MQ4V2, up=IQ4XS) dispatch
+    // each separately with per-weight x.
+    let ffn_gate_up_mixed = layer.w_gate.gpu_dtype != layer.w_up.gpu_dtype;
+    // For mixed gate/up layers we keep the unrotated normed x in x_rot_batch
+    // and rotate per-MQ-weight in the mixed dispatch below.
+    if ffn_is_mq && !ffn_gate_up_mixed {
         // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
         fused_rmsnorm_rotate_mq_batched_for(
             gpu,
@@ -5012,7 +5068,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             layer.w_gate.k,
             n,
         )?;
-    } else if ffn_is_q8 || ffn_is_lowbit {
+    } else if (ffn_is_q8 || ffn_is_lowbit) && !ffn_gate_up_mixed {
         run_plain_gemm_key(
             gpu,
             plain_gemm_key_for(layer.w_gate.gpu_dtype),
@@ -5035,6 +5091,24 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             layer.w_up.k,
             n,
         )?;
+    } else if ffn_gate_up_mixed {
+        // GSQ-RCO Stage-1: gate and up differ (e.g. gate=MQ4V2, up=IQ4XS).
+        // Dispatch each separately — MQ4V2 gets FWHT-rotated x (rotated into
+        // dn_normed_rot_batch, free until the wo section), IQ4XS/Q2K gets
+        // the unrotated normed x in x_rot_batch.
+        let ffn_scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.w_gate.k);
+        macro_rules! mixed_ffn_weight {
+            ($w:expr, $y:expr) => {{
+                if matches!($w.gpu_dtype, DType::MQ4G256V2) {
+                    rotate_x_mq_batched_for(gpu, &$w, &pbs.x_rot_batch, &ffn_scratch, $w.k, n)?;
+                    batched_gemm_single_weight(gpu, &$w, &ffn_scratch, $y, n)?;
+                } else {
+                    batched_gemm_single_weight(gpu, &$w, &pbs.x_rot_batch, $y, n)?;
+                }
+            }};
+        }
+        mixed_ffn_weight!(layer.w_gate, &pbs.gate_ffn_batch);
+        mixed_ffn_weight!(layer.w_up, &pbs.up_batch);
     } else if ffn_is_mq3_lloyd {
         run_fused_gate_up_key(
             gpu,
@@ -5124,6 +5198,15 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             hidden_dim,
             n,
         )?;
+    } else if ffn_is_mq && !ffn_gate_up_mixed && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K) {
+        // GSQ-RCO Stage-1: gate/up are MQ4V2 (FWHT-rotated), down is
+        // IQ4XS/Q2K (unrotated). silu(gate)*up is in the ROTATED basis;
+        // the unrotated down needs the natural basis. FWHT is involutory,
+        // so rotating the hidden state once more un-rotates it.
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        // up_batch is dead after silu_mul — reuse it as the un-rotate temp.
+        gpu.rotate_x_mq_batched(&pbs.ffn_hidden_batch, &pbs.up_batch, hidden_dim, n)?;
+        gpu.copy_f32_buffer(&pbs.ffn_hidden_batch, &pbs.up_batch, n * hidden_dim)?;
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
@@ -5191,7 +5274,13 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    // GSQ-RCO Stage-1 hybrid: a FA layer where ANY of wq/wk/wv is
+    // IQ4_XS/Q2_K (unrotated plain-GEMM) must dispatch per-weight with
+    // matching x — the fused QKV reads all three at one stride.
+    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K)
+        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K)
+        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K);
     // Fused QKV kernels require all three weights to share a
     // dtype — they treat wq/wk/wv as same-stride byte arrays.
     // When kmap mode 2 promotes only `v_proj` (issue #249), the
@@ -5205,7 +5294,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         layer.wk.gpu_dtype == layer.wq.gpu_dtype && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
     // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
-    if qkv_is_mq {
+    if qkv_is_mq && !fa_has_native_iq {
         // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
         fused_rmsnorm_rotate_mq_batched_for(
             gpu,
@@ -5382,9 +5471,26 @@ pub(crate) fn batch_chunk_full_attn_attn(
         // share a dtype. Dispatch each weight to its own
         // single-weight batched GEMM, dropping the fused-kernel
         // launch-overhead optimization for correctness.
-        batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
-        batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
-        batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+        // GSQ-RCO Stage-1: when the mix includes IQ4_XS/Q2_K (unrotated)
+        // alongside MQ4V2 (rotated), each weight needs its matching x —
+        // MQ4V2 consumes FWHT-rotated x (rotated here into
+        // fa_attn_out_rot_batch, free until the wo section), IQ4XS/Q2K
+        // consume x_rot_batch (unrotated normed — the preamble skipped
+        // the MQ rotate for fa_has_native_iq layers).
+        let fa_scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wq.k);
+        macro_rules! mixed_fa_weight {
+            ($w:expr, $y:expr) => {{
+                if matches!($w.gpu_dtype, DType::MQ4G256V2) {
+                    rotate_x_mq_batched_for(gpu, &$w, &pbs.x_rot_batch, &fa_scratch, $w.k, n)?;
+                    batched_gemm_single_weight(gpu, &$w, &fa_scratch, $y, n)?;
+                } else {
+                    batched_gemm_single_weight(gpu, &$w, &pbs.x_rot_batch, $y, n)?;
+                }
+            }};
+        }
+        mixed_fa_weight!(layer.wq, &pbs.fa_q_full_batch);
+        mixed_fa_weight!(layer.wk, &pbs.fa_k_batch);
+        mixed_fa_weight!(layer.wv, &pbs.fa_v_batch);
     }
 
     // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
@@ -5631,8 +5737,9 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let fa_ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
-    if fa_ffn_is_mq {
+    let fa_ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let fa_ffn_gate_up_mixed = layer.w_gate.gpu_dtype != layer.w_up.gpu_dtype;
+    if fa_ffn_is_mq && !fa_ffn_gate_up_mixed {
         // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
         fused_rmsnorm_rotate_mq_batched_for(
             gpu,
@@ -5690,7 +5797,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             layer.w_gate.k,
             n,
         )?;
-    } else if fa_ffn_is_q8 || fa_ffn_is_lowbit {
+    } else if (fa_ffn_is_q8 || fa_ffn_is_lowbit) && !fa_ffn_gate_up_mixed {
         run_plain_gemm_key(
             gpu,
             plain_gemm_key_for(layer.w_gate.gpu_dtype),
@@ -5713,6 +5820,23 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             layer.w_up.k,
             n,
         )?;
+    } else if fa_ffn_gate_up_mixed {
+        // GSQ-RCO Stage-1: FA-FFN gate and up differ. Dispatch separately
+        // with per-weight x (MQ4V2 → rotated, IQ4XS/Q2K → unrotated).
+        // fa_attn_out_rot_batch is free here (wo rotation happens later).
+        let fa_ffn_scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.w_gate.k);
+        macro_rules! mixed_ffn_weight {
+            ($w:expr, $y:expr) => {{
+                if matches!($w.gpu_dtype, DType::MQ4G256V2) {
+                    rotate_x_mq_batched_for(gpu, &$w, &pbs.x_rot_batch, &fa_ffn_scratch, $w.k, n)?;
+                    batched_gemm_single_weight(gpu, &$w, &fa_ffn_scratch, $y, n)?;
+                } else {
+                    batched_gemm_single_weight(gpu, &$w, &pbs.x_rot_batch, $y, n)?;
+                }
+            }};
+        }
+        mixed_ffn_weight!(layer.w_gate, &pbs.gate_ffn_batch);
+        mixed_ffn_weight!(layer.w_up, &pbs.up_batch);
     } else if fa_ffn_is_mq3_lloyd {
         run_fused_gate_up_key(
             gpu,
@@ -5794,6 +5918,14 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             hidden_dim,
             n,
         )?;
+    } else if fa_ffn_is_mq && !fa_ffn_gate_up_mixed
+        && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K) {
+        // GSQ-RCO Stage-1: gate/up MQ4V2 (rotated), down IQ4XS/Q2K
+        // (unrotated). FWHT is involutory — rotate once more to un-rotate.
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        // up_batch is dead after silu_mul — reuse it as the un-rotate temp.
+        gpu.rotate_x_mq_batched(&pbs.ffn_hidden_batch, &pbs.up_batch, hidden_dim, n)?;
+        gpu.copy_f32_buffer(&pbs.ffn_hidden_batch, &pbs.up_batch, n * hidden_dim)?;
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
@@ -5919,7 +6051,7 @@ fn batch_chunk_delta_net_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
     // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
     // ParoQ4G128 (each with its own Givens rotation tables);
     // w_alpha/w_beta are F32 (no rotation, no quantization).
@@ -6499,7 +6631,7 @@ fn batch_chunk_delta_net_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let dn_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let dn_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
     let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
     let dn_wo_input = if dn_wo_is_q8 {
@@ -6686,7 +6818,13 @@ fn batch_chunk_full_attn_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    // GSQ-RCO Stage-1 hybrid: a FA layer where ANY of wq/wk/wv is
+    // IQ4_XS/Q2_K (unrotated plain-GEMM) must dispatch per-weight with
+    // matching x — the fused QKV reads all three at one stride.
+    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K)
+        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K)
+        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K);
     // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
     // (each with its own Givens rotation tables). The fused-QKV
     // kernels can't handle this — they assume one shared
@@ -6699,7 +6837,7 @@ fn batch_chunk_full_attn_moe(
     let qkv_same_dtype =
         layer.wk.gpu_dtype == layer.wq.gpu_dtype && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
-    if qkv_is_mq {
+    if qkv_is_mq && !fa_has_native_iq {
         // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
         fused_rmsnorm_rotate_mq_batched_for(
             gpu,
@@ -6903,10 +7041,24 @@ fn batch_chunk_full_attn_moe(
     } else {
         // Mixed-format fallback (issue #249). batched_gemm_single_weight
         // covers MQ4/HFQ4 + MQ6/HFQ6 + Q8_0; mixed-Q8/MQ4 within FAMoe
-        // routes here.
-        batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
-        batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
-        batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+        // routes here. GSQ-RCO Stage-1: IQ4_XS/Q2_K weights consume the
+        // unrotated normed x (x_rot_batch — preamble skipped the MQ rotate
+        // for fa_has_native_iq layers); MQ4V2 weights get FWHT-rotated x
+        // from fa_attn_out_rot_batch (free until the wo section).
+        let fa_scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wq.k);
+        macro_rules! mixed_fa_weight {
+            ($w:expr, $y:expr) => {{
+                if matches!($w.gpu_dtype, DType::MQ4G256V2) {
+                    rotate_x_mq_batched_for(gpu, &$w, &pbs.x_rot_batch, &fa_scratch, $w.k, n)?;
+                    batched_gemm_single_weight(gpu, &$w, &fa_scratch, $y, n)?;
+                } else {
+                    batched_gemm_single_weight(gpu, &$w, &pbs.x_rot_batch, $y, n)?;
+                }
+            }};
+        }
+        mixed_fa_weight!(layer.wq, &pbs.fa_q_full_batch);
+        mixed_fa_weight!(layer.wk, &pbs.fa_k_batch);
+        mixed_fa_weight!(layer.wv, &pbs.fa_v_batch);
     }
     gpu.deinterleave_f32_batched(
         &pbs.fa_q_full_batch,
@@ -7065,7 +7217,7 @@ fn batch_chunk_full_attn_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
     let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
     // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
@@ -8253,12 +8405,57 @@ fn batched_gemm_single_weight(
                 n,
             )
         }
+        DType::Q4K => {
+            // GSQ-RCO native: Q4_K is unrotated (RotationPlan::None) like
+            // Q8_0 — plain batched GEMM over the release's own blocks.
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQ4KBatched,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::IQ4XS => {
+            // GSQ-RCO native: IQ4_XS is unrotated (RotationPlan::None) —
+            // plain batched GEMM over the release's own blocks.
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmIQ4XSBatched,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::Q2K => {
+            // GSQ-RCO native: Q2_K is unrotated (RotationPlan::None) —
+            // plain batched GEMM over the release's own blocks.
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQ2KBatched,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "mixed-format batched prefill: weight dtype {other:?} has no \
              single-weight batched dispatch yet. Currently MQ3/HFQ3, MQ6/5/3/2V2, \
-             MQ4/MQ4V2/MQ4C/HFQ4, MQ6/HFQ6, MQ6/5/3/2V2, and Q8_0 mixes are wired. Re-quantize with \
+             MQ4/MQ4V2/MQ4C/HFQ4, MQ6/HFQ6, MQ6/5/3/2V2, Q8_0, Q4K, IQ4XS, and Q2K mixes are wired. Re-quantize with \
              uniform format or extend `batched_gemm_single_weight` to cover this format."
             ),
         )),
@@ -8708,7 +8905,15 @@ mod tests {
     #[test]
     fn qwen35_is_batchable_la_unsupported_dtypes() {
         for &arch in WMMA_ARCHS {
-            assert!(!is_batchable_la(DType::Q4K, arch), "Q4K must fall back");
+            assert!(is_batchable_la(DType::Q4K, arch), "Q4K routes via GemmQ4KBatched");
+            assert!(
+                is_batchable_la(DType::IQ4XS, arch),
+                "IQ4XS routes via GemmIQ4XSBatched"
+            );
+            assert!(
+                is_batchable_la(DType::Q2K, arch),
+                "Q2K routes via GemmQ2KBatched"
+            );
             assert!(!is_batchable_la(DType::Q6K, arch), "Q6K must fall back");
             assert!(
                 !is_batchable_la(DType::Q4F16G64, arch),

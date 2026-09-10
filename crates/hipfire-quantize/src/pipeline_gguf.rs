@@ -82,6 +82,15 @@ pub(crate) enum GgufFormat {
     Mfp4E8Soa, // mfp4-E8 SoA — same E8 data in structure-of-arrays layout for coalesced GEMV
     Mfp3E8, // mfp3-E8 — mfp4-E8 frame with 3-bit lattice (13 B/blk, 3.25 bpw; drop-in for MQ3-Lloyd cold)
     Mfp2E8, // mfp2-E8 — mfp4-E8 frame with 2-bit lattice (9 B/blk, 2.25 bpw; drop-in for MQ2-Lloyd cold)
+    /// GSQ-RCO native — ISTA-DASLab mixed-precision GGUF passthrough.
+    /// The source already carries per-tensor RCO-chosen precision, so
+    /// 2D matmul tensors in K-quant/I-quant/BF16 carriers pass through
+    /// byte-verbatim (Q4K→qt4, Q2K→host-F32 pending its kernel, I-quants
+    /// and BF16 smalls→host-F32) while only genuinely foreign layouts go
+    /// through the chosen `--format` re-quant. Norms keep their residual
+    /// convention; the DeltaNet V-head interleave applies to every arm.
+    /// Fallback for non-passthrough dtypes under this format is MQ4V2.
+    Gsqrco,
     /// Ternary — PrismML Bonsai family. Source GGUF is already mixed-precision
     /// (Q2_0 ternary matmuls + Q8_0/F16 embeddings + F32/F16 norms); the
     /// per-tensor precision PrismML chose is authoritative, so 2D matmul
@@ -133,6 +142,7 @@ impl GgufFormat {
             "mfp3e8" | "mfp3-e8" => Some(Self::Mfp3E8),
             "mfp2e8" | "mfp2-e8" => Some(Self::Mfp2E8),
             "ternary" | "tq2" | "tq2g128" => Some(Self::Ternary),
+            "gsqrco" | "gsq-rco" | "gsq_rco" => Some(Self::Gsqrco),
             "binary" | "bq1" | "bq1g128" => Some(Self::Binary),
             _ => None,
         }
@@ -166,6 +176,7 @@ impl GgufFormat {
             Self::Mfp3E8 => "MFP3G32E8",
             Self::Mfp2E8 => "MFP2G32E8",
             Self::Ternary => "TQ2G128",
+            Self::Gsqrco => "GSQRCO",
             Self::Binary => "BQ1G128",
         }
     }
@@ -194,6 +205,39 @@ pub(crate) fn convert_binary_tensor(
 ) -> (Vec<u8>, crate::hfq::QuantType, u32) {
     debug_assert_eq!(dtype, gguf_input::GgmlType::Q1_0);
     (src.to_vec(), crate::hfq::QuantType::BQ1G128, 128)
+}
+
+/// GSQ-RCO native passthrough for the Stage-1 hybrid: IQ4_XS (ggml 23,
+/// 136 B/group) and Q2_K (ggml 10, 84 B/group) keep the release's own
+/// blocks verbatim — they have real GEMV + batched-GEMM kernels
+/// (`gemv_iq4_xs`/`gemm_iq4_xs_batched`, `gemv_q2k`/`gemm_q2k_batched`).
+/// Everything else (Q4_K included — Phase 0 proved Q4_K-only native serves
+/// garbage at the matcher gap) returns None and the caller falls through
+/// to the MQ4V2 re-quant arm.
+///
+/// Returns the packed bytes, QuantType, group size, and a label.
+pub(crate) fn gsqrco_native_passthrough(
+    info: &gguf_input::TensorInfo,
+    raw: &[u8],
+    n_elements: usize,
+    k: usize,
+) -> Option<(Vec<u8>, crate::hfq::QuantType, u32, &'static str)> {
+    let (qt, group_bytes, label) = match info.dtype {
+        gguf_input::GgmlType::IQ4XS => (crate::hfq::QuantType::IQ4XS, 136u32, "IQ4_XS (passthrough)"),
+        gguf_input::GgmlType::Q2K => (crate::hfq::QuantType::Q2K, 84u32, "Q2_K (passthrough)"),
+        _ => return None,
+    };
+    let expected = n_elements.div_ceil(256) * group_bytes as usize;
+    if raw.len() != expected || k % 256 != 0 {
+        eprintln!(
+            "{label} size/shape mismatch for {}: got {} bytes (expected {}), K={k}",
+            info.name,
+            raw.len(),
+            expected
+        );
+        std::process::exit(1);
+    }
+    Some((raw.to_vec(), qt, 256u32, label))
 }
 
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
@@ -302,6 +346,7 @@ pub(crate) fn run_gguf_pipeline(
             | GgufFormat::Mfp4E8
             | GgufFormat::Mfp3E8
             | GgufFormat::Mfp2E8
+            | GgufFormat::Gsqrco
     );
     let signs1 = if needs_signs {
         gen_fwht_signs(42, 256)
@@ -654,6 +699,23 @@ pub(crate) fn run_gguf_pipeline(
                     let q = quantize_tq2g128(&f32_data);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128")
                 }
+                GgufFormat::Gsqrco => {
+                    // GSQ-RCO native passthrough: the source IS the quant.
+                    // Stage 1 ships IQ4_XS + Q2_K verbatim (they have real
+                    // GEMV + batched-GEMM kernels); everything else — Q4_K
+                    // included, Phase 0 proved Q4_K-only native serves
+                    // garbage at the matcher gap — re-quantizes to MQ4V2.
+                    // Norms/1D never reach here (F16 arm above).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                        let _ = m;
+                        (pb, pqt, pgs, plbl)
+                    } else {
+                        let q = quantize_hfq4g256(&f32_data);
+                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                    }
+                }
                 GgufFormat::Binary => {
                     // Terminal low-bit format — promotion is a no-op.
                     // Direct BQ1G128 semantics: scale-only binary g128, 18 B/blk (1.14 bpw).
@@ -691,6 +753,19 @@ pub(crate) fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
+                }
+                GgufFormat::Gsqrco => {
+                    // K-map Override arm (lm_head etc.): same Stage-1
+                    // IQ4_XS + Q2_K passthrough, else MQ4V2.
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                        let _ = m;
+                        (pb, pqt, pgs, plbl)
+                    } else {
+                        let q = quantize_hfq4g256(&f32_data);
+                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                    }
                 }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
@@ -792,6 +867,19 @@ pub(crate) fn run_gguf_pipeline(
                     // Terminal low-bit: direct TQ2G128 semantics (plain, no rotation).
                     let q = quantize_tq2g128(&f32_data);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128")
+                }
+                GgufFormat::Gsqrco => {
+                    // Base-level arm (see the Promote6/Override Gsqrco arms
+                    // above for the passthrough logic).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                        let _ = m;
+                        (pb, pqt, pgs, plbl)
+                    } else {
+                        let q = quantize_hfq4g256(&f32_data);
+                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                    }
                 }
                 GgufFormat::Binary => {
                     // Terminal low-bit: direct BQ1G128 semantics (plain, no rotation).
@@ -936,6 +1024,18 @@ pub(crate) fn run_gguf_pipeline(
                     // Direct low-bit: scale-only ternary g128, 34 B per 128 (2.125 bpw).
                     let q = quantize_tq2g128(&f32_data);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128")
+                }
+                GgufFormat::Gsqrco => {
+                    // Base-level arm (same passthrough as Promote6/Override).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                        let _ = m;
+                        (pb, pqt, pgs, plbl)
+                    } else {
+                        let q = quantize_hfq4g256(&f32_data);
+                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                    }
                 }
                 GgufFormat::Binary => {
                     // Direct low-bit: scale-only binary g128, 18 B per 128 (1.14 bpw).
@@ -1141,7 +1241,10 @@ pub(crate) fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{gguf_arch_is_moe_like, gguf_format_is_dense_only_mq_v2, GgufFormat};
+    use super::{
+        gguf_arch_is_moe_like, gguf_format_is_dense_only_mq_v2,
+        maybe_interleave_deltanet_v_heads, GgufFormat,
+    };
 
     #[test]
     fn dense_only_mq_v2_predicate_covers_four_formats() {
@@ -1184,5 +1287,40 @@ mod tests {
                     && gguf_arch_is_moe_like(arch))
             );
         }
+    }
+
+    #[test]
+    fn gsqrco_flag_parses() {
+        assert_eq!(GgufFormat::from_flag("gsqrco"), Some(GgufFormat::Gsqrco));
+        assert_eq!(GgufFormat::from_flag("gsq-rco"), Some(GgufFormat::Gsqrco));
+        assert_eq!(GgufFormat::label(GgufFormat::Gsqrco), "GSQRCO");
+    }
+
+    #[test]
+    fn gsqrco_interleave_dt_bias_order() {
+        // Engine order: escha-head e == gguf-head PERM[e].
+        let mut v: Vec<f32> = (0..48).map(|x| x as f32).collect();
+        let out = maybe_interleave_deltanet_v_heads("model.layers.0.linear_attn.dt_bias", v);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[1], 16.0);
+        assert_eq!(out[2], 32.0);
+        assert_eq!(out[3], 1.0);
+        assert_eq!(out[47], 47.0);
+    }
+
+    #[test]
+    fn gsqrco_alog_domain_is_log_decay() {
+        // Raw decay multipliers (-0.04-ish) become ln(-A) (-3.2-ish).
+        let raw = vec![-0.04064f32; 48];
+        let out = maybe_interleave_deltanet_v_heads("model.layers.0.linear_attn.A_log", raw);
+        let expect = 0.04064f32.ln();
+        assert!((out[0] - expect).abs() < 1e-5, "got {}", out[0]);
+    }
+
+    #[test]
+    fn gsqrco_non_deltanet_names_pass_through() {
+        let v = vec![1.5f32; 100];
+        let out = maybe_interleave_deltanet_v_heads("model.layers.0.mlp.gate_proj.weight", v);
+        assert!(out.iter().all(|&x| x == 1.5));
     }
 }

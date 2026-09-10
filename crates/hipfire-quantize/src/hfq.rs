@@ -235,6 +235,16 @@ pub(crate) enum QuantType {
     /// never indexed. 2.25 bpw. `K % 256 == 0`.
     /// See `docs/design/2026-08-22-maple-preview-20b-a1b.md`.
     MQ2G256LloydU = 51,
+    /// IQ4_XS (qt=42): GGUF-native IQ4_XS passthrough (GSQ-RCO). 136 B per
+    /// 256-element group: `[0..2)` fp16 d, `[2..4)` scales_h u16, `[4..8)`
+    /// scales_l[4], `[8..136)` 128 B nibbles into `kvalues_iq4nl`. Unrotated
+    /// (Plain), K%256==0. Served by `gemv_iq4_xs` / `gemm_iq4_xs_batched`.
+    IQ4XS = 42,
+    /// Q2_K (qt=43): GGUF-native Q2_K passthrough (GSQ-RCO). 84 B per
+    /// 256-element group: `[0..16)` scales[16], `[16..80)` qs[64],
+    /// `[80..82)` fp16 d, `[82..84)` fp16 dmin. Unrotated (Plain),
+    /// K%256==0. Served by `gemv_q2k` / `gemm_q2k_batched`.
+    Q2K = 43,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -288,6 +298,7 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
         GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
         GgufFormat::Ternary => GgufFormat::Ternary,
+        GgufFormat::Gsqrco => GgufFormat::Mq4V2,
         GgufFormat::Binary => GgufFormat::Binary,
     }
 }
