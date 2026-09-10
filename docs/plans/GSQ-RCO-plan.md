@@ -152,6 +152,25 @@ with evidence. Resume from the stash, don't restart.
   file shrinks toward ~12 GB. (Note: IQ3_S is 3.06 bpw vs the HFQ4G256
   fallback's 4.25 — the win here is size + RCO allocation quality, not
   bit-depth; expect a Stage-1-like proportional PPL move, not 8.5.)
+  **Measured (2026-09-10, gfx1151):** `gemv_iq3_s` +
+  `gemm_iq3_s_batched` (110 B/group, 512-entry grid) landed; decode
+  mapping verified EXACT vs the C-verified `dequant_iq3_s` port (0.0
+  max diff, 500 random blocks); GPU parity harness 33/33 PASS. Full
+  Stage-2 hybrid (215 native: +93 IQ3_S incl. 22 in_proj_qkv + 18
+  in_proj_z interleaved, out_proj still falls back) serves coherently
+  (battery 5/5 stop, 0 empty/attractor). PPL **9.97** — only +0.05
+  over Stage-1's 10.02. The RCO allocation puts the 3.06 bpw tier on
+  low-sensitivity tensors, so native IQ3_S ≈ HFQ4G256 re-quant on this
+  slice; the ~8.5 bar is not attainable. **Outlook for Stage 4:** the
+  measured progression (10.38 → 10.02 → 9.97) implies full-native
+  lands ~9.9, NOT within 0.5 of the release row (7.17, different
+  tokenizer — llama-perplexity, 238-id divergence on the slice). The
+  native route's value is SIZE (11.8 GB) + serving the release's own
+  RCO allocation, not a PPL win over the in-engine mq4/mq6 ladder
+  (9.23/9.16). Stage-4 admission should be re-baselined against
+  in-engine formats, not the cross-tokenizer release row. Decode tok/s
+  drops on IQ3_S (9.2 vs 12.3 Stage-1) — grid lookup is the cost;
+  perf tuning is a follow-up.
 - **Stage 3 — tail (IQ3_XXS/IQ2_XS/IQ2_XXS/IQ2_S/IQ1_M/BF16-smalls).**
   Smallest-first; BF16 smalls can stay host-F32 (0.09%, not worth a kernel).
 - **Stage 4 — full-native file + admission.** All-native `.hfq` at
