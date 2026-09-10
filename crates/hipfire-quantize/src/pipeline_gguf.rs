@@ -246,6 +246,7 @@ pub(crate) fn gsqrco_native_passthrough(
     let (qt, group_bytes, label) = match info.dtype {
         gguf_input::GgmlType::IQ4XS => (crate::hfq::QuantType::IQ4XS, 136u32, "IQ4_XS (passthrough)"),
         gguf_input::GgmlType::Q2K => (crate::hfq::QuantType::Q2K, 84u32, "Q2_K (passthrough)"),
+        gguf_input::GgmlType::IQ3S => (crate::hfq::QuantType::IQ3S, 110u32, "IQ3_S (passthrough)"),
         _ => return None,
     };
     let m = info.shape[0] as usize;

@@ -245,6 +245,12 @@ pub(crate) enum QuantType {
     /// `[80..82)` fp16 d, `[82..84)` fp16 dmin. Unrotated (Plain),
     /// K%256==0. Served by `gemv_q2k` / `gemm_q2k_batched`.
     Q2K = 43,
+    /// IQ3_S (qt=46): GGUF-native IQ3_S passthrough (GSQ-RCO). 110 B per
+    /// 256-element group: `[0..2)` fp16 d, `[2..66)` qs[64], `[66..74)`
+    /// qh[8], `[74..106)` signs[32], `[106..110)` scales[4]; 512-entry
+    /// signed-magnitude grid codebook. Unrotated (Plain), K%256==0.
+    /// Served by `gemv_iq3_s` / `gemm_iq3_s_batched`.
+    IQ3S = 46,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.

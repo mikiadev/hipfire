@@ -100,7 +100,7 @@ fn dispatch_batched_gemm_epilogue(
     let is_mq3 = matches!(w.gpu_dtype, DType::MQ3G256);
     let is_fp4 = matches!(w.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
     let is_q8 = matches!(w.gpu_dtype, DType::Q8_0);
-    let is_lowbit = matches!(w.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let is_lowbit = matches!(w.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     match epilogue {
         BatchEpilogue::Residual => {
             if is_6bit {
@@ -1379,6 +1379,7 @@ fn plain_gemm_key_for(dt: DType) -> hipfire_dispatch::types::KernelKey {
         DType::Q4K => K::GemmQ4KBatched,
         DType::IQ4XS => K::GemmIQ4XSBatched,
         DType::Q2K => K::GemmQ2KBatched,
+        DType::IQ3S => K::GemmIQ3SBatched,
         DType::HFQ4G256 => K::GemmHfq4G256,
         _ => K::GemmQ8_0BatchedChunked,
     }
@@ -1417,7 +1418,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // docs/plans/mq-lloyd-batched-prefill-followup.md. Q4K joins via
         // the same unfused plain-GEMM strategy (GemmQ4KBatched) — the
         // unfused matchers below were widened in the same change.
-        | DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K
+        | DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S
         // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
         // on shisa-Qwen3.6-A3B-PARO. Dispatch in the DeltaNetMoe LA matcher
         // routes these through gemm_hfq4g128 (with per-weight Givens
@@ -4325,17 +4326,17 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     // GSQ-RCO Stage-1 hybrid: IQ4_XS/Q2_K are unrotated plain-GEMM dtypes
     // with NO fused qkvza/gate_up/qkv kernel. A layer where ANY of the four
     // LA weights (wqkv/wz/w_beta/w_alpha) is IQ4XS/Q2K must route the WHOLE
     // layer through the mixed-format `batched_gemm_single_weight` fallback —
     // the fused qkvza would read the other dtypes at the wrong stride
     // (e.g. Q2_K 84 B/group as MQ4V2 136 B/group → memory fault / garbage).
-    let la_has_native_iq = matches!(layer.wqkv.gpu_dtype, DType::IQ4XS | DType::Q2K)
-        || matches!(layer.wz.gpu_dtype, DType::IQ4XS | DType::Q2K)
-        || matches!(layer.w_beta.gpu_dtype, DType::IQ4XS | DType::Q2K)
-        || matches!(layer.w_alpha.gpu_dtype, DType::IQ4XS | DType::Q2K);
+    let la_has_native_iq = matches!(layer.wqkv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
+        || matches!(layer.wz.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
+        || matches!(layer.w_beta.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
+        || matches!(layer.w_alpha.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S);
 
     // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
@@ -4999,7 +5000,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     // GSQ-RCO Stage-1 hybrid: gate and up must share a dtype for the fused
     // gate+up kernel. When they differ (e.g. gate=MQ4V2, up=IQ4XS) dispatch
     // each separately with per-weight x.
@@ -5198,7 +5199,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             hidden_dim,
             n,
         )?;
-    } else if ffn_is_mq && !ffn_gate_up_mixed && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K) {
+    } else if ffn_is_mq && !ffn_gate_up_mixed && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S) {
         // GSQ-RCO Stage-1: gate/up are MQ4V2 (FWHT-rotated), down is
         // IQ4XS/Q2K (unrotated). silu(gate)*up is in the ROTATED basis;
         // the unrotated down needs the natural basis. FWHT is involutory,
@@ -5274,13 +5275,13 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     // GSQ-RCO Stage-1 hybrid: a FA layer where ANY of wq/wk/wv is
     // IQ4_XS/Q2_K (unrotated plain-GEMM) must dispatch per-weight with
     // matching x — the fused QKV reads all three at one stride.
-    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K)
-        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K)
-        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K);
+    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
+        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
+        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S);
     // Fused QKV kernels require all three weights to share a
     // dtype — they treat wq/wk/wv as same-stride byte arrays.
     // When kmap mode 2 promotes only `v_proj` (issue #249), the
@@ -5737,7 +5738,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let fa_ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let fa_ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     let fa_ffn_gate_up_mixed = layer.w_gate.gpu_dtype != layer.w_up.gpu_dtype;
     if fa_ffn_is_mq && !fa_ffn_gate_up_mixed {
         // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
@@ -5919,7 +5920,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             n,
         )?;
     } else if fa_ffn_is_mq && !fa_ffn_gate_up_mixed
-        && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K) {
+        && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S) {
         // GSQ-RCO Stage-1: gate/up MQ4V2 (rotated), down IQ4XS/Q2K
         // (unrotated). FWHT is involutory — rotate once more to un-rotate.
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
@@ -6051,7 +6052,7 @@ fn batch_chunk_delta_net_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
     // ParoQ4G128 (each with its own Givens rotation tables);
     // w_alpha/w_beta are F32 (no rotation, no quantization).
@@ -6631,7 +6632,7 @@ fn batch_chunk_delta_net_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let dn_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let dn_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
     let dn_wo_input = if dn_wo_is_q8 {
@@ -6818,13 +6819,13 @@ fn batch_chunk_full_attn_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     // GSQ-RCO Stage-1 hybrid: a FA layer where ANY of wq/wk/wv is
     // IQ4_XS/Q2_K (unrotated plain-GEMM) must dispatch per-weight with
     // matching x — the fused QKV reads all three at one stride.
-    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K)
-        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K)
-        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K);
+    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
+        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
+        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S);
     // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
     // (each with its own Givens rotation tables). The fused-QKV
     // kernels can't handle this — they assume one shared
@@ -7217,7 +7218,7 @@ fn batch_chunk_full_attn_moe(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K);
+    let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S);
     let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
     // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
@@ -8450,6 +8451,21 @@ fn batched_gemm_single_weight(
                 n,
             )
         }
+        DType::IQ3S => {
+            // GSQ-RCO native: IQ3_S is unrotated (RotationPlan::None) —
+            // plain batched GEMM over the release's own blocks.
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmIQ3SBatched,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
@@ -8913,6 +8929,10 @@ mod tests {
             assert!(
                 is_batchable_la(DType::Q2K, arch),
                 "Q2K routes via GemmQ2KBatched"
+            );
+            assert!(
+                is_batchable_la(DType::IQ3S, arch),
+                "IQ3S routes via GemmIQ3SBatched"
             );
             assert!(!is_batchable_la(DType::Q6K, arch), "Q6K must fall back");
             assert!(

@@ -222,6 +222,7 @@ pub enum KernelKey {
     GemvQ4K,
     GemvIQ4XS,
     GemvQ2K,
+    GemvIQ3S,
     GemvQ6K,
     GemvHfq4G256,
     GemvHfq4G128,
@@ -345,6 +346,10 @@ pub enum KernelKey {
     /// with per-batch accumulators. Prefill LA/FA/FFN unfused arms route
     /// Q2K here; decode keeps scalar `GemvQ2K`.
     GemmQ2KBatched,
+    /// Batched IQ3_S GEMM (GSQ-RCO native path): same math as `gemv_iq3_s`
+    /// with per-batch accumulators. Prefill LA/FA/FFN unfused arms route
+    /// IQ3S here; decode keeps scalar `GemvIQ3S`.
+    GemmIQ3SBatched,
     GemmQ8_0Wmma,
     GemmQ8_0Wmma4W,
     GemmHfq4G256Wmma,
@@ -700,6 +705,7 @@ impl KernelKey {
             (Q4K, Plain) => Ok(Self::GemvQ4K),
             (IQ4XS, Plain) => Ok(Self::GemvIQ4XS),
             (Q2K, Plain) => Ok(Self::GemvQ2K),
+            (IQ3S, Plain) => Ok(Self::GemvIQ3S),
             (Q6K, Plain) => Ok(Self::GemvQ6K),
             (HFQ4G256, Plain) => Ok(Self::GemvHfq4G256),
             (HFQ4G128, Plain) => Ok(Self::GemvHfq4G128),
@@ -852,7 +858,7 @@ impl KernelKey {
     pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
         use DType::*;
         match dtype {
-            F32 | F16 | BF16 | Q8_0 | Q4K | IQ4XS | Q2K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            F32 | F16 | BF16 | Q8_0 | Q4K | IQ4XS | Q2K | IQ3S | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
             // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)

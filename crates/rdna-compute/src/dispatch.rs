@@ -295,6 +295,10 @@ pub enum DType {
     /// GSQ-RCO native passthrough — served by `gemv_q2k` / `gemm_q2k_batched`.
     /// Unrotated (Plain), K%256==0.
     Q2K,
+    /// IQ3_S (ggml type 21): 110 B per 256 elements (3.4375 bpw), 512-entry
+    /// signed-magnitude grid codebook. GSQ-RCO native passthrough — served
+    /// by `gemv_iq3_s` / `gemm_iq3_s_batched`. Unrotated (Plain), K%256==0.
+    IQ3S,
     Q6K,      // 210 bytes per 256 elements
     Q8_0,     // 34 bytes per 32 elements
     Q4F16G64, // 36 bytes per 64 elements (RDNA-native FP16 dequant)
@@ -409,6 +413,7 @@ impl DType {
             DType::Q4K
             | DType::IQ4XS
             | DType::Q2K
+            | DType::IQ3S
             | DType::Q6K
             | DType::Q8_0
             | DType::Q4F16G64
@@ -570,6 +575,7 @@ impl DType {
                 | DType::MQ2G256V2
                 | DType::IQ4XS
                 | DType::Q2K
+                | DType::IQ3S
         )
     }
 }

@@ -485,6 +485,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
         K::GemvIQ4XS => hip!(gpu.gemv_iq4_xs(w.buf, x, y, m, k)),
         K::GemvQ2K => hip!(gpu.gemv_q2k(w.buf, x, y, m, k)),
+        K::GemvIQ3S => hip!(gpu.gemv_iq3_s(w.buf, x, y, m, k)),
         K::GemvQ6K => hip!(gpu.gemv_q6k(w.buf, x, y, m, k)),
         K::GemvHfq4G256 => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
         K::GemvHfq4G128 | K::GemvParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
