@@ -215,32 +215,40 @@ pub(crate) fn convert_binary_tensor(
 /// garbage at the matcher gap) returns None and the caller falls through
 /// to the MQ4V2 re-quant arm.
 ///
-/// Returns the packed bytes, QuantType, group size, and a label.
+/// DeltaNet V-head interleave on the PACKED path: the f32 arm
+/// (`maybe_interleave_deltanet_v_heads`) permutes V-head-major tensors
+/// from GGUF sequential order into the engine's interleaved order
+/// (escha-head j == gguf-head PERM[j]). The passthrough arm must apply
+/// the SAME permutation to the raw blocks or a layer mixes interleaved
+/// `in_proj_a/b`/`A_log`/`dt_bias` (f32 fallback) with GGUF-order
+/// `in_proj_qkv`/`in_proj_z` (passthrough) and the recurrence gates the
+/// wrong V-heads (near-zero output). Falsified 2026-09-10: excluding the
+/// three V-head-major roles from passthrough restores coherent serve.
 ///
-/// `HIPFIRE_GSQRCO_SKIP_VHEADS=1` is a one-off falsification knob: skip
-/// passthrough for the three DeltaNet V-head-major roles (in_proj_qkv,
-/// in_proj_z, out_proj) so they fall through to the interleaved-f32
-/// HFQ4G256 re-quant. If the resulting hybrid serves coherently while the
-/// full passthrough does not, the missing V-head interleave on the packed
-/// path is confirmed as the root cause. Not a product path.
+/// Granularity:
+/// - `in_proj_qkv.weight` [10240,K]: permute 128-row blocks in rows
+///   [4096,10240) — a chunk move (each 128-row block is contiguous).
+/// - `in_proj_z.weight` [6144,K]: permute 48 blocks of 128 rows.
+/// - `out_proj.weight` [dim,6144]: the 128-col V blocks sit HALF INSIDE
+///   each 256-element group (sub-group granularity), so a packed
+///   interleave is not a chunk move. Return None and let the caller fall
+///   back to the interleaved-f32 HFQ4G256 re-quant (identical size at
+///   ~4.1 bpw; packed half-group interleave is a follow-up).
+///
+/// Returns the packed bytes, QuantType, group size, and a label.
 pub(crate) fn gsqrco_native_passthrough(
     info: &gguf_input::TensorInfo,
+    out_name: &str,
     raw: &[u8],
     n_elements: usize,
     k: usize,
 ) -> Option<(Vec<u8>, crate::hfq::QuantType, u32, &'static str)> {
-    if std::env::var("HIPFIRE_GSQRCO_SKIP_VHEADS").as_deref() == Ok("1")
-        && (info.name.ends_with("attn_qkv.weight")
-            || info.name.ends_with("attn_gate.weight")
-            || info.name.ends_with("ssm_out.weight"))
-    {
-        return None;
-    }
     let (qt, group_bytes, label) = match info.dtype {
         gguf_input::GgmlType::IQ4XS => (crate::hfq::QuantType::IQ4XS, 136u32, "IQ4_XS (passthrough)"),
         gguf_input::GgmlType::Q2K => (crate::hfq::QuantType::Q2K, 84u32, "Q2_K (passthrough)"),
         _ => return None,
     };
+    let m = info.shape[0] as usize;
     let expected = n_elements.div_ceil(256) * group_bytes as usize;
     if raw.len() != expected || k % 256 != 0 {
         eprintln!(
@@ -251,7 +259,68 @@ pub(crate) fn gsqrco_native_passthrough(
         );
         std::process::exit(1);
     }
+    // V-head-major roles: apply the packed interleave, or refuse passthrough
+    // when the permutation is not a chunk move (out_proj).
+    if out_name.ends_with("linear_attn.in_proj_qkv.weight") {
+        // [10240,K]: V rows [4096,10240) in 48 groups of 128 rows.
+        let row_bytes = (k / 256) * group_bytes as usize;
+        if m != 10240 {
+            std::process::exit(1);
+        }
+        return Some((
+            interleave_packed_row_blocks(raw.to_vec(), row_bytes, 4096, 48, 128),
+            qt,
+            256u32,
+            label,
+        ));
+    }
+    if out_name.ends_with("linear_attn.in_proj_z.weight") {
+        // [6144,K]: 48 groups of 128 rows spanning the whole M.
+        let row_bytes = (k / 256) * group_bytes as usize;
+        if m != 6144 {
+            std::process::exit(1);
+        }
+        return Some((
+            interleave_packed_row_blocks(raw.to_vec(), row_bytes, 0, 48, 128),
+            qt,
+            256u32,
+            label,
+        ));
+    }
+    if out_name.ends_with("linear_attn.out_proj.weight") {
+        // 128-col V blocks are half-groups; not a chunk move. Fall through
+        // to the interleaved-f32 HFQ4G256 re-quant (same size, correct).
+        return None;
+    }
     Some((raw.to_vec(), qt, 256u32, label))
+}
+
+/// DeltaNet V-head interleave for a packed row-major weight: permute
+/// `n_blocks` blocks of `block_rows` rows starting at `src_start_row`,
+/// engine position `e` ← GGUF position `PERM[e]` (same mapping as the f32
+/// `maybe_interleave_deltanet_v_heads`). Each block is a contiguous chunk
+/// of `block_rows * row_bytes` bytes.
+fn interleave_packed_row_blocks(
+    data: Vec<u8>,
+    row_bytes: usize,
+    src_start_row: usize,
+    n_blocks: usize,
+    block_rows: usize,
+) -> Vec<u8> {
+    const PERM: [usize; 48] = [
+        0, 16, 32, 1, 17, 33, 2, 18, 34, 3, 19, 35, 4, 20, 36, 5, 21, 37, 6, 22, 38, 7, 23, 39,
+        8, 24, 40, 9, 25, 41, 10, 26, 42, 11, 27, 43, 12, 28, 44, 13, 29, 45, 14, 30, 46, 15,
+        31, 47,
+    ];
+    let block_bytes = block_rows * row_bytes;
+    let mut out = data.clone();
+    for e in 0..n_blocks {
+        let g = PERM[e];
+        let dst = (src_start_row + e * block_rows) * row_bytes;
+        let src = (src_start_row + g * block_rows) * row_bytes;
+        out[dst..dst + block_bytes].copy_from_slice(&data[src..src + block_bytes]);
+    }
+    out
 }
 
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
@@ -722,7 +791,7 @@ pub(crate) fn run_gguf_pipeline(
                     // Norms/1D never reach here (F16 arm above).
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &out_name, &raw, n_elements, k) {
                         let _ = m;
                         (pb, pqt, pgs, plbl)
                     } else {
@@ -773,7 +842,7 @@ pub(crate) fn run_gguf_pipeline(
                     // IQ4_XS + Q2_K passthrough, else MQ4V2.
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &out_name, &raw, n_elements, k) {
                         let _ = m;
                         (pb, pqt, pgs, plbl)
                     } else {
@@ -887,7 +956,7 @@ pub(crate) fn run_gguf_pipeline(
                     // above for the passthrough logic).
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &out_name, &raw, n_elements, k) {
                         let _ = m;
                         (pb, pqt, pgs, plbl)
                     } else {
@@ -1043,7 +1112,7 @@ pub(crate) fn run_gguf_pipeline(
                     // Base-level arm (same passthrough as Promote6/Override).
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &raw, n_elements, k) {
+                    if let Some((pb, pqt, pgs, plbl)) = gsqrco_native_passthrough(&info, &out_name, &raw, n_elements, k) {
                         let _ = m;
                         (pb, pqt, pgs, plbl)
                     } else {
