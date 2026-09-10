@@ -130,9 +130,28 @@ with evidence. Resume from the stash, don't restart.
   `gguf_iq.rs`, then serve-harness + PPL delta on a hybrid file where
   only these two dtypes go native. Success bar: hybrid PPL moves
   10.32 → ~9.6 (half the gap, proportional to share).
+  **Measured (2026-09-10, gfx1151):** hybrid PPL **10.02** (vs
+  all-HFQ4G256 same-pipeline baseline 10.38, vs v5 bridge 10.32) —
+  +0.36 for 23.9% native, right at the proportional-to-share line
+  (~0.26 expected). Serve coherent (battery 4/5 stop + 1 length-capped
+  code, 0 empty/attractor). Bar partially met: the ~9.6 target
+  over-estimated per-tensor gain; native replaces 4.06–2.06 bpw RCO
+  choices, not a uniform-4.25 upgrade, so the win is the RCO allocation
+  quality, not bit-depth.
+  **Root-cause fix landed:** the Stage-1 hybrid served garbage because
+  the packed passthrough skipped the DeltaNet V-head interleave the f32
+  arm applies (qkv/z kept GGUF order while alpha/beta were interleaved →
+  recurrence gated wrong heads). Falsified via
+  `HIPFIRE_GSQRCO_SKIP_VHEADS=1` (436ec6c3c), fixed with a packed
+  128-row block interleave for `in_proj_qkv`/`in_proj_z`; `out_proj`
+  (128-col half-group, not a chunk move) falls back to interleaved-f32
+  HFQ4G256 (34b4ae862). Follow-up if wanted: packed half-group
+  interleave for native `out_proj`.
 - **Stage 2 — IQ3_S (31%, the file's backbone).** Same pattern; grid
   decode is already C-verified in-tree. Success bar: hybrid → ~8.5,
-  file shrinks toward ~12 GB.
+  file shrinks toward ~12 GB. (Note: IQ3_S is 3.06 bpw vs the HFQ4G256
+  fallback's 4.25 — the win here is size + RCO allocation quality, not
+  bit-depth; expect a Stage-1-like proportional PPL move, not 8.5.)
 - **Stage 3 — tail (IQ3_XXS/IQ2_XS/IQ2_XXS/IQ2_S/IQ1_M/BF16-smalls).**
   Smallest-first; BF16 smalls can stay host-F32 (0.09%, not worth a kernel).
 - **Stage 4 — full-native file + admission.** All-native `.hfq` at
