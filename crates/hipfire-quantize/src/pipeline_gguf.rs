@@ -216,12 +216,26 @@ pub(crate) fn convert_binary_tensor(
 /// to the MQ4V2 re-quant arm.
 ///
 /// Returns the packed bytes, QuantType, group size, and a label.
+///
+/// `HIPFIRE_GSQRCO_SKIP_VHEADS=1` is a one-off falsification knob: skip
+/// passthrough for the three DeltaNet V-head-major roles (in_proj_qkv,
+/// in_proj_z, out_proj) so they fall through to the interleaved-f32
+/// HFQ4G256 re-quant. If the resulting hybrid serves coherently while the
+/// full passthrough does not, the missing V-head interleave on the packed
+/// path is confirmed as the root cause. Not a product path.
 pub(crate) fn gsqrco_native_passthrough(
     info: &gguf_input::TensorInfo,
     raw: &[u8],
     n_elements: usize,
     k: usize,
 ) -> Option<(Vec<u8>, crate::hfq::QuantType, u32, &'static str)> {
+    if std::env::var("HIPFIRE_GSQRCO_SKIP_VHEADS").as_deref() == Ok("1")
+        && (info.name.ends_with("attn_qkv.weight")
+            || info.name.ends_with("attn_gate.weight")
+            || info.name.ends_with("ssm_out.weight"))
+    {
+        return None;
+    }
     let (qt, group_bytes, label) = match info.dtype {
         gguf_input::GgmlType::IQ4XS => (crate::hfq::QuantType::IQ4XS, 136u32, "IQ4_XS (passthrough)"),
         gguf_input::GgmlType::Q2K => (crate::hfq::QuantType::Q2K, 84u32, "Q2_K (passthrough)"),
