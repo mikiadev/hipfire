@@ -414,6 +414,9 @@ impl GemmFamily {
             K::GemmIQ3XXSBatched => {
                 hip!(gpu.gemm_iq3_xxs_batched(w.buf, x, y, m, k, batch_size))
             }
+            K::GemmIQ2SBatched => {
+                hip!(gpu.gemm_iq2_s_batched(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmTQ2G128Prefill => {
                 hip!(gpu.gemm_tq2g128_prefill(w.buf, x, y, m, k, batch_size))

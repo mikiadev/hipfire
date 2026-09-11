@@ -256,6 +256,8 @@ pub(crate) fn gsqrco_native_passthrough(
         // IQ3_XXS (ggml 18, 98 B/256, 3.0625 bpw): 18% of params, the
         // biggest remaining tail dtype.
         gguf_input::GgmlType::IQ3XXS => (crate::hfq::QuantType::IQ3XXS, 98u32, "IQ3_XXS (passthrough)"),
+        // IQ2_S (ggml 22, 82 B/256, 2.5625 bpw): 7% of params.
+        gguf_input::GgmlType::IQ2S => (crate::hfq::QuantType::IQ2S, 82u32, "IQ2_S (passthrough)"),
         _ => return None,
     };
     let m = info.shape[0] as usize;
