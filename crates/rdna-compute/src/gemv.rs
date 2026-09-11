@@ -362,6 +362,50 @@ impl Gpu {
         }
     }
 
+    /// y += A_q4k * x (fused residual, GSQ-RCO perf item 1). Same decode math as gemv_q4k with `y[row] += sum`.
+    pub fn gemv_q4k_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_q4k_residual",
+            kernels::GEMV_Q4K_RESIDUAL_SRC,
+            "gemv_q4k_residual",
+        )?;
+        let func = &self.functions["gemv_q4k_residual"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 32u32; // single warp — no shared memory needed
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// y = A_iq4xs * x (quantized matrix-vector multiply, A stored as IQ4_XS on GPU)
     /// a_raw: raw IQ4_XS bytes on GPU, x: F32 input, y: F32 output
     /// m: number of output rows, k: number of input columns (must be multiple of 256)
@@ -376,6 +420,50 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel("gemv_iq4_xs", kernels::GEMV_IQ4_XS_SRC, "gemv_iq4_xs")?;
         let func = &self.functions["gemv_iq4_xs"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 32u32; // single warp — no shared memory needed
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// y += A_iq4xs * x (fused residual, GSQ-RCO perf item 1). Same decode math as gemv_iq4_xs with `y[row] += sum`.
+    pub fn gemv_iq4_xs_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq4_xs_residual",
+            kernels::GEMV_IQ4XS_RESIDUAL_SRC,
+            "gemv_iq4_xs_residual",
+        )?;
+        let func = &self.functions["gemv_iq4_xs_residual"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -488,6 +576,52 @@ impl Gpu {
         }
     }
 
+    /// y += A_iq3s * x (fused residual, GSQ-RCO perf item 1). Same decode
+    /// math as gemv_iq3_s with `y[row] += sum` — one launch replaces the
+    /// un-fused plain-GEMV + add_inplace pair for out_proj / FA o_proj.
+    pub fn gemv_iq3_s_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq3_s_residual",
+            kernels::GEMV_IQ3S_RESIDUAL_SRC,
+            "gemv_iq3_s_residual",
+        )?;
+        let func = &self.functions["gemv_iq3_s_residual"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 32u32; // single warp — no shared memory needed
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// y = A_iq3xxs * x (quantized matrix-vector multiply, A stored as IQ3_XXS on GPU)
     /// a_raw: raw IQ3_XXS bytes on GPU, x: F32 input, y: F32 output
     /// m: number of output rows, k: number of input columns (must be multiple of 256)
@@ -502,6 +636,50 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel("gemv_iq3_xxs", kernels::GEMV_IQ3XXS_SRC, "gemv_iq3_xxs")?;
         let func = &self.functions["gemv_iq3_xxs"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 32u32; // single warp — no shared memory needed
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// y += A_iq3xxs * x (fused residual, GSQ-RCO perf item 1). Same decode math as gemv_iq3_xxs with `y[row] += sum`.
+    pub fn gemv_iq3_xxs_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq3_xxs_residual",
+            kernels::GEMV_IQ3XXS_RESIDUAL_SRC,
+            "gemv_iq3_xxs_residual",
+        )?;
+        let func = &self.functions["gemv_iq3_xxs_residual"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();

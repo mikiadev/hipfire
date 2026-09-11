@@ -560,6 +560,13 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         HFQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         HFQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
         HFQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
+        // GSQ-RCO native I-quant fused-residual GEMVs (perf item 1): y += W·x
+        // in one launch for out_proj / FA o_proj (unrotated, GGUF-ordered x
+        // supplied by the caller — the RESID_WO handler un-permutes first).
+        IQ3S => hip!(gpu.gemv_iq3_s_residual(w.buf, x, y, m, k)),
+        IQ4XS => hip!(gpu.gemv_iq4_xs_residual(w.buf, x, y, m, k)),
+        Q4K => hip!(gpu.gemv_q4k_residual(w.buf, x, y, m, k)),
+        IQ3XXS => hip!(gpu.gemv_iq3_xxs_residual(w.buf, x, y, m, k)),
         // MQ-family WithResidual requires caller-supplied pre-rotated x
         // (same contract as Prerotated) — dispatch through HFQ residual kernel.
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),

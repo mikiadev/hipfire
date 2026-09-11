@@ -4849,6 +4849,23 @@ pub const GEMM_Q2K_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q
 /// release's IQ3_S projections through this scalar kernel.
 pub const GEMV_IQ3S_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_s.hip");
 
+/// IQ3_S fused-residual GEMV (GSQ-RCO perf item 1): same decode math as
+/// gemv_iq3_s with `y[row] += sum` epilogue — one launch replaces the
+/// un-fused plain-GEMV + add_inplace pair for out_proj / FA o_proj.
+pub const GEMV_IQ3S_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq3_s_residual.hip");
+
+/// IQ4_XS fused-residual GEMV (GSQ-RCO perf item 1). See GEMV_IQ3S_RESIDUAL_SRC.
+pub const GEMV_IQ4XS_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq4_xs_residual.hip");
+
+/// Q4_K fused-residual GEMV (GSQ-RCO perf item 1). See GEMV_IQ3S_RESIDUAL_SRC.
+pub const GEMV_Q4K_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_q4k_residual.hip");
+
+/// IQ3_XXS fused-residual GEMV (GSQ-RCO perf item 1). See GEMV_IQ3S_RESIDUAL_SRC.
+pub const GEMV_IQ3XXS_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq3_xxs_residual.hip");
+
 /// Batched IQ3_S GEMM (GSQ-RCO native path). Same per-row math as
 /// gemv_iq3_s (110 B groups, identical FMA order for greedy parity) with
 /// per-batch register accumulators. Prefill LA/FA/FFN matchers route IQ3S

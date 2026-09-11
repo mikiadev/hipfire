@@ -295,6 +295,12 @@ pub enum KernelKey {
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
     GemvMq4G256LloydResidual,
+    // GSQ-RCO native I-quant fused-residual GEMVs (perf item 1): y += W·x
+    // in one launch for the out_proj / FA o_proj dtypes.
+    GemvIQ3SResidual,
+    GemvIQ4XSResidual,
+    GemvQ4KResidual,
+    GemvIQ3XXSResidual,
     // GEMV SwiGLU + residual
     GemvHfq4G256SwiGLUResidual,
     GemvHfq3G256SwiGLUResidual,
@@ -838,6 +844,13 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
+            // GSQ-RCO native I-quant fused-residual GEMVs (perf item 1).
+            // Unrotated (RotationPlan::None) — the steps.rs fused path
+            // dispatches them via GemvVariant::WithResidual directly.
+            IQ3S => Ok(Self::GemvIQ3SResidual),
+            IQ4XS => Ok(Self::GemvIQ4XSResidual),
+            Q4K => Ok(Self::GemvQ4KResidual),
+            IQ3XXS => Ok(Self::GemvIQ3XXSResidual),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",

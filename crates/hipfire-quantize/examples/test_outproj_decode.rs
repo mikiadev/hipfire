@@ -157,4 +157,37 @@ fn main() {
         println!("FAIL: decode-path out_proj GEMV diverges");
         std::process::exit(1);
     }
+
+    // Fused-residual parity (perf item 1): gemv_iq4_xs_residual with a
+    // nonzero residual must equal CPU (W·x + residual) exactly.
+    let residual: Vec<f32> = (0..m).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
+    let res_t = gpu.upload_f32(&residual, &[m]).unwrap();
+    let d_y2 = gpu.alloc_tensor(&[m], rdna_compute::DType::F32).unwrap();
+    gpu.hip
+        .memcpy_dtod(&d_y2.buf, &res_t.buf, m * 4)
+        .expect("copy residual");
+    gpu.gemv_iq4_xs_residual(&d_raw, &d_xg, &d_y2, m, k).unwrap();
+    let y_res = gpu.download_f32(&d_y2).unwrap();
+    let mut max_abs_r = 0.0f32;
+    let mut bad_r = 0usize;
+    for i in 0..m {
+        let want = y_ref[i] + residual[i];
+        let e = (y_res[i] - want).abs();
+        if e > max_abs_r {
+            max_abs_r = e;
+        }
+        if e > 1e-3 {
+            bad_r += 1;
+            if bad_r <= 5 {
+                eprintln!("  res row {i}: gpu={:.6} want={:.6} err={:.6}", y_res[i], want, e);
+            }
+        }
+    }
+    eprintln!("gemv_iq4_xs_residual + unpermute: max_abs_err={max_abs_r:.8} bad={bad_r}/{m}");
+    if max_abs_r < 1e-3 {
+        println!("PASS: fused-residual out_proj GEMV matches CPU (W·x + residual)");
+    } else {
+        println!("FAIL: fused-residual out_proj GEMV diverges");
+        std::process::exit(1);
+    }
 }
