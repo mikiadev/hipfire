@@ -307,6 +307,14 @@ pub enum DType {
     /// u64 grid. GSQ-RCO native passthrough — served by `gemv_iq2_s` /
     /// `gemm_iq2_s_batched`. Unrotated (Plain), K%256==0.
     IQ2S,
+    /// IQ2_XS (ggml type 17): 74 B per 256 elements (2.3125 bpw), 512-entry
+    /// u64 grid. GSQ-RCO native passthrough — served by `gemv_iq2_xs` /
+    /// `gemm_iq2_xs_batched`. Unrotated (Plain), K%256==0.
+    IQ2XS,
+    /// IQ2_XXS (ggml type 16): 66 B per 256 elements (2.0625 bpw), 256-entry
+    /// u64 grid. GSQ-RCO native passthrough — served by `gemv_iq2_xxs` /
+    /// `gemm_iq2_xxs_batched`. Unrotated (Plain), K%256==0.
+    IQ2XXS,
     Q6K,      // 210 bytes per 256 elements
     Q8_0,     // 34 bytes per 32 elements
     Q4F16G64, // 36 bytes per 64 elements (RDNA-native FP16 dequant)
@@ -424,6 +432,8 @@ impl DType {
             | DType::IQ3S
             | DType::IQ3XXS
             | DType::IQ2S
+            | DType::IQ2XS
+            | DType::IQ2XXS
             | DType::Q6K
             | DType::Q8_0
             | DType::Q4F16G64
@@ -588,6 +598,8 @@ impl DType {
                 | DType::IQ3S
                 | DType::IQ3XXS
                 | DType::IQ2S
+                | DType::IQ2XS
+                | DType::IQ2XXS
         )
     }
 }

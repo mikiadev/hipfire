@@ -29,6 +29,8 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::IQ3S,
         DType::IQ3XXS,
         DType::IQ2S,
+        DType::IQ2XS,
+        DType::IQ2XXS,
         DType::Q6K,
         DType::HFQ4G256,
         DType::HFQ4G128,

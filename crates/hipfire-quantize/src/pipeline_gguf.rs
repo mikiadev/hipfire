@@ -258,6 +258,12 @@ pub(crate) fn gsqrco_native_passthrough(
         gguf_input::GgmlType::IQ3XXS => (crate::hfq::QuantType::IQ3XXS, 98u32, "IQ3_XXS (passthrough)"),
         // IQ2_S (ggml 22, 82 B/256, 2.5625 bpw): 7% of params.
         gguf_input::GgmlType::IQ2S => (crate::hfq::QuantType::IQ2S, 82u32, "IQ2_S (passthrough)"),
+        // IQ2_XS (ggml 17, 74 B/256) + IQ2_XXS (ggml 16, 66 B/256): kernels
+        // are verified-correct and wired, but NOT passed through — the
+        // 2.06-2.31 bpw weights destabilize the DeltaNet decode recurrence
+        // (first-decode hidden state grows ~2.8x vs the HFQ4G256 fallback,
+        // producing \n/\r\n attractors) despite identical prefill PPL.
+        // Re-enable when the decode recurrence stability is addressed.
         _ => return None,
     };
     let m = info.shape[0] as usize;

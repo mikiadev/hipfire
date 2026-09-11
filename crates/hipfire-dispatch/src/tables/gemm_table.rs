@@ -114,6 +114,24 @@ pub fn populate(registry: &mut KernelRegistry) {
         tile: TileImpl::None,
     });
     registry.register(KernelVariant {
+        // Batched IQ2_XS GEMM (GSQ-RCO native): 74 B/group, 512-entry grid.
+        key: KernelKey::GemmIQ2XSBatched,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        // Batched IQ2_XXS GEMM (GSQ-RCO native): 66 B/group, 256-entry grid.
+        key: KernelKey::GemmIQ2XXSBatched,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0Wmma,
         arch_required: ArchPredicate::HasWmma,
         shape_gate: None,

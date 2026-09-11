@@ -22460,6 +22460,144 @@ impl Gpu {
         Ok(())
     }
 
+
+    /// Batched IQ2_XS GEMM (GSQ-RCO native path). Same per-row math as
+    /// the scalar with per-batch register accumulators (MAX_BATCH=64).
+    pub fn gemm_iq2_xs_batched(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            k > 0 && k % 256 == 0,
+            "gemm_iq2_xs_batched: K must be a positive multiple of 256"
+        );
+        const MAX_BATCH: usize = 64;
+        let mut off = 0;
+        while off < batch_size {
+            let take = (batch_size - off).min(MAX_BATCH);
+            let x_sub = x.sub_offset(off * k, take * k);
+            let y_sub = y.sub_offset(off * m, take * m);
+            self.ensure_kernel(
+                "gemm_iq2_xs_batched",
+                kernels::GEMM_IQ2XS_BATCHED_SRC,
+                "gemm_iq2_xs_batched",
+            )?;
+            let mut a_ptr = a_raw.buf.as_ptr();
+            let mut x_ptr = x_sub.buf.as_ptr();
+            let mut y_ptr = y_sub.buf.as_ptr();
+            let mut m_val = m as i32;
+            let mut k_val = k as i32;
+            let mut bs_val = take as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut x_ptr as *mut _ as *mut c_void,
+                &mut y_ptr as *mut _ as *mut c_void,
+                &mut m_val as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut bs_val as *mut _ as *mut c_void,
+            ];
+            let bytes = m.saturating_mul(k) / 256 * 74 + take.saturating_mul(k) * 4;
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_iq2_xs_batched", bytes);
+            let result = self.launch_maybe_blob(
+                "gemm_iq2_xs_batched",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(bs_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            result?;
+            off += take;
+        }
+        Ok(())
+    }
+
+    /// Batched IQ2_XXS GEMM (GSQ-RCO native path). Same per-row math as
+    /// the scalar with per-batch register accumulators (MAX_BATCH=64).
+    pub fn gemm_iq2_xxs_batched(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            k > 0 && k % 256 == 0,
+            "gemm_iq2_xxs_batched: K must be a positive multiple of 256"
+        );
+        const MAX_BATCH: usize = 64;
+        let mut off = 0;
+        while off < batch_size {
+            let take = (batch_size - off).min(MAX_BATCH);
+            let x_sub = x.sub_offset(off * k, take * k);
+            let y_sub = y.sub_offset(off * m, take * m);
+            self.ensure_kernel(
+                "gemm_iq2_xxs_batched",
+                kernels::GEMM_IQ2XXS_BATCHED_SRC,
+                "gemm_iq2_xxs_batched",
+            )?;
+            let mut a_ptr = a_raw.buf.as_ptr();
+            let mut x_ptr = x_sub.buf.as_ptr();
+            let mut y_ptr = y_sub.buf.as_ptr();
+            let mut m_val = m as i32;
+            let mut k_val = k as i32;
+            let mut bs_val = take as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut x_ptr as *mut _ as *mut c_void,
+                &mut y_ptr as *mut _ as *mut c_void,
+                &mut m_val as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut bs_val as *mut _ as *mut c_void,
+            ];
+            let bytes = m.saturating_mul(k) / 256 * 66 + take.saturating_mul(k) * 4;
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_iq2_xxs_batched", bytes);
+            let result = self.launch_maybe_blob(
+                "gemm_iq2_xxs_batched",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(bs_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            result?;
+            off += take;
+        }
+        Ok(())
+    }
     /// `gemv_q8_0_wide`. Sub-batching bounds VGPR use while sharing weights.
     pub fn gemm_q8_0_batched_wide_exact(
         &mut self,
