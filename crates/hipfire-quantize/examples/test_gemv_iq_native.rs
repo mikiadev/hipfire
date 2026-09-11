@@ -273,6 +273,55 @@ fn ref_dequant_iq3_s(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+
+/// Port of `gguf_input.rs::dequant_q4_k` (144 B per 256, ggml type 12).
+fn ref_dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
+    let block_size = 256;
+    let block_bytes = 144;
+    let nblocks = (n + block_size - 1) / block_size;
+    let mut out = vec![0.0f32; n];
+    for b in 0..nblocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
+        let sc_data = &data[off + 4..off + 16];
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        for i in 0..4 {
+            scales[i] = sc_data[i] & 63;
+            mins[i] = sc_data[4 + i] & 63;
+        }
+        for i in 0..4 {
+            scales[4 + i] = (sc_data[8 + i] & 0xF) | ((sc_data[i] >> 6) << 4);
+            mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
+        }
+        let qdata = &data[off + 16..off + 16 + 128];
+        for group in 0..4 {
+            let sb_even = group * 2;
+            let sb_odd = group * 2 + 1;
+            let sc_even = d * scales[sb_even] as f32;
+            let m_even = dmin * mins[sb_even] as f32;
+            let sc_odd = d * scales[sb_odd] as f32;
+            let m_odd = dmin * mins[sb_odd] as f32;
+            for l in 0..32 {
+                let byte = qdata[group * 32 + l];
+                let idx_even = b * block_size + group * 64 + l;
+                let idx_odd = idx_even + 32;
+                if idx_even < n {
+                    out[idx_even] = (byte & 0x0F) as f32 * sc_even - m_even;
+                }
+                if idx_odd < n {
+                    out[idx_odd] = ((byte >> 4) & 0x0F) as f32 * sc_odd - m_odd;
+                }
+            }
+        }
+    }
+    out
+}
+
 // ── Harness ────────────────────────────────────────────────────────────
 
 fn main() {
@@ -331,6 +380,7 @@ fn main() {
                 GgmlType::IQ4XS => gpu.gemv_iq4_xs(&d_raw, &d_x, &d_y, m, k).unwrap(),
                 GgmlType::Q2K => gpu.gemv_q2k(&d_raw, &d_x, &d_y, m, k).unwrap(),
                 GgmlType::IQ3S => gpu.gemv_iq3_s(&d_raw, &d_x, &d_y, m, k).unwrap(),
+                GgmlType::Q4K => gpu.gemv_q4k(&d_raw, &d_x, &d_y, m, k).unwrap(),
                 _ => panic!("unreachable"),
             }
             let y_gpu = gpu.download_f32(&d_y).unwrap();
@@ -375,6 +425,9 @@ fn main() {
                 GgmlType::IQ3S => {
                     gpu.gemm_iq3_s_batched(&d_raw, &d_xb, &d_yb, m, k, batch).unwrap()
                 }
+                GgmlType::Q4K => {
+                    gpu.gemm_q4k_batched(&d_raw, &d_xb, &d_yb, m, k, batch).unwrap()
+                }
                 _ => panic!("unreachable"),
             }
             // Sub-view test: allocate a padded x buffer, pass a sub_offset view.
@@ -397,6 +450,9 @@ fn main() {
                     }
                     GgmlType::IQ3S => {
                         gpu.gemm_iq3_s_batched(&d_raw, &view, &d_yv, m, k, batch).unwrap()
+                    }
+                    GgmlType::Q4K => {
+                        gpu.gemm_q4k_batched(&d_raw, &view, &d_yv, m, k, batch).unwrap()
                     }
                     _ => panic!("unreachable"),
                 }
@@ -452,6 +508,7 @@ fn main() {
     run_case!("IQ4_XS", GgmlType::IQ4XS, |d, n| ref_dequant_iq4_xs(d, n));
     run_case!("Q2_K", GgmlType::Q2K, |d, n| ref_dequant_q2_k(d, n));
     run_case!("IQ3_S", GgmlType::IQ3S, |d, n| ref_dequant_iq3_s(d, n));
+    run_case!("Q4_K", GgmlType::Q4K, |d, n| ref_dequant_q4_k(d, n));
 
 
 

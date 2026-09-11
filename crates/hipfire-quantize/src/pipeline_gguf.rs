@@ -247,6 +247,12 @@ pub(crate) fn gsqrco_native_passthrough(
         gguf_input::GgmlType::IQ4XS => (crate::hfq::QuantType::IQ4XS, 136u32, "IQ4_XS (passthrough)"),
         gguf_input::GgmlType::Q2K => (crate::hfq::QuantType::Q2K, 84u32, "Q2_K (passthrough)"),
         gguf_input::GgmlType::IQ3S => (crate::hfq::QuantType::IQ3S, 110u32, "IQ3_S (passthrough)"),
+        // Q4_K (ggml 12, 144 B/256, 4.5 bpw): kernels were wired in Stage 1
+        // (`gemv_q4k` / `gemm_q4k_batched` + matcher routing) but passthrough
+        // was withheld because Phase-0's pre-matcher-fix prototype served
+        // garbage; the Stage-1 mixed-dtype dispatch fixed that gap. 14% of
+        // params. lm_head included (Q4_K > HFQ4G256 bit-depth).
+        gguf_input::GgmlType::Q4K => (crate::hfq::QuantType::Q4K, 144u32, "Q4_K (passthrough)"),
         _ => return None,
     };
     let m = info.shape[0] as usize;

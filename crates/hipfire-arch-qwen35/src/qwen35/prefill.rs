@@ -4333,10 +4333,10 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // layer through the mixed-format `batched_gemm_single_weight` fallback —
     // the fused qkvza would read the other dtypes at the wrong stride
     // (e.g. Q2_K 84 B/group as MQ4V2 136 B/group → memory fault / garbage).
-    let la_has_native_iq = matches!(layer.wqkv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
-        || matches!(layer.wz.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
-        || matches!(layer.w_beta.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
-        || matches!(layer.w_alpha.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S);
+    let la_has_native_iq = matches!(layer.wqkv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K)
+        || matches!(layer.wz.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K)
+        || matches!(layer.w_beta.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K)
+        || matches!(layer.w_alpha.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K);
 
     // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
@@ -5199,7 +5199,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
             hidden_dim,
             n,
         )?;
-    } else if ffn_is_mq && !ffn_gate_up_mixed && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S) {
+    } else if ffn_is_mq && !ffn_gate_up_mixed && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K) {
         // GSQ-RCO Stage-1: gate/up are MQ4V2 (FWHT-rotated), down is
         // IQ4XS/Q2K (unrotated). silu(gate)*up is in the ROTATED basis;
         // the unrotated down needs the natural basis. FWHT is involutory,
@@ -5279,9 +5279,9 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // GSQ-RCO Stage-1 hybrid: a FA layer where ANY of wq/wk/wv is
     // IQ4_XS/Q2_K (unrotated plain-GEMM) must dispatch per-weight with
     // matching x — the fused QKV reads all three at one stride.
-    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
-        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
-        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S);
+    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K)
+        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K)
+        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K);
     // Fused QKV kernels require all three weights to share a
     // dtype — they treat wq/wk/wv as same-stride byte arrays.
     // When kmap mode 2 promotes only `v_proj` (issue #249), the
@@ -5920,7 +5920,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
             n,
         )?;
     } else if fa_ffn_is_mq && !fa_ffn_gate_up_mixed
-        && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S) {
+        && matches!(layer.w_down.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K) {
         // GSQ-RCO Stage-1: gate/up MQ4V2 (rotated), down IQ4XS/Q2K
         // (unrotated). FWHT is involutory — rotate once more to un-rotate.
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
@@ -6823,9 +6823,9 @@ fn batch_chunk_full_attn_moe(
     // GSQ-RCO Stage-1 hybrid: a FA layer where ANY of wq/wk/wv is
     // IQ4_XS/Q2_K (unrotated plain-GEMM) must dispatch per-weight with
     // matching x — the fused QKV reads all three at one stride.
-    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
-        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S)
-        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S);
+    let fa_has_native_iq = matches!(layer.wq.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K)
+        || matches!(layer.wk.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K)
+        || matches!(layer.wv.gpu_dtype, DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::Q4K);
     // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
     // (each with its own Givens rotation tables). The fused-QKV
     // kernels can't handle this — they assume one shared
