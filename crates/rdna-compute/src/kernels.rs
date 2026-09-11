@@ -4856,6 +4856,18 @@ pub const GEMV_IQ3S_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_s.hi
 pub const GEMM_IQ3S_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemm_iq3_s_batched.hip");
 
+/// IQ3_XXS GEMV (GSQ-RCO native path). 98 B groups, 3.0625 bpw, 256-entry
+/// grid + ksigns_iq2xs sign table. Unrotated Plain — decode serves the
+/// release's IQ3_XXS projections through this scalar kernel.
+pub const GEMV_IQ3XXS_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_xxs.hip");
+
+/// Batched IQ3_XXS GEMM (GSQ-RCO native path). Same per-row math as
+/// gemv_iq3_xxs (98 B groups, identical FMA order for greedy parity) with
+/// per-batch register accumulators. Prefill LA/FA/FFN matchers route
+/// IQ3XXS layers here instead of the HFQ4-stride fused kernels.
+pub const GEMM_IQ3XXS_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iq3_xxs_batched.hip");
+
 /// WMMA-accelerated 3-way fused QKV GEMM for Q8_0 weights. gfx1100+ wave32.
 /// Recipe-selected per docs/plans/q8-fused-prefill-kernels.md T3-1a microbench
 /// (FP16-WMMA, register-redundant dequant, no LDS).

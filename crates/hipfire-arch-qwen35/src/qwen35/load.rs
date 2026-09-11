@@ -2772,10 +2772,13 @@ const Q2K_QT: u8 = 43;
 /// IQ3_S passthrough (qt=46): GGUF-native 110 B/group blocks served by
 /// `gemv_iq3_s` / `gemm_iq3_s_batched`. Admitted wherever qt13/qt44 are.
 const IQ3S_QT: u8 = 46;
+/// IQ3_XXS passthrough (qt=52): GGUF-native 98 B/group blocks served by
+/// `gemv_iq3_xxs` / `gemm_iq3_xxs_batched`. Admitted wherever qt13/qt44 are.
+const IQ3XXS_QT: u8 = 52;
 
 #[inline]
 fn is_dense_proj_qt(qt: u8) -> bool {
-    matches!(qt, MQ4_G256_QT | MQ4V2_G256_QT | Q4K_QT | IQ4XS_QT | Q2K_QT | IQ3S_QT)
+    matches!(qt, MQ4_G256_QT | MQ4V2_G256_QT | Q4K_QT | IQ4XS_QT | Q2K_QT | IQ3S_QT | IQ3XXS_QT)
 }
 
 #[inline]
@@ -2812,6 +2815,15 @@ fn expected_iq3_s_bytes(m: usize, k: usize) -> Option<usize> {
     }
     let gpr = k / 256;
     m.checked_mul(gpr)?.checked_mul(110)
+}
+
+#[inline]
+fn expected_iq3_xxs_bytes(m: usize, k: usize) -> Option<usize> {
+    if k % 256 != 0 {
+        return None;
+    }
+    let gpr = k / 256;
+    m.checked_mul(gpr)?.checked_mul(98)
 }
 
 fn find_qwen35_tensor<'a>(hfq: &'a HfqFile, bare: &str) -> Option<(&'a HfqTensorInfo, String)> {
@@ -2860,6 +2872,7 @@ fn validate_mq4_proj_info(
         IQ4XS_QT => expected_iq4_xs_bytes(m, k),
         Q2K_QT => expected_q2k_bytes(m, k),
         IQ3S_QT => expected_iq3_s_bytes(m, k),
+        IQ3XXS_QT => expected_iq3_xxs_bytes(m, k),
         _ => expected_mq4_bytes(m, k),
     }
     .ok_or_else(|| format!("{name}: K={k} not multiple of 256"))?;

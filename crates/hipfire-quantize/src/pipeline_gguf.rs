@@ -253,6 +253,9 @@ pub(crate) fn gsqrco_native_passthrough(
         // garbage; the Stage-1 mixed-dtype dispatch fixed that gap. 14% of
         // params. lm_head included (Q4_K > HFQ4G256 bit-depth).
         gguf_input::GgmlType::Q4K => (crate::hfq::QuantType::Q4K, 144u32, "Q4_K (passthrough)"),
+        // IQ3_XXS (ggml 18, 98 B/256, 3.0625 bpw): 18% of params, the
+        // biggest remaining tail dtype.
+        gguf_input::GgmlType::IQ3XXS => (crate::hfq::QuantType::IQ3XXS, 98u32, "IQ3_XXS (passthrough)"),
         _ => return None,
     };
     let m = info.shape[0] as usize;

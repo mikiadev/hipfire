@@ -322,6 +322,105 @@ fn ref_dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+
+/// Port of `gguf_iq.rs::dequant_iq3_xxs` (98 B per 256, ggml type 18).
+const IQ3XXS_GRID: [u32; 256] = [
+    0x04040404u32, 0x04040414u32, 0x04040424u32, 0x04040C0Cu32, 0x04040C1Cu32, 0x04040C3Eu32, 0x04041404u32, 0x04041414u32,
+    0x04041C0Cu32, 0x04042414u32, 0x04043E1Cu32, 0x04043E2Cu32, 0x040C040Cu32, 0x040C041Cu32, 0x040C0C04u32, 0x040C0C14u32,
+    0x040C140Cu32, 0x040C142Cu32, 0x040C1C04u32, 0x040C1C14u32, 0x040C240Cu32, 0x040C2C24u32, 0x040C3E04u32, 0x04140404u32,
+    0x04140414u32, 0x04140424u32, 0x04140C0Cu32, 0x04141404u32, 0x04141414u32, 0x04141C0Cu32, 0x04141C1Cu32, 0x04141C3Eu32,
+    0x04142C0Cu32, 0x04142C3Eu32, 0x04143E2Cu32, 0x041C040Cu32, 0x041C043Eu32, 0x041C0C04u32, 0x041C0C14u32, 0x041C142Cu32,
+    0x041C3E04u32, 0x04240C1Cu32, 0x04241C3Eu32, 0x04242424u32, 0x04242C3Eu32, 0x04243E1Cu32, 0x04243E2Cu32, 0x042C040Cu32,
+    0x042C043Eu32, 0x042C1C14u32, 0x042C2C14u32, 0x04341C2Cu32, 0x04343424u32, 0x043E0C04u32, 0x043E0C24u32, 0x043E0C34u32,
+    0x043E241Cu32, 0x043E340Cu32, 0x0C04040Cu32, 0x0C04041Cu32, 0x0C040C04u32, 0x0C040C14u32, 0x0C04140Cu32, 0x0C04141Cu32,
+    0x0C041C04u32, 0x0C041C14u32, 0x0C041C24u32, 0x0C04243Eu32, 0x0C042C04u32, 0x0C0C0404u32, 0x0C0C0414u32, 0x0C0C0C0Cu32,
+    0x0C0C1404u32, 0x0C0C1414u32, 0x0C14040Cu32, 0x0C14041Cu32, 0x0C140C04u32, 0x0C140C14u32, 0x0C14140Cu32, 0x0C141C04u32,
+    0x0C143E14u32, 0x0C1C0404u32, 0x0C1C0414u32, 0x0C1C1404u32, 0x0C1C1C0Cu32, 0x0C1C2434u32, 0x0C1C3434u32, 0x0C24040Cu32,
+    0x0C24042Cu32, 0x0C242C04u32, 0x0C2C1404u32, 0x0C2C1424u32, 0x0C2C2434u32, 0x0C2C3E0Cu32, 0x0C34042Cu32, 0x0C3E1414u32,
+    0x0C3E2404u32, 0x14040404u32, 0x14040414u32, 0x14040C0Cu32, 0x14040C1Cu32, 0x14041404u32, 0x14041414u32, 0x14041434u32,
+    0x14041C0Cu32, 0x14042414u32, 0x140C040Cu32, 0x140C041Cu32, 0x140C042Cu32, 0x140C0C04u32, 0x140C0C14u32, 0x140C140Cu32,
+    0x140C1C04u32, 0x140C341Cu32, 0x140C343Eu32, 0x140C3E04u32, 0x14140404u32, 0x14140414u32, 0x14140C0Cu32, 0x14140C3Eu32,
+    0x14141404u32, 0x14141414u32, 0x14141C3Eu32, 0x14142404u32, 0x14142C2Cu32, 0x141C040Cu32, 0x141C0C04u32, 0x141C0C24u32,
+    0x141C3E04u32, 0x141C3E24u32, 0x14241C2Cu32, 0x14242C1Cu32, 0x142C041Cu32, 0x142C143Eu32, 0x142C240Cu32, 0x142C3E24u32,
+    0x143E040Cu32, 0x143E041Cu32, 0x143E0C34u32, 0x143E242Cu32, 0x1C04040Cu32, 0x1C040C04u32, 0x1C040C14u32, 0x1C04140Cu32,
+    0x1C04141Cu32, 0x1C042C04u32, 0x1C04342Cu32, 0x1C043E14u32, 0x1C0C0404u32, 0x1C0C0414u32, 0x1C0C1404u32, 0x1C0C1C0Cu32,
+    0x1C0C2424u32, 0x1C0C2434u32, 0x1C14040Cu32, 0x1C14041Cu32, 0x1C140C04u32, 0x1C14142Cu32, 0x1C142C14u32, 0x1C143E14u32,
+    0x1C1C0C0Cu32, 0x1C1C1C1Cu32, 0x1C241C04u32, 0x1C24243Eu32, 0x1C243E14u32, 0x1C2C0404u32, 0x1C2C0434u32, 0x1C2C1414u32,
+    0x1C2C2C2Cu32, 0x1C340C24u32, 0x1C341C34u32, 0x1C34341Cu32, 0x1C3E1C1Cu32, 0x1C3E3404u32, 0x24040424u32, 0x24040C3Eu32,
+    0x24041C2Cu32, 0x24041C3Eu32, 0x24042C1Cu32, 0x24042C3Eu32, 0x240C3E24u32, 0x24141404u32, 0x24141C3Eu32, 0x24142404u32,
+    0x24143404u32, 0x24143434u32, 0x241C043Eu32, 0x241C242Cu32, 0x24240424u32, 0x24242C0Cu32, 0x24243424u32, 0x242C142Cu32,
+    0x242C241Cu32, 0x242C3E04u32, 0x243E042Cu32, 0x243E0C04u32, 0x243E0C14u32, 0x243E1C04u32, 0x2C040C14u32, 0x2C04240Cu32,
+    0x2C043E04u32, 0x2C0C0404u32, 0x2C0C0434u32, 0x2C0C1434u32, 0x2C0C2C2Cu32, 0x2C140C24u32, 0x2C141C14u32, 0x2C143E14u32,
+    0x2C1C0414u32, 0x2C1C2C1Cu32, 0x2C240C04u32, 0x2C24141Cu32, 0x2C24143Eu32, 0x2C243E14u32, 0x2C2C0414u32, 0x2C2C1C0Cu32,
+    0x2C342C04u32, 0x2C3E1424u32, 0x2C3E2414u32, 0x34041424u32, 0x34042424u32, 0x34042434u32, 0x34043424u32, 0x340C140Cu32,
+    0x340C340Cu32, 0x34140C3Eu32, 0x34143424u32, 0x341C1C04u32, 0x341C1C34u32, 0x34242424u32, 0x342C042Cu32, 0x342C2C14u32,
+    0x34341C1Cu32, 0x343E041Cu32, 0x343E140Cu32, 0x3E04041Cu32, 0x3E04042Cu32, 0x3E04043Eu32, 0x3E040C04u32, 0x3E041C14u32,
+    0x3E042C14u32, 0x3E0C1434u32, 0x3E0C2404u32, 0x3E140C14u32, 0x3E14242Cu32, 0x3E142C14u32, 0x3E1C0404u32, 0x3E1C0C2Cu32,
+    0x3E1C1C1Cu32, 0x3E1C3404u32, 0x3E24140Cu32, 0x3E24240Cu32, 0x3E2C0404u32, 0x3E2C0414u32, 0x3E2C1424u32, 0x3E341C04u32
+];
+
+const KSIGNS_IQ2XS: [u8; 128] = [
+    0u8, 129u8, 130u8, 3u8, 132u8, 5u8, 6u8, 135u8, 136u8, 9u8, 10u8, 139u8, 12u8, 141u8, 142u8, 15u8,
+    144u8, 17u8, 18u8, 147u8, 20u8, 149u8, 150u8, 23u8, 24u8, 153u8, 154u8, 27u8, 156u8, 29u8, 30u8, 159u8,
+    160u8, 33u8, 34u8, 163u8, 36u8, 165u8, 166u8, 39u8, 40u8, 169u8, 170u8, 43u8, 172u8, 45u8, 46u8, 175u8,
+    48u8, 177u8, 178u8, 51u8, 180u8, 53u8, 54u8, 183u8, 184u8, 57u8, 58u8, 187u8, 60u8, 189u8, 190u8, 63u8,
+    192u8, 65u8, 66u8, 195u8, 68u8, 197u8, 198u8, 71u8, 72u8, 201u8, 202u8, 75u8, 204u8, 77u8, 78u8, 207u8,
+    80u8, 209u8, 210u8, 83u8, 212u8, 85u8, 86u8, 215u8, 216u8, 89u8, 90u8, 219u8, 92u8, 221u8, 222u8, 95u8,
+    96u8, 225u8, 226u8, 99u8, 228u8, 101u8, 102u8, 231u8, 232u8, 105u8, 106u8, 235u8, 108u8, 237u8, 238u8, 111u8,
+    240u8, 113u8, 114u8, 243u8, 116u8, 245u8, 246u8, 119u8, 120u8, 249u8, 250u8, 123u8, 252u8, 125u8, 126u8, 255u8
+];
+
+fn ref_dequant_iq3_xxs(data: &[u8], n: usize) -> Vec<f32> {
+    const QK: usize = 256;
+    const BLK: usize = 98;
+    let nblocks = n.div_ceil(QK);
+    let mut out = vec![0.0f32; n];
+    for b in 0..nblocks {
+        let base = b * BLK;
+        if base + BLK > data.len() {
+            break;
+        }
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        let qs = &data[base + 2..base + 66];
+        let aux = &data[base + 66..base + 98];
+        let mut y = b * QK;
+        let mut qs_off = 0usize;
+        for ib32 in 0..8 {
+            let aux32 = u32::from_le_bytes([
+                aux[4 * ib32],
+                aux[4 * ib32 + 1],
+                aux[4 * ib32 + 2],
+                aux[4 * ib32 + 3],
+            ]);
+            let db = d * (0.5 + ((aux32 >> 28) as f32)) * 0.5;
+            for l in 0..4 {
+                let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+                let g1 = IQ3XXS_GRID[qs[qs_off + 2 * l] as usize];
+                let g2 = IQ3XXS_GRID[qs[qs_off + 2 * l + 1] as usize];
+                let b1 = g1.to_le_bytes();
+                let b2 = g2.to_le_bytes();
+                for j in 0..4 {
+                    let idx1 = y + j;
+                    let idx2 = y + 4 + j;
+                    if idx1 < n {
+                        out[idx1] = db
+                            * (b1[j] as i8 as f32)
+                            * (if signs & (1u8 << j) != 0 { -1.0 } else { 1.0 });
+                    }
+                    if idx2 < n {
+                        out[idx2] = db
+                            * (b2[j] as i8 as f32)
+                            * (if signs & (1u8 << (4 + j)) != 0 { -1.0 } else { 1.0 });
+                    }
+                }
+                y += 8;
+            }
+            qs_off += 8;
+        }
+    }
+    out
+}
+
 // ── Harness ────────────────────────────────────────────────────────────
 
 fn main() {
@@ -381,6 +480,7 @@ fn main() {
                 GgmlType::Q2K => gpu.gemv_q2k(&d_raw, &d_x, &d_y, m, k).unwrap(),
                 GgmlType::IQ3S => gpu.gemv_iq3_s(&d_raw, &d_x, &d_y, m, k).unwrap(),
                 GgmlType::Q4K => gpu.gemv_q4k(&d_raw, &d_x, &d_y, m, k).unwrap(),
+                GgmlType::IQ3XXS => gpu.gemv_iq3_xxs(&d_raw, &d_x, &d_y, m, k).unwrap(),
                 _ => panic!("unreachable"),
             }
             let y_gpu = gpu.download_f32(&d_y).unwrap();
@@ -428,6 +528,9 @@ fn main() {
                 GgmlType::Q4K => {
                     gpu.gemm_q4k_batched(&d_raw, &d_xb, &d_yb, m, k, batch).unwrap()
                 }
+                GgmlType::IQ3XXS => {
+                    gpu.gemm_iq3_xxs_batched(&d_raw, &d_xb, &d_yb, m, k, batch).unwrap()
+                }
                 _ => panic!("unreachable"),
             }
             // Sub-view test: allocate a padded x buffer, pass a sub_offset view.
@@ -453,6 +556,9 @@ fn main() {
                     }
                     GgmlType::Q4K => {
                         gpu.gemm_q4k_batched(&d_raw, &view, &d_yv, m, k, batch).unwrap()
+                    }
+                    GgmlType::IQ3XXS => {
+                        gpu.gemm_iq3_xxs_batched(&d_raw, &view, &d_yv, m, k, batch).unwrap()
                     }
                     _ => panic!("unreachable"),
                 }
@@ -509,6 +615,7 @@ fn main() {
     run_case!("Q2_K", GgmlType::Q2K, |d, n| ref_dequant_q2_k(d, n));
     run_case!("IQ3_S", GgmlType::IQ3S, |d, n| ref_dequant_iq3_s(d, n));
     run_case!("Q4_K", GgmlType::Q4K, |d, n| ref_dequant_q4_k(d, n));
+    run_case!("IQ3_XXS", GgmlType::IQ3XXS, |d, n| ref_dequant_iq3_xxs(d, n));
 
 
 

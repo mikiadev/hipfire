@@ -488,6 +488,48 @@ impl Gpu {
         }
     }
 
+    /// y = A_iq3xxs * x (quantized matrix-vector multiply, A stored as IQ3_XXS on GPU)
+    /// a_raw: raw IQ3_XXS bytes on GPU, x: F32 input, y: F32 output
+    /// m: number of output rows, k: number of input columns (must be multiple of 256)
+    pub fn gemv_iq3_xxs(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_iq3_xxs", kernels::GEMV_IQ3XXS_SRC, "gemv_iq3_xxs")?;
+        let func = &self.functions["gemv_iq3_xxs"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 32u32; // single warp — no shared memory needed
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HFQ4-G128 GEMV: flat 4-bit with 128-weight groups.
     /// K must be multiple of 128.
     pub fn gemv_hfq4g128(
