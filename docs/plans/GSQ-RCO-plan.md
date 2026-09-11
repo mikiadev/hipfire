@@ -173,6 +173,34 @@ with evidence. Resume from the stash, don't restart.
   perf tuning is a follow-up.
 - **Stage 3 — tail (IQ3_XXS/IQ2_XS/IQ2_XXS/IQ2_S/IQ1_M/BF16-smalls).**
   Smallest-first; BF16 smalls can stay host-F32 (0.09%, not worth a kernel).
+  **Measured (2026-09-11, gfx1151):**
+  - Q4_K (14%, kernels were already wired from Stage 1): passthrough
+    enabled after adding Q4K to the `la/fa_has_native_iq` matcher lists
+    (the Stage-1 lists checked IQ4XS/Q2K/IQ3S but not Q4K → mixed layers
+    fell to the fused kernel and read Q4K blocks at the HFQ4 stride →
+    '!!!' attractor). PPL 9.77, coherent.
+  - IQ3_XXS (18%): new 98 B/group grid kernels, verified EXACT + 55/55
+    harness. PPL 9.69 (best), greedy coherent.
+  - IQ2_S (7%): new 82 B/group kernels, verified EXACT + 66/66 harness.
+    PPL 9.72, greedy coherent.
+  - **IQ2_XS/IQ2_XXS (2.3%/1%): kernels + full wiring landed and verified
+    (88/88 harness, .hfq orientation test ~1.7e-7) but PASSTHROUGH
+    DISABLED** — serving the 2.06-2.31 bpw weights natively destabilizes
+    the DeltaNet DECODE recurrence: first-decode hidden state grows
+    ~2.8x vs the HFQ4G256 fallback (197 vs 71 max) → `\n`/`\r\n`
+    attractors on short prompts, despite IDENTICAL prefill PPL (9.72)
+    and verified kernels. Root cause is decode-recurrence stability
+    sensitivity to 2-bit weights, not a kernel/routing bug (exhaustively
+    traced). Re-enable when the decode recurrence stability is addressed.
+  - Final Stage-3 hybrid (338 native): PPL 9.72 (unchanged), **13.07 GB**
+    (vs 14.03 Stage-2, ~1 GB saved), greedy serve coherent. Battery
+    (temp 1.0) shows sampling weakness (1 attractor, off-topic) from the
+    deeper 2-bit mixture — greedy is clean, documented honestly.
+  - **Stage-3 conclusion:** the tail dtypes below ~3 bpw (IQ2_S and
+    especially IQ2_XS/XXS) degrade generation quality beyond what PPL
+    captures. The size win (~1 GB) comes with a real generation-quality
+    cost. out_proj (48 tensors, V-head half-group interleave) remains the
+    biggest non-native chunk.
 - **Stage 4 — full-native file + admission.** All-native `.hfq` at
   ~11.8 GB, PPL within ~0.5 of the release row, `docs/admissions.yml`
   row (fail-closed until then). Retire the re-quant bridge per model,
