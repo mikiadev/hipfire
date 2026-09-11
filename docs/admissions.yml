@@ -80,3 +80,60 @@ records:
         - path_inference
         - extension_inference
         - automatic_runtime_default
+  - id: gsqrco-iq3s-native-gfx1151-plain-ar
+    status: admitted_product_route
+    artifact:
+      # Sealed GSQ-RCO native hybrid (2026-09-11, Stage-4 of
+      # docs/plans/GSQ-RCO-plan.md). MD5 is identity only; the admitted
+      # object is the same immutable sealed snapshot bytes, not a path.
+      byte_size: 12987317248
+      md5: d148a9929b4db761c60514e2e8fa4151
+      md5_role: identity_only
+      identity: same immutable sealed snapshot bytes
+    arch_id: 5
+    gpu: gfx1151
+    weight_quant: mixed_native_iq
+    kv_cache: Q8
+    max_seq: 32768
+    decode_mode: plain_AR
+    pp: 1
+    tp: 1
+    transport: HIP
+    # Fail-closed scope: the admitted object is the exact sealed hybrid.
+    # Not all-native: IQ2_XS/IQ2_XXS stay on HFQ4G256 fallback (2-bit
+    # decode-recurrence instability, documented in the plan); embed stays
+    # Q8 (non-goal); BF16/F32 smalls stay high-precision. out_proj is
+    # native (GGUF-order passthrough + engine-side V-head activation
+    # un-permute, `vhead_unpermute_f32`).
+    excluded_scope:
+      any_field_mismatch: true
+      note: >
+        Row covers the exact sealed artifact on gfx1151 only. The PPL
+        evidence is re-baselined against in-engine formats (mq4/mq6),
+        NOT the cross-tokenizer llama.cpp release row (7.17, different
+        tokenizer) — the plan records that the native route's value is
+        SIZE + serving the release's own RCO allocation, not a PPL win
+        over the in-engine ladder.
+    product_screen:
+      artifact: /tmp/fpq16_stage4_final.bin
+      ppl_slice_md5: 538eb71fcff9f363716d063d28c6a2a4
+      ppl: 9.6767
+      ppl_note: >
+        wikitext2 200KB slice, flash_prefill_quality ctx512/chunks16/
+        stride8 (512 scored). In-engine ladder on the same slice: mq4
+        9.23, mq6 9.16, mq3 10.54, Stage-3 hybrid 9.7219. Serve battery
+        (greedy, 256 max): 5/5 turns, 0 attractor, 0 empty, 0 retrieval
+        miss; one reason turn hit the token cap (coherent text).
+      canonical_certification: false
+      caveat: >
+        Serve-semantics + PPL evidence only; not Redline certification,
+        not a perf claim, not an admission of the unmet all-native /
+        11.8 GB / release-row-PPL criteria (see plan Stage-4).
+    runtime_defaults:
+      wires_runtime_selection: false
+      current_runtime_wiring: absent_explicit_opt_in_only
+      automatic_selector: none
+      note: >
+        Registry evidence/admission only. Does not select runtime
+        defaults; the GSQ-RCO native route is explicit opt-in (the .hfq
+        file must be served directly).

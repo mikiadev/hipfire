@@ -20,6 +20,27 @@ pub mod load;
 pub mod prefill;
 pub mod weights;
 
+/// GSQ-RCO native I-quant passthrough dtypes (GGUF-native blocks served
+/// by the `gemv_iq*` / `gemm_iq*_batched` kernels). These are unrotated
+/// (RotationPlan::None) AND — for the V-head-major `linear_attn.out_proj`
+/// — stored in GGUF V-head order: the engine must un-permute the
+/// activation (`vhead_unpermute_f32`) before the wo GEMM/GEMV. Excludes
+/// TQ2G128/BQ1G128 (hipfire's own formats, engine order).
+pub(crate) fn is_gsqrco_native_iq(dt: rdna_compute::DType) -> bool {
+    use rdna_compute::DType;
+    matches!(
+        dt,
+        DType::Q4K
+            | DType::IQ4XS
+            | DType::Q2K
+            | DType::IQ3S
+            | DType::IQ3XXS
+            | DType::IQ2S
+            | DType::IQ2XS
+            | DType::IQ2XXS
+    )
+}
+
 pub use batch::{
     forward_decode_batch, forward_decode_batch_prepared, prepare_decode_batch_inputs,
     BatchSemantics, PrefillBatchScratch, Qwen35DecodeBatchState,

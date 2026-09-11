@@ -6407,6 +6407,13 @@ pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterlea
 pub const DEINTERLEAVE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deinterleave_batched.hip");
 
+/// GSQ-RCO native out_proj: un-permute the DeltaNet V-head concat from
+/// engine order back to GGUF order (dst[row, PERM[e]*128+j] = src[row, e*128+j]).
+/// out_proj W is passed through in GGUF order (per-256-block scales make a
+/// packed half-group interleave impossible), so the ACTIVATION is permuted
+/// to match before the plain GEMM/GEMV.
+pub const VHEAD_UNPERMUTE_SRC: &str = include_str!("../../../kernels/src/vhead_unpermute.hip");
+
 /// Single-token repeat-interleave Q and K key heads up to value heads count.
 pub const REPEAT_INTERLEAVE_QK_SRC: &str =
     include_str!("../../../kernels/src/repeat_interleave_qk.hip");

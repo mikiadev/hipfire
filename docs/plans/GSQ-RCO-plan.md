@@ -1,9 +1,12 @@
 # GSQ-RCO IQ3_S plan: re-quant bridge (shipped) → native IQ3_S support (proposed)
 
-**Status:** execution trace + proposal (2026-09-09 / 2026-09-10). Branch
-`exp/gsq-rco-iq3s`. This file is the plan record, not a product claim.
-Quality numbers below are `measured` on the stated fixture; admission
-state is fail-closed (`docs/admissions.yml` empty).
+**Status:** execution trace + proposal (2026-09-09 / 2026-09-12). Branch
+`exp/gsq-rco-iq3s`. Stages 0-4 complete (2026-09-12): native hybrid
+served + admitted (fail-closed). This file is the plan record, not a
+product claim. Quality numbers below are `measured` on the stated
+fixture; admission state is fail-closed (`docs/admissions.yml` row for
+the exact sealed Stage-4 artifact; all-native / 11.8 GB / release-row
+PPL criteria explicitly NOT met — see Stage 4).
 
 **Source under test:**
 [ISTA-DASLab `Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/raw/main/README.md)
@@ -205,6 +208,39 @@ with evidence. Resume from the stash, don't restart.
   ~11.8 GB, PPL within ~0.5 of the release row, `docs/admissions.yml`
   row (fail-closed until then). Retire the re-quant bridge per model,
   keep it per pipeline (other GSQ-RCO releases reuse it).
+  **Measured (2026-09-12, gfx1151):**
+  - **out_proj (48 tensors, 0.72 GB) went native — but NOT via a packed
+    half-group interleave.** Falsified: every I-quant block carries a
+    per-256 scale (d / d+dmin) shared across the two 128-col halves, so
+    interleaving half-groups from different source blocks mixes scales —
+    exact passthrough is impossible. Instead the out_proj W is passed
+    through in GGUF V-head order and the ENGINE un-permutes the
+    activation (`vhead_unpermute_f32`, new kernel + rdna-compute op,
+    verified 2/2 exact) before the wo GEMM/GEMV. Wired into ALL decode
+    paths: the lowered super-op executor's RESID_WO (default ON via
+    `HIPFIRE_FORWARD_LOWERED`) was the runtime path — found by probe,
+    not by reading — plus the hand arms (`forward_scratch_layers` ×3,
+    `dense_tp_deltanet_partial`) and the batched prefill
+    (`batch_chunk_delta_net_attn` + `dispatch_batched_gemm_epilogue`).
+  - Final Stage-4 hybrid (386 native: +48 out_proj): **PPL 9.6767**
+    (vs Stage-3 9.7219 — native out_proj is a small win, Q4K/IQ4XS are
+    higher bit-depth than the 4.25 bpw HFQ4G256 fallback), **12.99 GB**
+    (vs 13.07 GB Stage-3, -83 MB), serve battery greedy 5/5 coherent
+    (0 attractor, 0 empty; one reason turn hit the 256-token cap),
+    decode coherent on factual/code/prose/instruct.
+  - **Admission:** `docs/admissions.yml` row added (fail-closed): exact
+    sealed artifact md5 `d148a992…`, PPL 9.6767 re-baselined against
+    the in-engine ladder (not the cross-tokenizer release row 7.17),
+    explicit caveats (IQ2XS/XXS fallback, embed Q8, not all-native).
+  - **Bridge retired per model:** `/tmp/gsqrco-iq3s.hfq` (re-quant) is
+    no longer the serving artifact; the native hybrid replaces it. The
+    bridge PIPELINE stays (other GSQ-RCO releases reuse it).
+  - **Unmet criteria (documented honestly):** 11.8 GB not attainable —
+    embed→Q8 is a non-goal (+0.94 GB) and IQ2XS/XXS stay on HFQ4G256
+    fallback (decode-recurrence instability); full-native floor is
+    ~12.65 GB. PPL not within 0.5 of the release row (cross-tokenizer).
+    The native route's value is SIZE + serving the release's own RCO
+    allocation, as the Stage-2 note predicted.
 
 Non-goals: Q4_K-embedding GEMV (embed stays Q8 — lookup path, no win),
 DFlash draft work (after AR is correct per the arch-port skill),
@@ -217,12 +253,22 @@ as the ternary precedent).
   `gsqrco-native-phase0-wip` (+ `/tmp/phase0_wip.patch`,
   `kernels/src/gemm_q4k_batched.hip` untracked).
 - Models: `/data/rocmfpx/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf` (source);
-  `/tmp/gsqrco-iq3s.hfq` == `/tmp/gsqrco-v5.hfq` (md5 `3c60064f…`,
-  serving artifact); `/tmp/gsqrco-native.hfq` (Phase-0 hybrid,
-  diagnostic only); `~/.hipfire/models/qwen3.8-27b.{mq3,mq4,mq6}`.
-- Eval: `/tmp/ppl_slice.txt` (200 KB slice head); `/tmp/fpq16_*.bin`
-  per-model records; `/tmp/llama_ppl.err` (release row);
-  `/tmp/gsqrco_harness3.err` (serve battery).
+  `/tmp/gsqrco-stage4.hfq` (md5 `d148a992…`, 12.99 GB, Stage-4 native
+  hybrid — current serving artifact); `/tmp/gsqrco-stage3-final.hfq`
+  (md5 `…`, 13.07 GB, Stage-3 hybrid); `/tmp/gsqrco-iq3s.hfq` ==
+  `/tmp/gsqrco-v5.hfq` (md5 `3c60064f…`, re-quant bridge, retired per
+  model); `/tmp/gsqrco-native.hfq` (Phase-0 hybrid, diagnostic only);
+  `~/.hipfire/models/qwen3.8-27b.{mq3,mq4,mq6}`.
+- Eval: `/tmp/ppl_slice.txt` (200 KB slice head, md5
+  `538eb71f…`); `/tmp/fpq16_stage4_final.bin` (Stage-4 PPL 9.6767);
+  `/tmp/fpq16_stage3_recheck.bin` (Stage-3 recheck 9.7219);
+  `/tmp/fpq16_*.bin` per-model records; `/tmp/llama_ppl.err` (release
+  row); `/tmp/gsqrco_harness_stage4.log` (serve battery, coherent).
+- Stage-4 regression harnesses: `crates/rdna-compute/examples/
+  test_vhead_unpermute.rs` (kernel, 2/2 exact) and
+  `crates/hipfire-quantize/examples/test_outproj_decode.rs` (decode
+  GEMV + un-permute vs CPU, max_abs 2.6e-5); precompiled
+  `kernels/compiled/gfx1151/vhead_unpermute_f32.{hsaco,hash}`.
 - Reference export for the kernel work: `/data/rocmfpx/Qwen38-27b-Escha-W2`
   (BF16 safetensors; norm-residual + dt/A_log ground truth) and
   `/data/rocmfpx/Qwen3.8F/llama.cpp` (`ggml-quants.c` / `ggml-common.h`

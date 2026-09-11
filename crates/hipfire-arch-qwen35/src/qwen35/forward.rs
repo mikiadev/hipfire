@@ -2165,13 +2165,24 @@ pub(crate) fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
                 {
+                    // GSQ-RCO native out_proj: W is passed through in GGUF
+                    // V-head order (per-256-block scales make a packed
+                    // half-group interleave impossible), so un-permute the
+                    // engine-order V-concat into the free dn_attn_out scratch
+                    // (dead after gated_norm_f32) before the GEMV.
+                    let wo_input = if super::is_gsqrco_native_iq(layer.wo.gpu_dtype) {
+                        gpu.vhead_unpermute_f32_batched(&s.dn_normed, &s.dn_attn_out, 1)?;
+                        &s.dn_attn_out
+                    } else {
+                        &s.dn_normed
+                    };
                     let wr = layer.wo.dispatch_ref();
                     execute_steps(
                         gpu,
                         &ctx,
                         &[Step::GemvResidual {
                             w: &wr,
-                            input: GemvInput::Raw(&s.dn_normed),
+                            input: GemvInput::Raw(wo_input),
                             residual: &s.x,
                             out: &s.x,
                         }],
@@ -2510,13 +2521,24 @@ pub(crate) fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
                 {
+                    // GSQ-RCO native out_proj: W is passed through in GGUF
+                    // V-head order (per-256-block scales make a packed
+                    // half-group interleave impossible), so un-permute the
+                    // engine-order V-concat into the free dn_attn_out scratch
+                    // (dead after gated_norm_f32) before the GEMV.
+                    let wo_input = if super::is_gsqrco_native_iq(layer.wo.gpu_dtype) {
+                        gpu.vhead_unpermute_f32_batched(&s.dn_normed, &s.dn_attn_out, 1)?;
+                        &s.dn_attn_out
+                    } else {
+                        &s.dn_normed
+                    };
                     let wr = layer.wo.dispatch_ref();
                     execute_steps(
                         gpu,
                         &ctx,
                         &[Step::GemvResidual {
                             w: &wr,
-                            input: GemvInput::Raw(&s.dn_normed),
+                            input: GemvInput::Raw(wo_input),
                             residual: &s.x,
                             out: &s.x,
                         }],
@@ -2679,13 +2701,24 @@ pub(crate) fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
                 {
+                    // GSQ-RCO native out_proj: W is passed through in GGUF
+                    // V-head order (per-256-block scales make a packed
+                    // half-group interleave impossible), so un-permute the
+                    // engine-order V-concat into the free dn_attn_out scratch
+                    // (dead after gated_norm_f32) before the GEMV.
+                    let wo_input = if super::is_gsqrco_native_iq(layer.wo.gpu_dtype) {
+                        gpu.vhead_unpermute_f32_batched(&s.dn_normed, &s.dn_attn_out, 1)?;
+                        &s.dn_attn_out
+                    } else {
+                        &s.dn_normed
+                    };
                     let wr = layer.wo.dispatch_ref();
                     execute_steps(
                         gpu,
                         &ctx,
                         &[Step::GemvResidual {
                             w: &wr,
-                            input: GemvInput::Raw(&s.dn_normed),
+                            input: GemvInput::Raw(wo_input),
                             residual: &s.x,
                             out: &s.x,
                         }],
@@ -4016,13 +4049,23 @@ fn dense_tp_deltanet_partial(
         config.linear_value_head_dim,
         config.norm_eps,
     )?;
+    // GSQ-RCO native out_proj: W is passed through in GGUF V-head order
+    // (per-256-block scales make a packed half-group interleave
+    // impossible), so un-permute the engine-order V-concat into the free
+    // dn_attn_out scratch (dead after gated_norm_f32) before the GEMV.
+    let wo_input = if super::is_gsqrco_native_iq(layer.wo.gpu_dtype) {
+        gpu.vhead_unpermute_f32_batched(&s.dn_normed, &s.dn_attn_out, 1)?;
+        &s.dn_attn_out
+    } else {
+        &s.dn_normed
+    };
     let wr = layer.wo.dispatch_ref();
     execute_steps(
         gpu,
         &ctx,
         &[Step::Gemv {
             w: &wr,
-            input: GemvInput::Raw(&s.dn_normed),
+            input: GemvInput::Raw(wo_input),
             out: &s.o,
         }],
     )
@@ -5494,6 +5537,15 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                             &l.wo,
                         ) {
                             GemvInput::Prerotated(&s.x_rot)
+                        } else if crate::qwen35::is_gsqrco_native_iq(l.wo.gpu_dtype) {
+                            // GSQ-RCO native out_proj: W is passed through in
+                            // GGUF V-head order (per-256-block scales make a
+                            // packed half-group interleave impossible), so
+                            // un-permute the engine-order V-concat into the
+                            // free dn_attn_out scratch (dead after NORM_GATED)
+                            // before the GEMV.
+                            gpu.vhead_unpermute_f32_batched(&s.dn_normed, &s.dn_attn_out, 1)?;
+                            GemvInput::Raw(&s.dn_attn_out)
                         } else {
                             GemvInput::Raw(&s.dn_normed)
                         };
@@ -5507,6 +5559,15 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                             &l.wo,
                         ) {
                             GemvInput::Prerotated(&s.x_rot)
+                        } else if crate::qwen35::is_gsqrco_native_iq(l.wo.gpu_dtype) {
+                            // GSQ-RCO native out_proj: W is passed through in
+                            // GGUF V-head order (per-256-block scales make a
+                            // packed half-group interleave impossible), so
+                            // un-permute the engine-order V-concat into the
+                            // free dn_attn_out scratch (dead after NORM_GATED)
+                            // before the GEMV.
+                            gpu.vhead_unpermute_f32_batched(&s.dn_normed, &s.dn_attn_out, 1)?;
+                            GemvInput::Raw(&s.dn_attn_out)
                         } else {
                             GemvInput::Raw(&s.dn_normed)
                         };
@@ -5528,6 +5589,15 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                             &l.wo,
                         ) {
                             GemvInput::Prerotated(&s.x_rot)
+                        } else if crate::qwen35::is_gsqrco_native_iq(l.wo.gpu_dtype) {
+                            // GSQ-RCO native out_proj: W is passed through in
+                            // GGUF V-head order (per-256-block scales make a
+                            // packed half-group interleave impossible), so
+                            // un-permute the engine-order V-concat into the
+                            // free dn_attn_out scratch (dead after NORM_GATED)
+                            // before the GEMV.
+                            gpu.vhead_unpermute_f32_batched(&s.dn_normed, &s.dn_attn_out, 1)?;
+                            GemvInput::Raw(&s.dn_attn_out)
                         } else {
                             GemvInput::Raw(&s.dn_normed)
                         };

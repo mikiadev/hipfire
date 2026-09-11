@@ -4949,6 +4949,13 @@ pub(crate) fn batch_chunk_delta_net_attn(
             n,
         )?;
         &pbs.dn_normed_rot_batch
+    } else if super::is_gsqrco_native_iq(layer.wo.gpu_dtype) {
+        // GSQ-RCO native out_proj: W is passed through in GGUF V-head
+        // order (per-256-block scales make a packed half-group interleave
+        // impossible), so un-permute the engine-order V-concat into GGUF
+        // order before the plain GEMM in dispatch_batched_gemm_epilogue.
+        gpu.vhead_unpermute_f32_batched(&pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, n)?;
+        &pbs.dn_normed_rot_batch
     } else {
         &pbs.dn_normed_batch
     };
@@ -6637,9 +6644,18 @@ fn batch_chunk_delta_net_moe(
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
     let dn_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128 | DType::Q4K | DType::IQ4XS | DType::Q2K | DType::IQ3S | DType::IQ3XXS | DType::IQ2S | DType::IQ2XS | DType::IQ2XXS);
+    // GSQ-RCO native I-quant wo (out_proj): unrotated (RotationPlan::None)
+    // AND stored in GGUF V-head order. The lowbit branch below un-permutes
+    // the engine-order V-concat to GGUF order before the plain GEMM.
+    let dn_wo_is_gsqrco_iq = super::is_gsqrco_native_iq(layer.wo.gpu_dtype);
     let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
     let dn_wo_input = if dn_wo_is_q8 {
+        &pbs.dn_normed_batch
+    } else if dn_wo_is_gsqrco_iq {
+        // GSQ-RCO native I-quant wo: no FWHT (RotationPlan::None). The
+        // GGUF-order un-permute happens in the lowbit branch (needs a
+        // scratch; dn_normed_rot_batch is reused there).
         &pbs.dn_normed_batch
     } else if dn_wo_is_paro {
         // PARO wo: rotate dn_normed by wo's own Givens tables
@@ -6697,23 +6713,49 @@ fn batch_chunk_delta_net_moe(
             n,
         )?;
     } else if dn_wo_is_q8 || dn_wo_is_lowbit {
-        // Non-WMMA Q8: gemm into a scratch then add into x_batch.
-        // Reuse `dn_normed_rot_batch` (free since the MQ4 rotate
-        // path didn't run here) as the GEMM scratch.
-        let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            dn_wo_input,
-            &scratch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
+        if dn_wo_is_gsqrco_iq {
+            // GSQ-RCO native out_proj: W is passed through in GGUF V-head
+            // order (per-256-block scales make a packed half-group
+            // interleave impossible), so un-permute the engine-order
+            // V-concat (dn_normed_batch) into GGUF order in
+            // dn_normed_rot_batch, then GEMM into the free x_norm_batch
+            // scratch — dn_normed_rot_batch would alias (m < k) and mixing
+            // the two source scales is exactly what the un-permute avoids.
+            gpu.vhead_unpermute_f32_batched(&pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, n)?;
+            let gemm_in = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.k);
+            let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
+            run_plain_gemm_key(
+                gpu,
+                plain_gemm_key_for(layer.wo.gpu_dtype),
+                &layer.wo.buf,
+                layer.wo.gpu_dtype,
+                &gemm_in,
+                &scratch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+            )?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
+        } else {
+            // Non-WMMA Q8: gemm into a scratch then add into x_batch.
+            // Reuse `dn_normed_rot_batch` (free since the MQ4 rotate
+            // path didn't run here) as the GEMM scratch.
+            let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
+            run_plain_gemm_key(
+                gpu,
+                plain_gemm_key_for(layer.wo.gpu_dtype),
+                &layer.wo.buf,
+                layer.wo.gpu_dtype,
+                dn_wo_input,
+                &scratch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+            )?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
+        }
     } else if dn_wo_is_paro {
         // PARO wo residual: HFQ4G128 batched GEMM into scratch,
         // then add into x_batch. Reuse x_norm_batch (free at

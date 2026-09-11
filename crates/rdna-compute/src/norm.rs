@@ -2074,6 +2074,62 @@ impl Gpu {
         result
     }
 
+    /// GSQ-RCO native out_proj: un-permute the DeltaNet V-head concat from
+    /// engine order back to GGUF order. src/dst are [n, 6144] f32; each
+    /// 128-col V block moves dst[row, PERM[e]] = src[row, e]. out_proj W is
+    /// passed through in GGUF order (per-256-block scales make a packed
+    /// half-group interleave impossible), so the ACTIVATION is permuted to
+    /// match before the plain GEMM/GEMV (kernels/src/vhead_unpermute.hip).
+    pub fn vhead_unpermute_f32_batched(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "vhead_unpermute_f32",
+            kernels::VHEAD_UNPERMUTE_SRC,
+            "vhead_unpermute_f32",
+        )?;
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut nn = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        let total = (n * 6144) as u32;
+        let block = 256u32;
+        let grid = (total + block - 1) / block;
+        let bytes = n * 6144 * 4 * 2; // read src, write dst
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "vhead_unpermute_f32",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "vhead_unpermute_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(dp);
+                b.push_i32(nn);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;

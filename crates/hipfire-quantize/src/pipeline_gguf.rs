@@ -306,9 +306,16 @@ pub(crate) fn gsqrco_native_passthrough(
         ));
     }
     if out_name.ends_with("linear_attn.out_proj.weight") {
-        // 128-col V blocks are half-groups; not a chunk move. Fall through
-        // to the interleaved-f32 HFQ4G256 re-quant (same size, correct).
-        return None;
+        // [dim,6144]: the 128-col V blocks sit HALF INSIDE each 256-element
+        // group (sub-group granularity), and every I-quant block carries a
+        // per-256 scale (d / d+dmin) shared across the two halves — an exact
+        // packed half-group interleave would MIX scales from two source
+        // blocks into one destination block, so it is impossible. Instead
+        // the out_proj W is passed through in GGUF V-head order and the
+        // ENGINE un-permutes the activation (vhead_unpermute_f32) before
+        // the plain GEMM/GEMV. The engine detects this by dtype: a native
+        // I-quant wo is always GGUF-ordered.
+        return Some((raw.to_vec(), qt, 256u32, label));
     }
     Some((raw.to_vec(), qt, 256u32, label))
 }
