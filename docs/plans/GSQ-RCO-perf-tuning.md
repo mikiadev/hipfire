@@ -201,8 +201,17 @@ over the Item-2 scalar baseline 7.1). Serialized decode kernel time
 
 Remaining headroom is small and structural (the I-quant codebook/sign/
 scale decode is fundamentally ~4× more instructions/element than HFQ4's
-direct 4-bit decode). Documented rejections above; no further lever is
-queued without a new mechanism (e.g. packed `v_cvt_f32_i8`).
+direct 4-bit decode). Documented rejections above, plus:
+- **q4k scalar 2-block LDS staging: REJECTED.** 307 vs 238 µs/call —
+  Q4_K's qbyte loads are already coalesced (`block[16+tid]`), so staging
+  adds sync + VGPR (70) for pure overhead. Q4_K is at its practical
+  limit (dual-row also rejected in Item 2).
+- **iq3_s 2-block staging: REJECTED (worse than 4-block).** 218 vs 204
+  µs/call — IQ3_S benefits from the larger 4-block K-tile.
+- **packed `v_cvt_f32_i8` for the cvt-heavy kernels: UNAVAILABLE** on
+  gfx1151 (invalid instruction; only scalar `v_cvt_f32_i32` exists).
+
+No further lever is queued without a new mechanism.
 
 ### Item 3 (optional) — fold the V-head PERM into the out_proj GEMV
 
