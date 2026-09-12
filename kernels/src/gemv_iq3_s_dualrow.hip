@@ -141,16 +141,71 @@ extern "C" __global__ void gemv_iq3_s_dualrow(
 
     float sum0 = 0.0f, sum1 = 0.0f;
 
-    for (int bi = 0; bi < blocks_per_row; bi++) {
-        const unsigned char* b0 = row0_data + bi * 110;
-        const unsigned char* b1 = row1_data + bi * 110;
-        const float* xb = x + bi * 256 + x_off;
+    // GSQ-RCO perf item 2b experiment: stage 4 blocks (2 rows x 4 x 110 B)
+    // into LDS with COALESCED u32 loads, one sync, then decode from LDS.
+    // The scalar kernel's scattered u8/u16 weight loads become ds_read.
+    __shared__ unsigned char s_blk[880];
+    int bg = 0;
+    for (; bg + 4 <= blocks_per_row; bg += 4) {
+        const unsigned int* src0 = (const unsigned int*)(row0_data + bg * 110);
+        const unsigned int* src1 = (const unsigned int*)(row1_data + bg * 110);
+        #pragma unroll
+        for (int i = tid; i < 110; i += 32) {
+            ((unsigned int*)s_blk)[i] = src0[i];
+            ((unsigned int*)s_blk)[110 + i] = src1[i];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int bi = 0; bi < 4; bi++) {
+            const unsigned char* b0 = s_blk + bi * 110;
+            const unsigned char* b1 = s_blk + 440 + bi * 110;
+            const float* xb = x + (bg + bi) * 256 + x_off;
 
-        // Shared x: 8 contiguous floats per thread (2 float4).
+            const float4 xa = *reinterpret_cast<const float4*>(xb);
+            const float4 xb4 = *reinterpret_cast<const float4*>(xb + 4);
+
+            float d0 = half_to_float((unsigned short)(b0[0] | (b0[1] << 8)));
+            unsigned char qh0 = b0[66 + ib];
+            unsigned char sc0 = b0[106 + i];
+            int nib0 = half ? (sc0 >> 4) : (sc0 & 0xf);
+            float db0 = d0 * (1.0f + 2.0f * (float)nib0);
+            unsigned char sign0 = b0[74 + i * 8 + half * 4 + l];
+            unsigned int grid0a = IQ3S_GRID[(int)b0[2 + qs_base] | ((qh0 << shift_lo) & 256)];
+            unsigned int grid0b = IQ3S_GRID[(int)b0[2 + qs_base + 1] | ((qh0 << shift_hi) & 256)];
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int gb = (int)(int8_t)((k < 4 ? grid0a : grid0b) >> (8 * (k & 3)));
+                float w = db0 * (float)gb * ((sign0 >> k) & 1 ? -1.0f : 1.0f);
+                sum0 += w * (k < 4 ? (k == 0 ? xa.x : k == 1 ? xa.y : k == 2 ? xa.z : xa.w)
+                                   : (k == 4 ? xb4.x : k == 5 ? xb4.y : k == 6 ? xb4.z : xb4.w));
+            }
+
+            float d1 = half_to_float((unsigned short)(b1[0] | (b1[1] << 8)));
+            unsigned char qh1 = b1[66 + ib];
+            unsigned char sc1 = b1[106 + i];
+            int nib1 = half ? (sc1 >> 4) : (sc1 & 0xf);
+            float db1 = d1 * (1.0f + 2.0f * (float)nib1);
+            unsigned char sign1 = b1[74 + i * 8 + half * 4 + l];
+            unsigned int grid1a = IQ3S_GRID[(int)b1[2 + qs_base] | ((qh1 << shift_lo) & 256)];
+            unsigned int grid1b = IQ3S_GRID[(int)b1[2 + qs_base + 1] | ((qh1 << shift_hi) & 256)];
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int gb = (int)(int8_t)((k < 4 ? grid1a : grid1b) >> (8 * (k & 3)));
+                float w = db1 * (float)gb * ((sign1 >> k) & 1 ? -1.0f : 1.0f);
+                sum1 += w * (k < 4 ? (k == 0 ? xa.x : k == 1 ? xa.y : k == 2 ? xa.z : xa.w)
+                                   : (k == 4 ? xb4.x : k == 5 ? xb4.y : k == 6 ? xb4.z : xb4.w));
+            }
+        }
+        __syncthreads();
+    }
+    // Scalar tail for K not a multiple of 1024.
+    for (; bg < blocks_per_row; bg++) {
+        const unsigned char* b0 = row0_data + bg * 110;
+        const unsigned char* b1 = row1_data + bg * 110;
+        const float* xb = x + bg * 256 + x_off;
         const float4 xa = *reinterpret_cast<const float4*>(xb);
         const float4 xb4 = *reinterpret_cast<const float4*>(xb + 4);
 
-        // Row 0
         float d0 = half_to_float((unsigned short)(b0[0] | (b0[1] << 8)));
         unsigned char qh0 = b0[66 + ib];
         unsigned char sc0 = b0[106 + i];
@@ -167,7 +222,6 @@ extern "C" __global__ void gemv_iq3_s_dualrow(
                                : (k == 4 ? xb4.x : k == 5 ? xb4.y : k == 6 ? xb4.z : xb4.w));
         }
 
-        // Row 1 (same x)
         float d1 = half_to_float((unsigned short)(b1[0] | (b1[1] << 8)));
         unsigned char qh1 = b1[66 + ib];
         unsigned char sc1 = b1[106 + i];

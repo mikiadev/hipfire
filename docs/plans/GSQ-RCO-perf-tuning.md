@@ -154,7 +154,7 @@ MQ3/bridge siblings and meets the plan's success bar. Greedy parity is
 NOT preserved (documented above); any future admission must weigh the
 1e-7 reordering against the 43% win.
 
-### Item 2b — post-Item-2 follow-up (2026-09-12, decode 10.2 → 10.4)
+### Item 2b — post-Item-2 follow-up (2026-09-12, decode 10.2 → 10.9)
 
 Attempts to close the remaining ~35% gap to the MQ3/bridge siblings
 (13.8-14.2) after Item 2 shipped. Profile/ISA root-cause: the dual-row
@@ -162,11 +162,19 @@ kernels are latency-bound (not bandwidth- or instruction-bound); the
 HFQ4 23 µs/call reference is not apples-to-apples (different M, no
 codebook). Levers tried on the dual-row kernels:
 
+- **Coalesced 4-block LDS staging in gemv_iq3_s_dualrow (+ residual):
+  SHIPPED.** The scalar kernel's scattered u8/u16 weight loads (qs/qh/
+  scales/signs at different offsets) coalesce poorly. Staging 4 blocks
+  (2 rows × 4 × 110 B = 880 B) into LDS with u32 loads + one sync per
+  group turns the scattered reads into ds_read. 235 → 204 µs/call
+  (plain, −13%), 116 → 108 (residual). Same staging in
+  gemv_iq3_xxs_dualrow: 238 → 233 µs/call (+2%, VGPR 38→72 so the win
+  is small; residual 109 → 115, net ~flat).
 - **LDS-stage the KV table in gemv_iq4_xs_dualrow (+ residual): SHIPPED.**
   The 16-entry kvalues_iq4nl lookups were 16 `global_load_b32` per
   iteration (8/row × 2 rows); staging the 64-byte table in LDS once per
   kernel turns them into `ds_read`. 268 → 243 µs/call (plain), 129 → 118
-  (residual). Parity unchanged (ALL PASS). Overall decode ~+2%.
+  (residual). Parity unchanged (ALL PASS).
 - **LDS-stage the IQ3_S codebook grid: REJECTED.** 512-entry grid staged
   in LDS once per kernel: 235 → 247 µs/call (−5%). The grid was already
   L1-hot (2 KB), so the setup + ds_read cost more than the L1-hit global
@@ -178,11 +186,14 @@ codebook). Levers tried on the dual-row kernels:
   the ILP gain is largely offset; combined with LDS grid staging it
   regressed. Not shipped.
 
+Measured (gfx1151, fresh-process ×3, prompt md5 `2c8abce9…`): decode
+OFF 7.1/7.1/7.1 → ON 10.9/10.8/10.8 → median **10.8 tok/s** (vs 10.2
+post-Item-2; +6%). Serialized decode kernel time 2877 → 2687 ms.
+
 Remaining headroom is small and structural (the I-quant codebook/sign/
 scale decode is fundamentally ~4× more instructions/element than HFQ4's
 direct 4-bit decode). Documented rejections above; no further lever is
-queued without a new mechanism (e.g. coalesced multi-block LDS staging
-with amortized sync, or packed `v_cvt_f32_i8`).
+queued without a new mechanism (e.g. packed `v_cvt_f32_i8`).
 
 ### Item 3 (optional) — fold the V-head PERM into the out_proj GEMV
 
