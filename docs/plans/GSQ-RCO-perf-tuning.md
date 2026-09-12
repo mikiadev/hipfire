@@ -33,6 +33,33 @@ touch it — see §3 Item 2.
 ³ Fresh-process ×3 median, prompt md5 `2c8abce9…`, daemon md5
 `e6d1f7b7…` (Item-2b build). §1 rows above are single-run directional.
 
+## 1a. Complete current-state survey (2026-09-12, post-Item-2b build)
+
+Prompt `Why is the sky blue?` (md5 `2c8abce9…`), greedy, `-n 1024`,
+natural stop (225-559 tok). pp/tg = fresh-process ×3 medians (warmup
+discarded), current build (daemon `e6d1f7b7…`, hipfire `5222d950…`),
+gfx1151. PPL = wikitext2 200 KB slice (md5 `538eb71f…`),
+`flash_prefill_quality` ctx512/chunks16/stride8, 512 scored.
+
+| model | file | size (GB / GiB) | md5 | PPL | prefill | decode |
+|---|---|---|---|---|---|---|
+| MQ3 ladder | `~/.hipfire/models/qwen3.8-27b.mq3` | 12.62 / 11.75 | `ad20b3d3…` | 10.54 | 47.3 | 16.5 |
+| MQ4 ladder | `~/.hipfire/models/qwen3.8-27b.mq4` | 15.66 / 14.59 | `d1292b4d…` | 9.23 | 31.3 | 13.3 |
+| MQ6 ladder | `~/.hipfire/models/qwen3.8-27b.mq6` | 21.75 / 20.26 | `ae18a5d9…` | 9.16 | 14.7 | 9.7 |
+| bridge (all-HFQ4 re-quant) | `/tmp/gsqrco-iq3s.hfq` | 14.97 / 13.94 | `3c60064f…` | 10.32 | 59.7 | 14.8 |
+| stage-4 native hybrid | `/tmp/gsqrco-stage4.hfq` | 12.99 / 12.10 | `d148a992…` | 9.68 | 9.5 | 11.4¹ |
+
+¹ stage-4 decode survey median 11.4; documented fresh-process median
+from the Item-2b commit is 11.7 (same build, different session position).
+
+**Corrections to §1:** the bridge prefill/PPL row there was measured on
+a pre-A_log-fix file (stale `/tmp/fpq16_gsqrco-iq3s.hfq.bin` = PPL 35.59);
+the current bridge file measures PPL 10.32 / prefill 59.7. Consequently
+§8's "prefill is already FASTER than the bridge (9.6 vs 7.2)" is
+OUTDATED: the current bridge prefills 6× faster than stage-4 (59.7 vs
+9.5). The native I-quant prefill GEMMs are the remaining prefill gap —
+still a separate track per §8, but the direction is now reversed.
+
 Single-run numbers are directional only; any claim needs the fresh-
 process protocol in §5. Post-Item-2b, native I-quant decode (11.7) is
 now within ~1.2x of the tuned HFQ4/MQ3 GEMV family (13.8-14.2)
