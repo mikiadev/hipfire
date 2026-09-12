@@ -170,6 +170,12 @@ codebook). Levers tried on the dual-row kernels:
   (plain, −13%), 116 → 108 (residual). Same staging in
   gemv_iq3_xxs_dualrow: 238 → 233 µs/call (+2%, VGPR 38→72 so the win
   is small; residual 109 → 115, net ~flat).
+- **Coalesced 2-block LDS staging in gemv_iq4_xs_dualrow (+ residual):
+  SHIPPED.** 4-block staging spilled (96 VGPR / 32 spills); 2-block
+  (2 rows × 2 × 136 B = 544 B) fits at 79 VGPR / 0 spills. On top of the
+  KV-table LDS: 243 → 209 µs/call (plain, −14%), 118 → 110 (residual).
+  Total iq4_xs improvement vs the Item-2 baseline: 268 → 209 µs/call
+  (−22%).
 - **LDS-stage the KV table in gemv_iq4_xs_dualrow (+ residual): SHIPPED.**
   The 16-entry kvalues_iq4nl lookups were 16 `global_load_b32` per
   iteration (8/row × 2 rows); staging the 64-byte table in LDS once per
@@ -187,8 +193,9 @@ codebook). Levers tried on the dual-row kernels:
   regressed. Not shipped.
 
 Measured (gfx1151, fresh-process ×3, prompt md5 `2c8abce9…`): decode
-OFF 7.1/7.1/7.1 → ON 10.9/10.8/10.8 → median **10.8 tok/s** (vs 10.2
-post-Item-2; +6%). Serialized decode kernel time 2877 → 2687 ms.
+OFF 7.1/7.1/7.1 → ON 11.5/11.5/11.5 → median **11.5 tok/s** (+6%
+over the 4-block state, +62% over the Item-2 scalar baseline).
+Serialized decode kernel time 2877 → 2595 ms.
 
 Remaining headroom is small and structural (the I-quant codebook/sign/
 scale decode is fundamentally ~4× more instructions/element than HFQ4's
