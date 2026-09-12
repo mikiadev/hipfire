@@ -24,18 +24,18 @@ Prompt: `Why is the sky blue?` (prompt md5 `2c8abce9…`, 18 tok,
 | `~/.hipfire/models/qwen3.8-27b.mq3` | 12.62 GB | 10.54 | 39.0 | 14.2 |
 | `/tmp/gsqrco-iq3s.hfq` (bridge, all-HFQ4G256 re-quant) | 14.97 GB | 10.32 | 7.2 | 13.8 |
 | `/tmp/gsqrco-stage4.hfq` (native hybrid) | 12.99 GB | **9.68** | 9.6 | **7.0** |
-| `/tmp/gsqrco-stage4.hfq` + Item-2 dual-row GEMVs | 12.99 GB | 9.68² | 9.6 | **10.2**³ |
+| `/tmp/gsqrco-stage4.hfq` + Item-2/2b dual-row GEMVs | 12.99 GB | 9.68² | 9.6 | **11.7**³ |
 
 ¹ PPL = wikitext2 200 KB slice, `flash_prefill_quality` ctx512/chunks16/
 stride8 (512 scored), md5 `538eb71f…`.
 ² PPL is prefill-only (batched GEMMs); the decode-GEMV change does not
 touch it — see §3 Item 2.
 ³ Fresh-process ×3 median, prompt md5 `2c8abce9…`, daemon md5
-`dd765164…` (Item-2 build). §1 rows above are single-run directional.
+`e6d1f7b7…` (Item-2b build). §1 rows above are single-run directional.
 
 Single-run numbers are directional only; any claim needs the fresh-
-process protocol in §5. Post-Item-2, native I-quant decode (10.2) is
-now within ~1.4x of the tuned HFQ4/MQ3 GEMV family (13.8-14.2)
+process protocol in §5. Post-Item-2b, native I-quant decode (11.7) is
+now within ~1.2x of the tuned HFQ4/MQ3 GEMV family (13.8-14.2)
 instead of ~2x slower.
 
 ## 2. Root cause (three compounding costs)
