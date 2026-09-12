@@ -154,6 +154,36 @@ MQ3/bridge siblings and meets the plan's success bar. Greedy parity is
 NOT preserved (documented above); any future admission must weigh the
 1e-7 reordering against the 43% win.
 
+### Item 2b — post-Item-2 follow-up (2026-09-12, decode 10.2 → 10.4)
+
+Attempts to close the remaining ~35% gap to the MQ3/bridge siblings
+(13.8-14.2) after Item 2 shipped. Profile/ISA root-cause: the dual-row
+kernels are latency-bound (not bandwidth- or instruction-bound); the
+HFQ4 23 µs/call reference is not apples-to-apples (different M, no
+codebook). Levers tried on the dual-row kernels:
+
+- **LDS-stage the KV table in gemv_iq4_xs_dualrow (+ residual): SHIPPED.**
+  The 16-entry kvalues_iq4nl lookups were 16 `global_load_b32` per
+  iteration (8/row × 2 rows); staging the 64-byte table in LDS once per
+  kernel turns them into `ds_read`. 268 → 243 µs/call (plain), 129 → 118
+  (residual). Parity unchanged (ALL PASS). Overall decode ~+2%.
+- **LDS-stage the IQ3_S codebook grid: REJECTED.** 512-entry grid staged
+  in LDS once per kernel: 235 → 247 µs/call (−5%). The grid was already
+  L1-hot (2 KB), so the setup + ds_read cost more than the L1-hit global
+  loads.
+- **LDS-stage the IQ3_XXS grid + ksigns: REJECTED (flat).** 236 vs 238
+  µs/call — no measurable effect, reverted.
+- **`#pragma unroll 4` on the gemv_iq3_s bi-loop (4-block K-tile):**
+  235 → 223 µs/call (+5%) but VGPR 41 → 81 (occupancy 16 → 12 waves), so
+  the ILP gain is largely offset; combined with LDS grid staging it
+  regressed. Not shipped.
+
+Remaining headroom is small and structural (the I-quant codebook/sign/
+scale decode is fundamentally ~4× more instructions/element than HFQ4's
+direct 4-bit decode). Documented rejections above; no further lever is
+queued without a new mechanism (e.g. coalesced multi-block LDS staging
+with amortized sync, or packed `v_cvt_f32_i8`).
+
 ### Item 3 (optional) — fold the V-head PERM into the out_proj GEMV
 
 A `gemv_iq*_residual_gguf` variant that reads x in ENGINE order and

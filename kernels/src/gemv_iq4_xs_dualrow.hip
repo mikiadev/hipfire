@@ -39,12 +39,13 @@ __device__ __forceinline__ float half_to_float(unsigned short h) {
     return __int_as_float((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13));
 }
 
+// kvalues_iq4nl from ggml-common.h / gguf_iq.rs (file scope so the kernel
+// can LDS-stage it: per-element lookups become ds_read, not global loads).
+const float IQ4NL_KV[16] = { -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f,
+                             -22.0f, -10.0f, 1.0f, 13.0f, 25.0f, 38.0f,
+                             53.0f, 69.0f, 89.0f, 113.0f };
 __device__ __forceinline__ float iq4nl_value(int nibble) {
-    // kvalues_iq4nl from ggml-common.h / gguf_iq.rs.
-    const float KV[16] = { -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f,
-                           -22.0f, -10.0f, 1.0f, 13.0f, 25.0f, 38.0f,
-                           53.0f, 69.0f, 89.0f, 113.0f };
-    return KV[nibble & 0xF];
+    return IQ4NL_KV[nibble & 0xF];
 }
 
 __launch_bounds__(32, 16)
@@ -64,6 +65,12 @@ extern "C" __global__ void gemv_iq4_xs_dualrow(
     const size_t row_stride = (size_t)blocks_per_row * 136;
     const unsigned char* row0_data = A_iq4xs + (size_t)row0 * row_stride;
     const unsigned char* row1_data = A_iq4xs + (size_t)(have_row1 ? row1 : row0) * row_stride;
+
+    // LDS-stage the 16-entry kvalues table once per kernel: per-element
+    // lookups become ds_read instead of global loads (16 per iteration).
+    __shared__ float s_kv[16];
+    if (tid < 16) s_kv[tid] = IQ4NL_KV[tid];
+    __syncthreads();
 
     const int ib = tid >> 2;
     // Element e = 8*tid + k has e%16 = ((tid&3)&1)*8 + k, so the 8 qs bytes
@@ -92,7 +99,7 @@ extern "C" __global__ void gemv_iq4_xs_dualrow(
         #pragma unroll
         for (int k = 0; k < 8; k++) {
             int kv = high ? ((int)((q0 >> (8 * k)) & 0xff) >> 4) : ((int)((q0 >> (8 * k)) & 0xff) & 0xf);
-            float w = dl0 * iq4nl_value(kv);
+            float w = dl0 * s_kv[kv];
             sum0 += w * (k < 4 ? (k == 0 ? xa.x : k == 1 ? xa.y : k == 2 ? xa.z : xa.w)
                                : (k == 4 ? xb4.x : k == 5 ? xb4.y : k == 6 ? xb4.z : xb4.w));
         }
@@ -107,7 +114,7 @@ extern "C" __global__ void gemv_iq4_xs_dualrow(
         #pragma unroll
         for (int k = 0; k < 8; k++) {
             int kv = high ? ((int)((q1 >> (8 * k)) & 0xff) >> 4) : ((int)((q1 >> (8 * k)) & 0xff) & 0xf);
-            float w = dl1 * iq4nl_value(kv);
+            float w = dl1 * s_kv[kv];
             sum1 += w * (k < 4 ? (k == 0 ? xa.x : k == 1 ? xa.y : k == 2 ? xa.z : xa.w)
                                : (k == 4 ? xb4.x : k == 5 ? xb4.y : k == 6 ? xb4.z : xb4.w));
         }
