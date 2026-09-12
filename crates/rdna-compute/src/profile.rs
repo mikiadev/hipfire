@@ -205,6 +205,14 @@ pub fn gemv_mq4g256_lloyd_bytes(m: usize, k: usize) -> usize {
     m * groups * 160 + k * 4 + m * 4
 }
 
+/// I-quant GEMV bytes (GGUF native formats): weight + x + y.
+/// `bytes_per_group` is the packed size per 256-element group
+/// (IQ3_S=110, IQ4_XS=136, Q4_K=144, IQ3_XXS=98).
+pub fn gemv_iq_bytes(m: usize, k: usize, bytes_per_group: usize) -> usize {
+    let groups = k / 256;
+    m * groups * bytes_per_group + k * 4 + m * 4
+}
+
 /// Bytes for a B-way batched HFQ4-G256 GEMM (weight read once, B input/output
 /// vectors).
 pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {

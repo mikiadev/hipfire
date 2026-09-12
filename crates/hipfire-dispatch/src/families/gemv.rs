@@ -457,6 +457,59 @@ fn prepare_rotation_scratch(
 
 // ── Central KernelKey-keyed launch ─────────────────────
 
+/// GSQ-RCO perf item 2 experiment gate: use the dual-row gemv_iq3_s on
+/// gfx1151 (the only arch with measured data) unless the caller opts out
+/// with `HIPFIRE_IQ3S_DUALROW=0`. Measured, not admitted — gfx1151 only.
+fn iq3s_dualrow_enabled(gpu: &Gpu) -> bool {
+    if !gpu.arch.starts_with("gfx1151") {
+        return false;
+    }
+    match std::env::var("HIPFIRE_IQ3S_DUALROW") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
+}
+
+/// Same experiment gate for gemv_iq3_xxs_dualrow (`HIPFIRE_IQ3XXS_DUALROW`).
+fn iq3xxs_dualrow_enabled(gpu: &Gpu) -> bool {
+    if !gpu.arch.starts_with("gfx1151") {
+        return false;
+    }
+    match std::env::var("HIPFIRE_IQ3XXS_DUALROW") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
+}
+
+/// Same experiment gate for gemv_iq4_xs_dualrow (`HIPFIRE_IQ4XS_DUALROW`).
+fn iq4xs_dualrow_enabled(gpu: &Gpu) -> bool {
+    if !gpu.arch.starts_with("gfx1151") {
+        return false;
+    }
+    match std::env::var("HIPFIRE_IQ4XS_DUALROW") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
+}
+
+/// Same experiment gate for gemv_q4k_dualrow (`HIPFIRE_Q4K_DUALROW`).
+///
+/// REJECTED (default OFF): measured 310 µs/call vs the scalar gemv_q4k's
+/// 237 µs/call on gfx1151 (M=K=4096, decode profile, HIPFIRE_GRAPH=0).
+/// The Q4_K contiguous-8 remap needs a per-thread sub-group branch plus a
+/// wider live range (41 VGPR vs the scalar kernel's leaner set) and the
+/// scalar kernel's 8 byte loads were already cheap; net 1.3× SLOWER. Kept
+/// as an opt-in kernel for a future revisit with a branch-free scale decode.
+fn q4k_dualrow_enabled(gpu: &Gpu) -> bool {
+    if !gpu.arch.starts_with("gfx1151") {
+        return false;
+    }
+    match std::env::var("HIPFIRE_Q4K_DUALROW") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    }
+}
+
 /// Launch the concrete GEMV kernel for a resolved key. 1:1 with KernelKey.
 fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchError> {
     use KernelKey as K;
@@ -482,11 +535,37 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvF16 => hip!(gpu.gemm_f16_batched_lmhead(w.buf, x, y, m, k, 1)),
         K::GemvBf16 => hip!(gpu.gemv_bf16_xf32(w.buf, x, y, m, k)),
         K::GemvQ8_0 => hip!(gpu.gemv_q8_0(w.buf, x, y, m, k)),
-        K::GemvQ4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
-        K::GemvIQ4XS => hip!(gpu.gemv_iq4_xs(w.buf, x, y, m, k)),
+        K::GemvQ4K => {
+            if q4k_dualrow_enabled(gpu) {
+                hip!(gpu.gemv_q4k_dualrow(w.buf, x, y, m, k))
+            } else {
+                hip!(gpu.gemv_q4k(w.buf, x, y, m, k))
+            }
+        }
+        K::GemvIQ4XS => {
+            if iq4xs_dualrow_enabled(gpu) {
+                hip!(gpu.gemv_iq4_xs_dualrow(w.buf, x, y, m, k))
+            } else {
+                hip!(gpu.gemv_iq4_xs(w.buf, x, y, m, k))
+            }
+        }
         K::GemvQ2K => hip!(gpu.gemv_q2k(w.buf, x, y, m, k)),
-        K::GemvIQ3S => hip!(gpu.gemv_iq3_s(w.buf, x, y, m, k)),
-        K::GemvIQ3XXS => hip!(gpu.gemv_iq3_xxs(w.buf, x, y, m, k)),
+        // GSQ-RCO perf item 2 experiment: dual-row gemv_iq3_s on gfx1151
+        // (HIPFIRE_IQ3S_DUALROW=0 opts back to the scalar kernel).
+        K::GemvIQ3S => {
+            if iq3s_dualrow_enabled(gpu) {
+                hip!(gpu.gemv_iq3_s_dualrow(w.buf, x, y, m, k))
+            } else {
+                hip!(gpu.gemv_iq3_s(w.buf, x, y, m, k))
+            }
+        }
+        K::GemvIQ3XXS => {
+            if iq3xxs_dualrow_enabled(gpu) {
+                hip!(gpu.gemv_iq3_xxs_dualrow(w.buf, x, y, m, k))
+            } else {
+                hip!(gpu.gemv_iq3_xxs(w.buf, x, y, m, k))
+            }
+        }
         K::GemvIQ2S => hip!(gpu.gemv_iq2_s(w.buf, x, y, m, k)),
         K::GemvIQ2XS => hip!(gpu.gemv_iq2_xs(w.buf, x, y, m, k)),
         K::GemvIQ2XXS => hip!(gpu.gemv_iq2_xxs(w.buf, x, y, m, k)),
@@ -563,10 +642,30 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         // GSQ-RCO native I-quant fused-residual GEMVs (perf item 1): y += W·x
         // in one launch for out_proj / FA o_proj (unrotated, GGUF-ordered x
         // supplied by the caller — the RESID_WO handler un-permutes first).
-        IQ3S => hip!(gpu.gemv_iq3_s_residual(w.buf, x, y, m, k)),
-        IQ4XS => hip!(gpu.gemv_iq4_xs_residual(w.buf, x, y, m, k)),
+        // perf item 2: dual-row variants on gfx1151 (same HIPFIRE_*_DUALROW
+        // gates as the plain GEMVs).
+        IQ3S => {
+            if iq3s_dualrow_enabled(gpu) {
+                hip!(gpu.gemv_iq3_s_dualrow_residual(w.buf, x, y, m, k))
+            } else {
+                hip!(gpu.gemv_iq3_s_residual(w.buf, x, y, m, k))
+            }
+        }
+        IQ4XS => {
+            if iq4xs_dualrow_enabled(gpu) {
+                hip!(gpu.gemv_iq4_xs_dualrow_residual(w.buf, x, y, m, k))
+            } else {
+                hip!(gpu.gemv_iq4_xs_residual(w.buf, x, y, m, k))
+            }
+        }
         Q4K => hip!(gpu.gemv_q4k_residual(w.buf, x, y, m, k)),
-        IQ3XXS => hip!(gpu.gemv_iq3_xxs_residual(w.buf, x, y, m, k)),
+        IQ3XXS => {
+            if iq3xxs_dualrow_enabled(gpu) {
+                hip!(gpu.gemv_iq3_xxs_dualrow_residual(w.buf, x, y, m, k))
+            } else {
+                hip!(gpu.gemv_iq3_xxs_residual(w.buf, x, y, m, k))
+            }
+        }
         // MQ-family WithResidual requires caller-supplied pre-rotated x
         // (same contract as Prerotated) — dispatch through HFQ residual kernel.
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),

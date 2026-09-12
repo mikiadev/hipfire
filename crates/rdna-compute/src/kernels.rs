@@ -26,6 +26,12 @@ pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");
 ///     sub-block 2g+1: upper nibbles of qs[g*32..g*32+32] → elements g*64+32..g*64+63
 pub const GEMV_Q4K_SRC: &str = include_str!("../../../kernels/src/gemv_q4k.hip");
 
+/// Q4_K dual-row GEMV (GSQ-RCO perf item 2, experiment): two rows per
+/// 32-thread wave, contiguous 8-element per-thread remap — 8 qbytes as one
+/// u64 load, float4 x shared across both rows. gfx1151-only dispatch behind
+/// HIPFIRE_Q4K_DUALROW (default on).
+pub const GEMV_Q4K_DUALROW_SRC: &str = include_str!("../../../kernels/src/gemv_q4k_dualrow.hip");
+
 /// HFQ4-G128: flat 4-bit with 128-weight groups.
 /// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights.
 /// Minimal metadata → minimal VGPRs. Hypothesis: ≤32 VGPRs → max occupancy.
@@ -4826,6 +4832,13 @@ pub const GEMM_Q4K_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q
 /// IQ4_XS projections through this scalar kernel.
 pub const GEMV_IQ4_XS_SRC: &str = include_str!("../../../kernels/src/gemv_iq4_xs.hip");
 
+/// IQ4_XS dual-row GEMV (GSQ-RCO perf item 2, experiment): two rows per
+/// 32-thread wave, contiguous 8-element per-thread remap — 8 qs nibbles as
+/// one u64 load, float4 x shared across both rows. gfx1151-only dispatch
+/// behind HIPFIRE_IQ4XS_DUALROW (default on).
+pub const GEMV_IQ4XS_DUALROW_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq4_xs_dualrow.hip");
+
 /// Batched IQ4_XS GEMM (GSQ-RCO native path). Same per-row math as
 /// gemv_iq4_xs (136 B groups, identical FMA order for greedy parity) with
 /// per-batch register accumulators. Prefill LA/FA/FFN matchers route IQ4XS
@@ -4849,6 +4862,13 @@ pub const GEMM_Q2K_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q
 /// release's IQ3_S projections through this scalar kernel.
 pub const GEMV_IQ3S_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_s.hip");
 
+/// IQ3_S dual-row GEMV (GSQ-RCO perf item 2, experiment): two rows per
+/// 32-thread wave with a contiguous 8-element per-thread remap — 2 grid
+/// lookups per 8 elements (vs 8 in the scalar kernel), one byte each for
+/// qs/qh/scales/signs, float4 x loads shared across both rows.
+/// gfx1151-only dispatch behind HIPFIRE_IQ3S_DUALROW (default on).
+pub const GEMV_IQ3S_DUALROW_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_s_dualrow.hip");
+
 /// IQ3_S fused-residual GEMV (GSQ-RCO perf item 1): same decode math as
 /// gemv_iq3_s with `y[row] += sum` epilogue — one launch replaces the
 /// un-fused plain-GEMV + add_inplace pair for out_proj / FA o_proj.
@@ -4866,6 +4886,16 @@ pub const GEMV_Q4K_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_
 pub const GEMV_IQ3XXS_RESIDUAL_SRC: &str =
     include_str!("../../../kernels/src/gemv_iq3_xxs_residual.hip");
 
+/// Dual-row fused-residual I-quant GEMVs (GSQ-RCO perf item 2): dual-row
+/// gemv_iq*_dualrow bodies with the `y[row] += sum` epilogue. gfx1151-only
+/// dispatch behind the matching HIPFIRE_*_DUALROW gate.
+pub const GEMV_IQ3S_DUALROW_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq3_s_dualrow_residual.hip");
+pub const GEMV_IQ4XS_DUALROW_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq4_xs_dualrow_residual.hip");
+pub const GEMV_IQ3XXS_DUALROW_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq3_xxs_dualrow_residual.hip");
+
 /// Batched IQ3_S GEMM (GSQ-RCO native path). Same per-row math as
 /// gemv_iq3_s (110 B groups, identical FMA order for greedy parity) with
 /// per-batch register accumulators. Prefill LA/FA/FFN matchers route IQ3S
@@ -4877,6 +4907,14 @@ pub const GEMM_IQ3S_BATCHED_SRC: &str =
 /// grid + ksigns_iq2xs sign table. Unrotated Plain — decode serves the
 /// release's IQ3_XXS projections through this scalar kernel.
 pub const GEMV_IQ3XXS_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_xxs.hip");
+
+/// IQ3_XXS dual-row GEMV (GSQ-RCO perf item 2, experiment): two rows per
+/// 32-thread wave with a contiguous 8-element per-thread remap — 2 grid
+/// lookups per 8 elements, one aux32 + one qs-pair + one ksigns lookup,
+/// float4 x shared across both rows. gfx1151-only dispatch behind
+/// HIPFIRE_IQ3XXS_DUALROW (default on).
+pub const GEMV_IQ3XXS_DUALROW_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq3_xxs_dualrow.hip");
 
 /// Batched IQ3_XXS GEMM (GSQ-RCO native path). Same per-row math as
 /// gemv_iq3_xxs (98 B groups, identical FMA order for greedy parity) with

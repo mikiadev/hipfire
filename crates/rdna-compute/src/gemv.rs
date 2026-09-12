@@ -349,8 +349,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 144);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_q4k", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -359,7 +361,65 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
+    }
+
+    /// y = A_q4k * x (GSQ-RCO perf item 2 experiment): dual-row variant of
+    /// gemv_q4k — two rows per 32-thread wave, contiguous 8-element
+    /// per-thread remap (8 qbytes as one u64 load), float4 x shared across
+    /// both rows. gfx1151-only dispatch behind HIPFIRE_Q4K_DUALROW.
+    pub fn gemv_q4k_dualrow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_q4k_dualrow",
+            kernels::GEMV_Q4K_DUALROW_SRC,
+            "gemv_q4k_dualrow",
+        )?;
+        let func = &self.functions["gemv_q4k_dualrow"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 144);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_q4k_dualrow", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// y += A_q4k * x (fused residual, GSQ-RCO perf item 1). Same decode math as gemv_q4k with `y[row] += sum`.
@@ -393,8 +453,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 144);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_q4k_residual", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -403,7 +465,11 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
 
     /// y = A_iq4xs * x (quantized matrix-vector multiply, A stored as IQ4_XS on GPU)
@@ -435,8 +501,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 136);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq4_xs", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -445,7 +513,65 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
+    }
+
+    /// y = A_iq4xs * x (GSQ-RCO perf item 2 experiment): dual-row variant of
+    /// gemv_iq4_xs — two rows per 32-thread wave, contiguous 8-element
+    /// per-thread remap (8 qs nibbles as one u64 load), float4 x shared
+    /// across both rows. gfx1151-only dispatch behind HIPFIRE_IQ4XS_DUALROW.
+    pub fn gemv_iq4_xs_dualrow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq4_xs_dualrow",
+            kernels::GEMV_IQ4XS_DUALROW_SRC,
+            "gemv_iq4_xs_dualrow",
+        )?;
+        let func = &self.functions["gemv_iq4_xs_dualrow"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 136);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq4_xs_dualrow", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// y += A_iq4xs * x (fused residual, GSQ-RCO perf item 1). Same decode math as gemv_iq4_xs with `y[row] += sum`.
@@ -479,8 +605,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 136);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq4_xs_residual", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -489,7 +617,170 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
+    }
+
+    /// y += A * x (GSQ-RCO perf item 2): dual-row fused-residual variant.
+    /// gfx1151-only dispatch behind the matching HIPFIRE_*_DUALROW gate.
+    pub fn gemv_iq4_xs_dualrow_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq4_xs_dualrow_residual",
+            kernels::GEMV_IQ4XS_DUALROW_RESIDUAL_SRC,
+            "gemv_iq4_xs_dualrow_residual",
+        )?;
+        let func = &self.functions["gemv_iq4_xs_dualrow_residual"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 136);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq4_xs_dualrow_residual", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// y += A * x (GSQ-RCO perf item 2): dual-row fused-residual variant.
+    /// gfx1151-only dispatch behind the matching HIPFIRE_*_DUALROW gate.
+    pub fn gemv_iq3_s_dualrow_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq3_s_dualrow_residual",
+            kernels::GEMV_IQ3S_DUALROW_RESIDUAL_SRC,
+            "gemv_iq3_s_dualrow_residual",
+        )?;
+        let func = &self.functions["gemv_iq3_s_dualrow_residual"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 110);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_s_dualrow_residual", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// y += A * x (GSQ-RCO perf item 2): dual-row fused-residual variant.
+    /// gfx1151-only dispatch behind the matching HIPFIRE_*_DUALROW gate.
+    pub fn gemv_iq3_xxs_dualrow_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq3_xxs_dualrow_residual",
+            kernels::GEMV_IQ3XXS_DUALROW_RESIDUAL_SRC,
+            "gemv_iq3_xxs_dualrow_residual",
+        )?;
+        let func = &self.functions["gemv_iq3_xxs_dualrow_residual"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 98);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_xxs_dualrow_residual", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// y = A_q2k * x (quantized matrix-vector multiply, A stored as Q2_K on GPU)
@@ -563,8 +854,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 110);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_s", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -573,7 +866,67 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
+    }
+
+    /// y = A_iq3s * x (GSQ-RCO perf item 2 experiment): dual-row variant of
+    /// gemv_iq3_s — two rows per 32-thread wave, contiguous 8-element
+    /// per-thread remap (2 grid lookups per 8 elements), float4 x shared
+    /// across both rows. Same block_iq3_s layout; FP-reduction order differs
+    /// from the scalar kernel (greedy parity verified by harness).
+    /// gfx1151-only dispatch behind HIPFIRE_IQ3S_DUALROW.
+    pub fn gemv_iq3_s_dualrow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq3_s_dualrow",
+            kernels::GEMV_IQ3S_DUALROW_SRC,
+            "gemv_iq3_s_dualrow",
+        )?;
+        let func = &self.functions["gemv_iq3_s_dualrow"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 110);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_s_dualrow", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// y += A_iq3s * x (fused residual, GSQ-RCO perf item 1). Same decode
@@ -609,8 +962,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 110);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_s_residual", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -619,7 +974,11 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
 
     /// y = A_iq3xxs * x (quantized matrix-vector multiply, A stored as IQ3_XXS on GPU)
@@ -651,8 +1010,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 98);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_xxs", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -661,7 +1022,65 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
+    }
+
+    /// y = A_iq3xxs * x (GSQ-RCO perf item 2 experiment): dual-row variant
+    /// of gemv_iq3_xxs — two rows per 32-thread wave, contiguous 8-element
+    /// per-thread remap (2 grid lookups per 8 elements), float4 x shared
+    /// across both rows. gfx1151-only dispatch behind HIPFIRE_IQ3XXS_DUALROW.
+    pub fn gemv_iq3_xxs_dualrow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq3_xxs_dualrow",
+            kernels::GEMV_IQ3XXS_DUALROW_SRC,
+            "gemv_iq3_xxs_dualrow",
+        )?;
+        let func = &self.functions["gemv_iq3_xxs_dualrow"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 98);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_xxs_dualrow", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// y += A_iq3xxs * x (fused residual, GSQ-RCO perf item 1). Same decode math as gemv_iq3_xxs with `y[row] += sum`.
@@ -695,8 +1114,10 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 98);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_xxs_residual", bytes);
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -705,7 +1126,11 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
 
     

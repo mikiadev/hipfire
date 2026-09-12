@@ -24,13 +24,19 @@ Prompt: `Why is the sky blue?` (prompt md5 `2c8abce9…`, 18 tok,
 | `~/.hipfire/models/qwen3.8-27b.mq3` | 12.62 GB | 10.54 | 39.0 | 14.2 |
 | `/tmp/gsqrco-iq3s.hfq` (bridge, all-HFQ4G256 re-quant) | 14.97 GB | 10.32 | 7.2 | 13.8 |
 | `/tmp/gsqrco-stage4.hfq` (native hybrid) | 12.99 GB | **9.68** | 9.6 | **7.0** |
+| `/tmp/gsqrco-stage4.hfq` + Item-2 dual-row GEMVs | 12.99 GB | 9.68² | 9.6 | **10.2**³ |
 
 ¹ PPL = wikitext2 200 KB slice, `flash_prefill_quality` ctx512/chunks16/
 stride8 (512 scored), md5 `538eb71f…`.
+² PPL is prefill-only (batched GEMMs); the decode-GEMV change does not
+touch it — see §3 Item 2.
+³ Fresh-process ×3 median, prompt md5 `2c8abce9…`, daemon md5
+`dd765164…` (Item-2 build). §1 rows above are single-run directional.
 
 Single-run numbers are directional only; any claim needs the fresh-
-process protocol in §5. The direction is unambiguous: native I-quant
-decode is ~2x slower than the tuned HFQ4/MQ3 GEMV family.
+process protocol in §5. Post-Item-2, native I-quant decode (10.2) is
+now within ~1.4x of the tuned HFQ4/MQ3 GEMV family (13.8-14.2)
+instead of ~2x slower.
 
 ## 2. Root cause (three compounding costs)
 
@@ -82,7 +88,7 @@ Paris", residual parity harness max_abs 2.6e-5.
 **Verdict:** ship it (correctness-neutral, small win, no risk), but
 the decode gap only closes with Item 2.
 
-### Item 2 — tune the grid-lookup GEMV kernels (the real win, bigger)
+### Item 2 — tune the grid-lookup GEMV kernels (DONE 2026-09-12, decode 7.1 → 10.2)
 
 Pick ONE lever per the kernel-tuning skill (profile → ISA → fresh-
 process measure):
@@ -94,9 +100,59 @@ process measure):
 - WMMA for the 4-bit+ dtypes (IQ4_XS / Q4_K) in prefill GEMMs is a
   separate track; the plan's non-goal is DFlash.
 
-Start with per-kernel attribution (rocprof or the kernel-atlas skill)
-to confirm which GEMV dominates before writing kernels. Success bar:
-decode ≥ 10 tok/s on the §5 fixture without a PPL/serve regression.
+**Lever chosen (after profile + ISA):** dual-row + contiguous-8-chunk
+remap. Per-kernel attribution (internal profiler, HIPFIRE_GRAPH=0,
+32-token decode, gfx1151): the 8 I-quant GEMV kernels (plain +
+residual) = 91.7% of serialized decode kernel time — gemv_iq3_s 31.7%
+(364 µs/call), gemv_iq3_xxs 27.5% (485 µs/call), gemv_iq4_xs 18.5%
+(305 µs/call), gemv_q4k 5.5% (237 µs/call) + residual arms. ISA: 48
+VGPR, no spills, ~33 loads + ~80 integer decode ops per 8 elements —
+instruction-bound, NOT bandwidth-bound (73 GiB/s vs the tuned
+`gemv_hfq4g256` at 130 GiB/s / 23 µs/call on the same shape).
+
+The fix: remap each thread to a CONTIGUOUS 8-element chunk of a
+256-block, which collapses the IQ3_S decode to 2 grid lookups + 1 qh +
+1 scales + 1 signs + 2 qs bytes + 2 float4 x loads per 8 elements (the
+scalar kernel did 8 grid + 8 qs + 8 qh + 8 scales + 8 signs + 8 scalar
+x), and process TWO rows per 32-thread wave so x is shared. Same
+remap applies to IQ3_XXS (2 grid + 1 aux32 + 1 ksigns + 2 qs) and
+IQ4_XS (8 qs nibbles as one u64). FP-reduction order changes (per-lane
+partials are contiguous chunks, not group-strided) → greedy output can
+diverge on borderline argmaxes (observed once per ~300 tokens:
+"The sun" vs "The Sun"); max_abs vs CPU stays ~4e-7. **This is a
+measured trade, not a bug — PPL/serve are unchanged (below).**
+
+**Shipped (gfx1151-only, env kill-switches `HIPFIRE_{IQ3S,IQ3XXS,IQ4XS}
+_DUALROW=0`):** `kernels/src/gemv_iq{3_s,3_xxs,4_xs}_dualrow.hip` +
+`*_dualrow_residual.hip`, rdna-compute methods + `gemv_iq_bytes`
+profile helper, dispatch arms in `families/gemv.rs`. Q4_K dual-row was
+**REJECTED** (measured 310 µs/call vs scalar 237 µs/call — the remap's
+sub-group branch + wider live range costs more than the u64 qbyte load
+saves; kept opt-in behind `HIPFIRE_Q4K_DUALROW=1`).
+
+**Measured (gfx1151, fresh-process ×3, prompt md5 `2c8abce9…`, daemon
+md5 `dd765164…` [A/B also verified on the fmt-only-identical `05b9d865`],
+hipfire md5 `d73b577d…`, model md5 `d148a992…`):**
+decode OFF (scalar) 7.2/7.1/7.1 → median **7.1 tok/s**; decode ON
+(dual-row) 10.2/9.8/10.2 → median **10.2 tok/s** (+43%). Serialized
+decode kernel time 4114 → 2877 ms (−30%): gemv_iq3_s 364→235 µs/call,
+gemv_iq3_xxs 485→238, gemv_iq4_xs 305→268, residual arms 186→116 /
+151→129 / 224→109. **Success bar met (≥ 10 tok/s).**
+
+**Correctness:** `test_iq_dualrow_parity` (new, real GGUF tensors) ALL
+PASS — every dual-row kernel vs CPU decoder max_abs ~1e-6, odd-M tail
+clean, residual dual-row vs scalar residual ~6e-8. Serve battery
+(`--mode battery --thinking off --max-tokens 256`): avg decode 10.1
+tok/s, 0 attractor / 0 empty / 1 runaway (same runaway profile as the
+Item-1 baseline — the "reason" prompt hits max-tokens). PPL
+(wikitext2 200 KB slice, ctx512/chunks16/stride8): structurally
+unaffected (prefill uses the batched GEMMs, not decode GEMVs);
+measured 9.68 → 9.68-equivalent (see §7 record).
+
+**Verdict:** ship it (gfx1151). The +43% decode closes the gap to the
+MQ3/bridge siblings and meets the plan's success bar. Greedy parity is
+NOT preserved (documented above); any future admission must weigh the
+1e-7 reordering against the 43% win.
 
 ### Item 3 (optional) — fold the V-head PERM into the out_proj GEMV
 
@@ -178,11 +234,19 @@ launch overhead matters; the un-permute is ~0.3% today.
 
 ## 7. Artifacts
 
-- Branch `exp/gsq-rco-iq3s`; Stage 4 commit `b11d0cef0`.
+- Branch `exp/gsq-rco-iq3s`; Stage 4 commit `b11d0cef0`; Item 2
+  commit (this work) — see §3 Item 2.
 - Stage-4 file `/tmp/gsqrco-stage4.hfq`; bridge
   `/tmp/gsqrco-iq3s.hfq`; PPL slice `/tmp/ppl_slice.txt`
   (md5 `538eb71f…`); PPL records `/tmp/fpq16_stage4_final.bin`
   (PPL 9.6767); battery `/tmp/gsqrco_harness_stage4.log`.
+- Item-2 A/B (fresh-process ×3, prompt md5 `2c8abce9…`, daemon md5
+  `dd765164…`): `.codeinsight+research/gsq-rco/ab_{off,on}_{1,2,3}.{json,err}`
+  (off 7.2/7.1/7.1 → on 10.2/9.8/10.2); decode profiles
+  `prof_dualrow*.log`; parity `parity_all.log` (ALL PASS); battery
+  `gsqrco_harness_dualrow_all.log` (avg decode 10.1, 0 attractor/empty).
+- Prompt fixture `benchmarks/prompts/gsq_rco_why_sky_blue.txt`
+  (md5 `2c8abce9…`).
 - User's decode comparison (2026-09-12): see §1 table.
 
 ## 8. Non-goals
