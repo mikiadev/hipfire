@@ -116,21 +116,21 @@ extern "C" __global__ void gemv_iq3_xxs_dualrow_residual(
 
     // GSQ-RCO perf item 2b: stage 4 blocks (2 rows x 4 x 98 B) into LDS
     // with COALESCED u32 loads, one sync, then decode from LDS.
-    __shared__ unsigned char s_blk[784];
+    __shared__ unsigned char s_blk[392];
     int bg = 0;
-    for (; bg + 4 <= blocks_per_row; bg += 4) {
+    for (; bg + 2 <= blocks_per_row; bg += 2) {
         const unsigned int* src0 = (const unsigned int*)(row0_data + bg * 98);
         const unsigned int* src1 = (const unsigned int*)(row1_data + bg * 98);
         #pragma unroll
-        for (int i = tid; i < 98; i += 32) {
+        for (int i = tid; i < 49; i += 32) {
             ((unsigned int*)s_blk)[i] = src0[i];
-            ((unsigned int*)s_blk)[98 + i] = src1[i];
+            ((unsigned int*)s_blk)[49 + i] = src1[i];
         }
         __syncthreads();
         #pragma unroll
-        for (int bi = 0; bi < 4; bi++) {
+        for (int bi = 0; bi < 2; bi++) {
             const unsigned char* b0 = s_blk + bi * 98;
-            const unsigned char* b1 = s_blk + 392 + bi * 98;
+            const unsigned char* b1 = s_blk + 196 + bi * 98;
             const float* xb = x + (bg + bi) * 256 + x_off;
 
             const float4 xa = *reinterpret_cast<const float4*>(xb);

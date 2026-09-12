@@ -167,9 +167,11 @@ codebook). Levers tried on the dual-row kernels:
   scales/signs at different offsets) coalesce poorly. Staging 4 blocks
   (2 rows × 4 × 110 B = 880 B) into LDS with u32 loads + one sync per
   group turns the scattered reads into ds_read. 235 → 204 µs/call
-  (plain, −13%), 116 → 108 (residual). Same staging in
-  gemv_iq3_xxs_dualrow: 238 → 233 µs/call (+2%, VGPR 38→72 so the win
-  is small; residual 109 → 115, net ~flat).
+  (plain, −13%), 116 → 108 (residual).
+- **Coalesced 2-block LDS staging in gemv_iq3_xxs_dualrow (+ residual):
+  SHIPPED.** 4-block staging only gave +2% (VGPR 38→72); 2-block
+  (2 rows × 2 × 98 B = 392 B) at 86 VGPR / 0 spills gives 238 → 211
+  µs/call (plain, −11%), residual 109 → ~100.
 - **Coalesced 2-block LDS staging in gemv_iq4_xs_dualrow (+ residual):
   SHIPPED.** 4-block staging spilled (96 VGPR / 32 spills); 2-block
   (2 rows × 2 × 136 B = 544 B) fits at 79 VGPR / 0 spills. On top of the
@@ -193,9 +195,9 @@ codebook). Levers tried on the dual-row kernels:
   regressed. Not shipped.
 
 Measured (gfx1151, fresh-process ×3, prompt md5 `2c8abce9…`): decode
-OFF 7.1/7.1/7.1 → ON 11.5/11.5/11.5 → median **11.5 tok/s** (+6%
-over the 4-block state, +62% over the Item-2 scalar baseline).
-Serialized decode kernel time 2877 → 2595 ms.
+OFF 7.1/7.1/6.7 → ON 11.5/11.7/11.7 → median **11.7 tok/s** (+65%
+over the Item-2 scalar baseline 7.1). Serialized decode kernel time
+2877 → ~2549 ms.
 
 Remaining headroom is small and structural (the I-quant codebook/sign/
 scale decode is fundamentally ~4× more instructions/element than HFQ4's
