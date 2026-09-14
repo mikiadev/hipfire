@@ -3312,12 +3312,19 @@ impl Gpu {
         let d_x = self.zeros(&[256], DType::F32)?;
         let d_xs = self.alloc_tensor(&[256], DType::Raw)?;
         let d_sc = self.zeros(&[8], DType::F32)?;
-        let d_w = self.alloc_tensor(&[220], DType::Raw)?; // 2 rows x 1 block x 110 B
         let d_y = self.zeros(&[2], DType::F32)?;
+        // 2 rows x 1 block: 110 B (IQ3S), 98 B (IQ3_XXS), 136 B (IQ4_XS).
+        let d_w_s = self.alloc_tensor(&[220], DType::Raw)?;
+        let d_w_xxs = self.alloc_tensor(&[196], DType::Raw)?;
+        let d_w_xs = self.alloc_tensor(&[272], DType::Raw)?;
         self.quantize_q8_1(&d_x, &d_xs, &d_sc, 256)?;
-        self.gemv_iq3_s_q8dot(&d_w, &d_xs, &d_sc, &d_y, 2, 256)?;
-        self.gemv_iq3_s_q8dot_residual(&d_w, &d_xs, &d_sc, &d_y, 2, 256)?;
-        for t in [d_x, d_xs, d_sc, d_w, d_y] {
+        self.gemv_iq3_s_q8dot(&d_w_s, &d_xs, &d_sc, &d_y, 2, 256)?;
+        self.gemv_iq3_s_q8dot_residual(&d_w_s, &d_xs, &d_sc, &d_y, 2, 256)?;
+        self.gemv_iq3_xxs_q8dot(&d_w_xxs, &d_xs, &d_sc, &d_y, 2, 256)?;
+        self.gemv_iq3_xxs_q8dot_residual(&d_w_xxs, &d_xs, &d_sc, &d_y, 2, 256)?;
+        self.gemv_iq4_xs_q8dot(&d_w_xs, &d_xs, &d_sc, &d_y, 2, 256)?;
+        self.gemv_iq4_xs_q8dot_residual(&d_w_xs, &d_xs, &d_sc, &d_y, 2, 256)?;
+        for t in [d_x, d_xs, d_sc, d_y, d_w_s, d_w_xxs, d_w_xs] {
             let _ = self.free_tensor(t);
         }
         Ok(())

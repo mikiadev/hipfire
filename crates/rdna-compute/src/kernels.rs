@@ -4908,6 +4908,15 @@ pub const QUANTIZE_Q8_1_SRC: &str = include_str!("../../../kernels/src/quantize_
 /// Plain + fused-residual variants in one source.
 pub const GEMV_IQ3S_Q8DOT_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_s_q8dot.hip");
 
+/// IQ3_XXS q8_1 + dp4a dual-row GEMV (GSQ-RCO decode-next): the IQ3_XXS twin
+/// of GEMV_IQ3S_Q8DOT_SRC (separate ksigns sign array, carry-free packed sign).
+pub const GEMV_IQ3XXS_Q8DOT_SRC: &str =
+    include_str!("../../../kernels/src/gemv_iq3_xxs_q8dot.hip");
+
+/// IQ4_XS q8_1 + dp4a dual-row GEMV (GSQ-RCO decode-next): signed kvalues table,
+/// no separate sign step.
+pub const GEMV_IQ4XS_Q8DOT_SRC: &str = include_str!("../../../kernels/src/gemv_iq4_xs_q8dot.hip");
+
 /// Batched IQ3_S GEMM (GSQ-RCO native path). Same per-row math as
 /// gemv_iq3_s (110 B groups, identical FMA order for greedy parity) with
 /// per-batch register accumulators. Prefill LA/FA/FFN matchers route IQ3S

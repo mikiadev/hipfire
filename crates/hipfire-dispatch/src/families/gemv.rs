@@ -523,10 +523,11 @@ fn iq3s_q8dot_enabled(gpu: &Gpu) -> bool {
     }
 }
 
-/// Quantize `x` to q8_1 (cached scratch) and run the dp4a IQ3_S GEMV, plain or
-/// fused-residual. `k` must be a multiple of 256/32 (all GSQ-RCO IQ3_S
-/// projections are). The scratch is moved out of `Gpu` around the `&mut`
-/// kernel calls so no allocation lands inside a captured decode graph.
+/// Quantize `x` to q8_1 (cached scratch) and run the dp4a I-quant GEMV, plain
+/// or fused-residual, for the dtypes that have a q8dot kernel (IQ3S / IQ3XXS /
+/// IQ4XS). `k` must be a multiple of 256/32 (all GSQ-RCO I-quant projections
+/// are). The scratch is moved out of `Gpu` around the `&mut` kernel calls so no
+/// allocation lands inside a captured decode graph.
 fn launch_iq3s_q8dot(
     gpu: &mut Gpu,
     w: &WeightRef,
@@ -536,16 +537,21 @@ fn launch_iq3s_q8dot(
     k: usize,
     residual: bool,
 ) -> Result<(), DispatchError> {
+    use rdna_compute::DType;
     let mapped = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
     gpu.ensure_q8_scratch(k).map_err(mapped)?;
     let (xs, sc, cap) = gpu
         .take_q8_scratch()
         .expect("q8 scratch ensured immediately above");
     let r = gpu.quantize_q8_1(x, &xs, &sc, k).and_then(|_| {
-        if residual {
-            gpu.gemv_iq3_s_q8dot_residual(w.buf, &xs, &sc, y, m, k)
-        } else {
-            gpu.gemv_iq3_s_q8dot(w.buf, &xs, &sc, y, m, k)
+        match (w.dtype, residual) {
+            (DType::IQ3S, false) => gpu.gemv_iq3_s_q8dot(w.buf, &xs, &sc, y, m, k),
+            (DType::IQ3S, true) => gpu.gemv_iq3_s_q8dot_residual(w.buf, &xs, &sc, y, m, k),
+            (DType::IQ3XXS, false) => gpu.gemv_iq3_xxs_q8dot(w.buf, &xs, &sc, y, m, k),
+            (DType::IQ3XXS, true) => gpu.gemv_iq3_xxs_q8dot_residual(w.buf, &xs, &sc, y, m, k),
+            (DType::IQ4XS, false) => gpu.gemv_iq4_xs_q8dot(w.buf, &xs, &sc, y, m, k),
+            (DType::IQ4XS, true) => gpu.gemv_iq4_xs_q8dot_residual(w.buf, &xs, &sc, y, m, k),
+            _ => Err(hip_bridge::HipError::new(0, "no q8dot kernel for dtype")),
         }
     });
     gpu.put_q8_scratch(xs, sc, cap);
@@ -585,7 +591,9 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
             }
         }
         K::GemvIQ4XS => {
-            if iq4xs_dualrow_enabled(gpu) {
+            if iq3s_q8dot_enabled(gpu) && k % 256 == 0 {
+                launch_iq3s_q8dot(gpu, w, x, y, m, k, false)
+            } else if iq4xs_dualrow_enabled(gpu) {
                 hip!(gpu.gemv_iq4_xs_dualrow(w.buf, x, y, m, k))
             } else {
                 hip!(gpu.gemv_iq4_xs(w.buf, x, y, m, k))
@@ -604,7 +612,9 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
             }
         }
         K::GemvIQ3XXS => {
-            if iq3xxs_dualrow_enabled(gpu) {
+            if iq3s_q8dot_enabled(gpu) && k % 256 == 0 {
+                launch_iq3s_q8dot(gpu, w, x, y, m, k, false)
+            } else if iq3xxs_dualrow_enabled(gpu) {
                 hip!(gpu.gemv_iq3_xxs_dualrow(w.buf, x, y, m, k))
             } else {
                 hip!(gpu.gemv_iq3_xxs(w.buf, x, y, m, k))
@@ -698,7 +708,9 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
             }
         }
         IQ4XS => {
-            if iq4xs_dualrow_enabled(gpu) {
+            if iq3s_q8dot_enabled(gpu) && k % 256 == 0 {
+                launch_iq3s_q8dot(gpu, w, x, y, m, k, true)
+            } else if iq4xs_dualrow_enabled(gpu) {
                 hip!(gpu.gemv_iq4_xs_dualrow_residual(w.buf, x, y, m, k))
             } else {
                 hip!(gpu.gemv_iq4_xs_residual(w.buf, x, y, m, k))
@@ -706,7 +718,9 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         }
         Q4K => hip!(gpu.gemv_q4k_residual(w.buf, x, y, m, k)),
         IQ3XXS => {
-            if iq3xxs_dualrow_enabled(gpu) {
+            if iq3s_q8dot_enabled(gpu) && k % 256 == 0 {
+                launch_iq3s_q8dot(gpu, w, x, y, m, k, true)
+            } else if iq3xxs_dualrow_enabled(gpu) {
                 hip!(gpu.gemv_iq3_xxs_dualrow_residual(w.buf, x, y, m, k))
             } else {
                 hip!(gpu.gemv_iq3_xxs_residual(w.buf, x, y, m, k))

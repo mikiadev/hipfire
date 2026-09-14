@@ -191,6 +191,13 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "/data/rocmfpx/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf".to_string());
     let filter = args.get(2).cloned();
+    // Optional quant selector: iq3s (default) | iq3xxs | iq4xs
+    let quant = args.get(3).cloned().unwrap_or_else(|| "iq3s".to_string());
+    let ggml = match quant.as_str() {
+        "iq3xxs" => GgmlType::IQ3XXS,
+        "iq4xs" => GgmlType::IQ4XS,
+        _ => GgmlType::IQ3S,
+    };
 
     let gguf = GgufFile::open(Path::new(&path)).expect("open GGUF failed");
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
@@ -199,7 +206,7 @@ fn main() {
     // Prefer a large IQ3_S 2D tensor; allow a name filter (e.g. in_proj_qkv).
     let mut found = None;
     for t in &gguf.tensors {
-        if t.dtype == GgmlType::IQ3S && t.shape.len() == 2 && t.shape[1] % 256 == 0 {
+        if t.dtype == ggml && t.shape.len() == 2 && t.shape[1] % 256 == 0 {
             if let Some(f) = &filter {
                 if !t.name.contains(f.as_str()) {
                     continue;
@@ -216,13 +223,13 @@ fn main() {
         }
     }
     let Some(t) = found else {
-        eprintln!("no matching IQ3_S 2D tensor");
+        eprintln!("no matching {} 2D tensor", quant);
         std::process::exit(2);
     };
     let m = t.shape[0];
     let k = t.shape[1];
     let raw = gguf.tensor_data(t);
-    eprintln!("=== IQ3_S: {} [{} x {}] ===", t.name, m, k);
+    eprintln!("=== {}: {} [{} x {}] ===", quant, t.name, m, k);
 
     // Deterministic activation with realistic magnitude (~N(0,1)-ish).
     let mut x_data: Vec<f32> = (0..k).map(|i| {
@@ -236,7 +243,13 @@ fn main() {
 
     // CPU q8_1 oracle.
     let (xs_cpu, sc_cpu) = cpu_quantize_q8_1(&x_data, k);
-    let y_oracle = cpu_q8dot_iq3s(raw, &xs_cpu, &sc_cpu, m, k);
+    // CPU oracle only exists for IQ3_S; for the other dtypes correctness is
+    // checked q8dot-vs-dualrow (within the q8_1 activation delta).
+    let y_oracle = if quant == "iq3s" {
+        Some(cpu_q8dot_iq3s(raw, &xs_cpu, &sc_cpu, m, k))
+    } else {
+        None
+    };
 
     // Uploads.
     let d_raw = gpu.upload_raw(raw, &[raw.len()]).unwrap();
@@ -248,8 +261,20 @@ fn main() {
 
     // Run: quantize (GPU) + q8dot, and dual-row fp32.
     gpu.quantize_q8_1(&d_x, &d_xs, &d_sc, k).unwrap();
-    gpu.gemv_iq3_s_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap();
-    gpu.gemv_iq3_s_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap();
+    match quant.as_str() {
+        "iq3xxs" => {
+            gpu.gemv_iq3_xxs_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap();
+            gpu.gemv_iq3_xxs_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap();
+        }
+        "iq4xs" => {
+            gpu.gemv_iq4_xs_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap();
+            gpu.gemv_iq4_xs_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap();
+        }
+        _ => {
+            gpu.gemv_iq3_s_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap();
+            gpu.gemv_iq3_s_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap();
+        }
+    }
 
     let y_q8 = gpu.download_f32(&d_yq).unwrap();
     let y_dual = gpu.download_f32(&d_yd).unwrap();
@@ -266,36 +291,58 @@ fn main() {
     let sc_err = max_abs(&sc_gpu, &sc_cpu);
     eprintln!("  quantize: xs mismatches={xs_mismatch}/{}  sc max_abs={sc_err:.8}", k);
 
-    let q8_vs_oracle = max_abs(&y_q8, &y_oracle);
+    let q8_vs_oracle = y_oracle.as_ref().map(|o| max_abs(&y_q8, o));
     let q8_vs_dual = max_abs(&y_q8, &y_dual);
     let dual_mag = y_dual.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-    eprintln!("  q8dot  vs CPU q8_1 oracle  max_abs={q8_vs_oracle:.6}  rel={:.6}",
-        q8_vs_oracle / dual_mag.max(1e-12));
+    if let Some(v) = q8_vs_oracle {
+        eprintln!("  q8dot  vs CPU q8_1 oracle  max_abs={v:.6}  rel={:.6}",
+            v / dual_mag.max(1e-12));
+    }
     eprintln!("  q8dot  vs dualrow (fp32)   max_abs={q8_vs_dual:.6}  rel={:.6}",
         q8_vs_dual / dual_mag.max(1e-12));
     eprintln!("  dualrow magnitude max={dual_mag:.4}");
-    if q8_vs_oracle > 1e-3 * dual_mag.max(1e-12) {
-        eprintln!("  FAIL: q8dot kernel deviates from CPU oracle beyond rounding");
+    if let Some(v) = q8_vs_oracle {
+        if v > 1e-3 * dual_mag.max(1e-12) {
+            eprintln!("  FAIL: q8dot kernel deviates from CPU oracle beyond rounding");
+        }
     }
 
     // Residual variant: y += A @ x_q8_1 vs dualrow residual.
     let y_init: Vec<f32> = (0..m).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
     let d_yr_q = gpu.upload_f32(&y_init, &[m]).unwrap();
     let d_yr_d = gpu.upload_f32(&y_init, &[m]).unwrap();
-    gpu.gemv_iq3_s_q8dot_residual(&d_raw, &d_xs, &d_sc, &d_yr_q, m, k).unwrap();
-    gpu.gemv_iq3_s_dualrow_residual(&d_raw, &d_x, &d_yr_d, m, k).unwrap();
+    match quant.as_str() {
+        "iq3xxs" => {
+            gpu.gemv_iq3_xxs_q8dot_residual(&d_raw, &d_xs, &d_sc, &d_yr_q, m, k).unwrap();
+            gpu.gemv_iq3_xxs_dualrow_residual(&d_raw, &d_x, &d_yr_d, m, k).unwrap();
+        }
+        "iq4xs" => {
+            gpu.gemv_iq4_xs_q8dot_residual(&d_raw, &d_xs, &d_sc, &d_yr_q, m, k).unwrap();
+            gpu.gemv_iq4_xs_dualrow_residual(&d_raw, &d_x, &d_yr_d, m, k).unwrap();
+        }
+        _ => {
+            gpu.gemv_iq3_s_q8dot_residual(&d_raw, &d_xs, &d_sc, &d_yr_q, m, k).unwrap();
+            gpu.gemv_iq3_s_dualrow_residual(&d_raw, &d_x, &d_yr_d, m, k).unwrap();
+        }
+    }
     let yr_q = gpu.download_f32(&d_yr_q).unwrap();
     let yr_d = gpu.download_f32(&d_yr_d).unwrap();
     // oracle: y_init + oracle-dot
-    let yr_oracle: Vec<f32> = y_init.iter().zip(y_oracle.iter()).map(|(a, b)| a + b).collect();
-    eprintln!("  residual q8dot vs oracle  max_abs={:.6}", max_abs(&yr_q, &yr_oracle));
+    if let Some(o) = y_oracle.as_ref() {
+        let yr_oracle: Vec<f32> = y_init.iter().zip(o.iter()).map(|(a, b)| a + b).collect();
+        eprintln!("  residual q8dot vs oracle  max_abs={:.6}", max_abs(&yr_q, &yr_oracle));
+    }
     eprintln!("  residual q8dot vs dualrow max_abs={:.6}", max_abs(&yr_q, &yr_d));
 
     // Timing: N iterations each, sync via download.
     let iters = 200usize;
     let t0 = Instant::now();
     for _ in 0..iters {
-        gpu.gemv_iq3_s_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap();
+        match quant.as_str() {
+            "iq3xxs" => gpu.gemv_iq3_xxs_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap(),
+            "iq4xs" => gpu.gemv_iq4_xs_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap(),
+            _ => gpu.gemv_iq3_s_dualrow(&d_raw, &d_x, &d_yd, m, k).unwrap(),
+        }
     }
     let _ = gpu.download_f32(&d_yd).unwrap();
     let t_dual = t0.elapsed().as_secs_f64() / iters as f64;
@@ -303,7 +350,11 @@ fn main() {
     let t1 = Instant::now();
     for _ in 0..iters {
         gpu.quantize_q8_1(&d_x, &d_xs, &d_sc, k).unwrap();
-        gpu.gemv_iq3_s_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap();
+        match quant.as_str() {
+            "iq3xxs" => gpu.gemv_iq3_xxs_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap(),
+            "iq4xs" => gpu.gemv_iq4_xs_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap(),
+            _ => gpu.gemv_iq3_s_q8dot(&d_raw, &d_xs, &d_sc, &d_yq, m, k).unwrap(),
+        }
     }
     let _ = gpu.download_f32(&d_yq).unwrap();
     let t_q8 = t1.elapsed().as_secs_f64() / iters as f64;
