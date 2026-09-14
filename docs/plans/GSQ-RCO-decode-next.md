@@ -180,6 +180,15 @@ non-I-quant kernels running at lower bandwidth plus non-kernel overhead, not
 arithmetic. This is why the kernel-level 1.5× converts to +14.5% E2E, not
 +40%.
 
+**Coherence battery** (`scripts/serve_harness.py --mode battery --thinking off
+--max-tokens 256`, daemon `a0dec359…`): q8dot off avg_decode 11.7 tok/s,
+`runaway=1 empty=0 attractor=0 retrieval_miss=0`; on avg_decode **13.3 tok/s
+(+13.7%)**, same `runaway=1 empty=0 attractor=0 retrieval_miss=0` — identical
+coherence profile, all 5 turns (code / reasoning / factual / prose / instruct)
+coherent. The single runaway is the same max-tokens "reason" prompt on both
+arms, not a q8dot regression. Battery prompt md5s `43ca0d15…`, `640e0fd4…`,
+`8f66b4c9…`, `8fe0ad36…`, `8bed8e2d…`.
+
 **gfx1151 gotchas found while implementing (portable to further dtypes):**
 - `__builtin_amdgcn_sdot4` fails with `needs target feature 'dot1-insts'`.
   `-Xclang -target-feature +dot1-insts` silently DROPS `__global__` kernels
