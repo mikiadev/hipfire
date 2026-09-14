@@ -724,6 +724,12 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
+    /// q8_1 decode-GEMV scratch (GSQ-RCO decode-next prototype): `(xs, xscales,
+    /// k)` where `xs` is `k` int8 bytes and `xscales` is `k/32` f32. Lazily
+    /// allocated on first `HIPFIRE_IQ3S_Q8DOT` use and reused across calls so
+    /// no hipMalloc happens inside a captured decode graph.
+    q8_scratch: Option<(GpuTensor, GpuTensor, usize)>,
+
     /// Calibration activation capture (Tier-1 collector). When `Some`, the
     /// instrumented linear dispatch arms resolve their weight buffer pointer
     /// to a tensor name via `capture_names` and invoke `capture()` with the
@@ -1317,6 +1323,7 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            q8_scratch: None,
             active_capture: None,
             capture_names: HashMap::new(),
             hessian_capture: None,
@@ -1328,6 +1335,22 @@ impl Gpu {
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
             // available out of the box. No-op on consumer arches.
             gpu.try_init_rocblas();
+            // GSQ-RCO decode-next: eagerly reserve the q8_1 decode-GEMV scratch AND
+            // JIT the q8dot kernels so the first `HIPFIRE_IQ3S_Q8DOT` decode never
+            // hipMallocs / loads a module inside a captured AR graph (both are
+            // illegal under stream capture).
+            if gpu.arch.starts_with("gfx1151")
+                && std::env::var("HIPFIRE_IQ3S_Q8DOT").ok().as_deref() == Some("1")
+            {
+                match gpu.prewarm_q8dot() {
+                    Ok(()) => {
+                        if std::env::var("HIPFIRE_Q8DOT_TRACE").is_ok() {
+                            eprintln!("[q8dot] prewarm ok");
+                        }
+                    }
+                    Err(e) => eprintln!("[q8dot] prewarm failed: {e}"),
+                }
+            }
             gpu
         })
     }
@@ -3240,6 +3263,64 @@ impl Gpu {
         let mut data = vec![0u8; tensor.byte_size()];
         self.hip.memcpy_dtoh(&mut data, &tensor.buf)?;
         Ok(data)
+    }
+
+    /// Ensure the q8_1 decode-GEMV scratch holds at least `k` int8 bytes (+
+    /// `k/32` f32 scales). Reallocates ONLY when `k` exceeds the current
+    /// capacity, and the first allocation is padded to a generous 32768 so a
+    /// decode pass that alternates K (5120 / 10240 / 17408) never triggers a
+    /// second hipMalloc — which is illegal inside a captured decode graph.
+    pub fn ensure_q8_scratch(&mut self, k: usize) -> HipResult<()> {
+        if let Some((_, _, cap)) = &self.q8_scratch {
+            if k <= *cap {
+                if std::env::var("HIPFIRE_Q8DOT_TRACE").is_ok() {
+                    eprintln!("[q8dot] ensure reuse k={k} cap={cap}");
+                }
+                return Ok(());
+            }
+        }
+        if std::env::var("HIPFIRE_Q8DOT_TRACE").is_ok() {
+            eprintln!("[q8dot] ensure ALLOC k={k} (prewarm_missing)");
+        }
+        let cap = k.max(32768);
+        let xs = self.alloc_tensor(&[cap], DType::Raw)?;
+        let sc = self.alloc_tensor(&[cap / 32], DType::F32)?;
+        self.q8_scratch = Some((xs, sc, cap));
+        Ok(())
+    }
+
+    /// Temporarily move the q8_1 scratch out of `Gpu` so `&mut self` kernel
+    /// methods can be called with `&GpuTensor` borrows of it. Pair with
+    /// [`Self::put_q8_scratch`].
+    pub fn take_q8_scratch(&mut self) -> Option<(GpuTensor, GpuTensor, usize)> {
+        self.q8_scratch.take()
+    }
+
+    /// Restore the scratch moved out by [`Self::take_q8_scratch`], preserving
+    /// the original capacity (`cap`) — not the per-call `k`, which would shrink
+    /// the buffer and force a hipMalloc on the next larger-K layer.
+    pub fn put_q8_scratch(&mut self, xs: GpuTensor, sc: GpuTensor, cap: usize) {
+        self.q8_scratch = Some((xs, sc, cap));
+    }
+
+    /// Warm the q8dot decode path OUTSIDE any stream capture: allocate the
+    /// scratch, JIT the kernels, and do one throwaway launch of each so HIP's
+    /// first-launch bookkeeping (which allocates) is done before the decode
+    /// graph captures. Idempotent.
+    pub fn prewarm_q8dot(&mut self) -> HipResult<()> {
+        self.ensure_q8_scratch(32768)?;
+        let d_x = self.zeros(&[256], DType::F32)?;
+        let d_xs = self.alloc_tensor(&[256], DType::Raw)?;
+        let d_sc = self.zeros(&[8], DType::F32)?;
+        let d_w = self.alloc_tensor(&[220], DType::Raw)?; // 2 rows x 1 block x 110 B
+        let d_y = self.zeros(&[2], DType::F32)?;
+        self.quantize_q8_1(&d_x, &d_xs, &d_sc, 256)?;
+        self.gemv_iq3_s_q8dot(&d_w, &d_xs, &d_sc, &d_y, 2, 256)?;
+        self.gemv_iq3_s_q8dot_residual(&d_w, &d_xs, &d_sc, &d_y, 2, 256)?;
+        for t in [d_x, d_xs, d_sc, d_w, d_y] {
+            let _ = self.free_tensor(t);
+        }
+        Ok(())
     }
 
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {

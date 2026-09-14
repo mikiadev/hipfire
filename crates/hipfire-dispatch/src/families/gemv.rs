@@ -493,7 +493,6 @@ fn iq4xs_dualrow_enabled(gpu: &Gpu) -> bool {
 }
 
 /// Same experiment gate for gemv_q4k_dualrow (`HIPFIRE_Q4K_DUALROW`).
-///
 /// REJECTED (default OFF): measured 310 µs/call vs the scalar gemv_q4k's
 /// 237 µs/call on gfx1151 (M=K=4096, decode profile, HIPFIRE_GRAPH=0).
 /// The Q4_K contiguous-8 remap needs a per-thread sub-group branch plus a
@@ -508,6 +507,49 @@ fn q4k_dualrow_enabled(gpu: &Gpu) -> bool {
         Ok(v) => v == "1",
         Err(_) => false,
     }
+}
+
+/// GSQ-RCO decode-next prototype gate: use the q8_1 + dp4a gemv_iq3_s_q8dot on
+/// gfx1151. Opt-in (`HIPFIRE_IQ3S_Q8DOT=1`) — measured 1.5-1.6x/call vs the
+/// dual-row fp32 kernel on real IQ3_S tensors, but re-quantizes x per GEMV
+/// here (the shared-x fast path is a follow-up), so it stays experimental.
+fn iq3s_q8dot_enabled(gpu: &Gpu) -> bool {
+    if !gpu.arch.starts_with("gfx1151") {
+        return false;
+    }
+    match std::env::var("HIPFIRE_IQ3S_Q8DOT") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    }
+}
+
+/// Quantize `x` to q8_1 (cached scratch) and run the dp4a IQ3_S GEMV, plain or
+/// fused-residual. `k` must be a multiple of 256/32 (all GSQ-RCO IQ3_S
+/// projections are). The scratch is moved out of `Gpu` around the `&mut`
+/// kernel calls so no allocation lands inside a captured decode graph.
+fn launch_iq3s_q8dot(
+    gpu: &mut Gpu,
+    w: &WeightRef,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    residual: bool,
+) -> Result<(), DispatchError> {
+    let mapped = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+    gpu.ensure_q8_scratch(k).map_err(mapped)?;
+    let (xs, sc, cap) = gpu
+        .take_q8_scratch()
+        .expect("q8 scratch ensured immediately above");
+    let r = gpu.quantize_q8_1(x, &xs, &sc, k).and_then(|_| {
+        if residual {
+            gpu.gemv_iq3_s_q8dot_residual(w.buf, &xs, &sc, y, m, k)
+        } else {
+            gpu.gemv_iq3_s_q8dot(w.buf, &xs, &sc, y, m, k)
+        }
+    });
+    gpu.put_q8_scratch(xs, sc, cap);
+    r.map_err(mapped)
 }
 
 /// Launch the concrete GEMV kernel for a resolved key. 1:1 with KernelKey.
@@ -553,7 +595,9 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         // GSQ-RCO perf item 2 experiment: dual-row gemv_iq3_s on gfx1151
         // (HIPFIRE_IQ3S_DUALROW=0 opts back to the scalar kernel).
         K::GemvIQ3S => {
-            if iq3s_dualrow_enabled(gpu) {
+            if iq3s_q8dot_enabled(gpu) && k % 256 == 0 {
+                launch_iq3s_q8dot(gpu, w, x, y, m, k, false)
+            } else if iq3s_dualrow_enabled(gpu) {
                 hip!(gpu.gemv_iq3_s_dualrow(w.buf, x, y, m, k))
             } else {
                 hip!(gpu.gemv_iq3_s(w.buf, x, y, m, k))
@@ -645,7 +689,9 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         // perf item 2: dual-row variants on gfx1151 (same HIPFIRE_*_DUALROW
         // gates as the plain GEMVs).
         IQ3S => {
-            if iq3s_dualrow_enabled(gpu) {
+            if iq3s_q8dot_enabled(gpu) && k % 256 == 0 {
+                launch_iq3s_q8dot(gpu, w, x, y, m, k, true)
+            } else if iq3s_dualrow_enabled(gpu) {
                 hip!(gpu.gemv_iq3_s_dualrow_residual(w.buf, x, y, m, k))
             } else {
                 hip!(gpu.gemv_iq3_s_residual(w.buf, x, y, m, k))
