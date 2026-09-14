@@ -929,6 +929,160 @@ impl Gpu {
         result
     }
 
+    /// q8_1 activation quantize (GSQ-RCO decode-next prototype): x[K] f32 →
+    /// xs[K] int8 + xscales[K/32] f32. One 32-element group per block of 32
+    /// threads; scale = max(|x|)/127, round-to-nearest. Feeds the q8_1/dp4a
+    /// decode GEMVs. `xs`/`xscales` are freshly allocated buffers.
+    pub fn quantize_q8_1(
+        &mut self,
+        x: &GpuTensor,
+        xs: &GpuTensor,
+        xscales: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("quantize_q8_1", kernels::QUANTIZE_Q8_1_SRC, "quantize_q8_1")?;
+        let func = &self.functions["quantize_q8_1"];
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut xs_ptr = xs.buf.as_ptr();
+        let mut sc_ptr = xscales.buf.as_ptr();
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut xs_ptr as *mut _ as *mut c_void,
+            &mut sc_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let timer = crate::profile::begin_timer(&self.hip, "quant", "quantize_q8_1", k * 5);
+        let block_size = 32u32;
+        let grid = ((k as u32) + 31) / 32;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// y = A_iq3s @ q8_1(x) (GSQ-RCO decode-next prototype): dual-row dp4a
+    /// GEMV on a pre-quantized q8_1 activation. `xs` = [K] int8,
+    /// `xscales` = [K/32] f32. See kernels/src/gemv_iq3_s_q8dot.hip.
+    pub fn gemv_iq3_s_q8dot(
+        &mut self,
+        a_raw: &GpuTensor,
+        xs: &GpuTensor,
+        xscales: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_iq3_s_q8dot", kernels::GEMV_IQ3S_Q8DOT_SRC, "gemv_iq3_s_q8dot")?;
+        let func = &self.functions["gemv_iq3_s_q8dot"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xs_ptr = xs.buf.as_ptr();
+        let mut sc_ptr = xscales.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xs_ptr as *mut _ as *mut c_void,
+            &mut sc_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 110);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_s_q8dot", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// y += A_iq3s @ q8_1(x): fused-residual variant of gemv_iq3_s_q8dot
+    /// (out_proj / FA o_proj path).
+    pub fn gemv_iq3_s_q8dot_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        xs: &GpuTensor,
+        xscales: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_iq3_s_q8dot_residual",
+            kernels::GEMV_IQ3S_Q8DOT_SRC,
+            "gemv_iq3_s_q8dot_residual",
+        )?;
+        let func = &self.functions["gemv_iq3_s_q8dot_residual"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xs_ptr = xs.buf.as_ptr();
+        let mut sc_ptr = xscales.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xs_ptr as *mut _ as *mut c_void,
+            &mut sc_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_iq_bytes(m, k, 110);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_iq3_s_q8dot_residual", bytes);
+        let block_size = 32u32;
+        let grid = ((m as u32) + 1) / 2;
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// y += A_iq3s * x (fused residual, GSQ-RCO perf item 1). Same decode
     /// math as gemv_iq3_s with `y[row] += sum` — one launch replaces the
     /// un-fused plain-GEMV + add_inplace pair for out_proj / FA o_proj.

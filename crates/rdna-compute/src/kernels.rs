@@ -4896,6 +4896,18 @@ pub const GEMV_IQ4XS_DUALROW_RESIDUAL_SRC: &str =
 pub const GEMV_IQ3XXS_DUALROW_RESIDUAL_SRC: &str =
     include_str!("../../../kernels/src/gemv_iq3_xxs_dualrow_residual.hip");
 
+/// q8_1 activation quantize (GSQ-RCO decode-next prototype): x[K] f32 ->
+/// xs[K] int8 + xscales[K/32] f32, one 32-element group per block.
+/// Feeds the q8_1/dp4a decode GEMVs (gemv_iq3_s_q8dot).
+pub const QUANTIZE_Q8_1_SRC: &str = include_str!("../../../kernels/src/quantize_q8_1.hip");
+
+/// IQ3_S q8_1 + dp4a dual-row GEMV (GSQ-RCO decode-next prototype): same
+/// thread mapping as gemv_iq3_s_dualrow but the activation is pre-quantized
+/// to q8_1 and the dot uses v_dot4_i32_i32 (dp4a) with packed sign
+/// application — ~2x fewer per-element instructions than the fp32 FMA path.
+/// Plain + fused-residual variants in one source.
+pub const GEMV_IQ3S_Q8DOT_SRC: &str = include_str!("../../../kernels/src/gemv_iq3_s_q8dot.hip");
+
 /// Batched IQ3_S GEMM (GSQ-RCO native path). Same per-row math as
 /// gemv_iq3_s (110 B groups, identical FMA order for greedy parity) with
 /// per-batch register accumulators. Prefill LA/FA/FFN matchers route IQ3S

@@ -3234,6 +3234,14 @@ impl Gpu {
         Ok(data)
     }
 
+    /// Download a raw-byte tensor (e.g. an int8 activation buffer) as bytes.
+    pub fn download_raw(&self, tensor: &GpuTensor) -> HipResult<Vec<u8>> {
+        self.bind_thread()?;
+        let mut data = vec![0u8; tensor.byte_size()];
+        self.hip.memcpy_dtoh(&mut data, &tensor.buf)?;
+        Ok(data)
+    }
+
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, dtype)?;
