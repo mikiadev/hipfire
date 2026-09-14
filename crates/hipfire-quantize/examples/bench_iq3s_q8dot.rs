@@ -367,6 +367,18 @@ fn main() {
     let _ = gpu.download_f32(&d_sc).unwrap();
     let t_quant = t2.elapsed().as_secs_f64() / iters as f64;
 
+    // Split-K experiment (IQ3_S only): time the split-K variant at 1/2/4.
+    if quant == "iq3s" {
+        for sp in [1usize, 2, 4] {
+            let ts = Instant::now();
+            for _ in 0..iters {
+                gpu.gemv_iq3_s_q8dot_split(&d_raw, &d_xs, &d_sc, &d_yq, m, k, sp).unwrap();
+            }
+            let _ = gpu.download_f32(&d_yq).unwrap();
+            eprintln!("  q8dot split={sp}: {:.1} us/call", ts.elapsed().as_secs_f64() / iters as f64 * 1e6);
+        }
+    }
+
     eprintln!("  dualrow fp32 : {:.1} us/call", t_dual * 1e6);
     eprintln!("  q8dot (incl. quantize): {:.1} us/call", t_q8 * 1e6);
     eprintln!("  quantize_q8_1: {:.1} us/call", t_quant * 1e6);

@@ -313,3 +313,92 @@ extern "C" __global__ void gemv_iq3_s_q8dot_residual(
         if (have_row1) y[row1] += sum1;
     }
 }
+// ── Split-K variant (GSQ-RCO decode-next) — REJECTED (measured) ───────────
+// Each block covers a contiguous slice of the K blocks; the per-row partial is
+// combined with atomicAdd. grid = [ceil(M/2), split]. Caller MUST pre-zero y
+// (plain) — for the residual variant y already holds the residual, so all
+// splits add into it directly.
+//
+// MEASURED REGRESSION on gfx1151 (200 iters, us/call, vs the plain q8dot):
+//   attn_output 6144x5120   60.7 -> 62.2 (split=1) -> 73.3 (2) -> 76.5 (4)
+//   ffn_down   17408x5120  174.6 -> 180.6        -> 192.4    -> 204.1
+// The q8dot kernels already run at ~210 GiB/s (~88% of the APU peak), so the
+// kernel is memory-bandwidth-bound, not latency-bound; split-K adds atomic +
+// extra-partial overhead without adding useful parallelism. Kept for the
+// record only — do not wire. (The fp32 dual-row kernel was latency-bound at
+// ~140 GiB/s, which is why split-K looked plausible before q8dot.)
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_iq3_s_q8dot_split(
+    const unsigned char* __restrict__ A_iq3s,
+    const signed char* __restrict__ xs,
+    const float* __restrict__ xscales,
+    float* __restrict__ y,
+    int M, int K, int split) {
+
+    const int row0 = blockIdx.x << 1;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const bool have_row1 = row1 < M;
+    const int tid = threadIdx.x;
+    const int by = blockIdx.y;
+
+    const int blocks_per_row = K / 256;
+    const size_t row_stride = (size_t)blocks_per_row * 110;
+    const unsigned char* row0_data = A_iq3s + (size_t)row0 * row_stride;
+    const unsigned char* row1_data = A_iq3s + (size_t)(have_row1 ? row1 : row0) * row_stride;
+
+    const int ib   = tid >> 2;
+    const int l    = tid & 3;
+    const int i    = ib >> 1;
+    const int half = ib & 1;
+    const int qs_base  = i * 16 + half * 8 + 2 * l;
+    const int shift_lo = 8 - 2 * l;
+    const int shift_hi = 7 - 2 * l;
+
+    // Contiguous slice [start, end) of the K blocks for this split.
+    const int kb = (blocks_per_row + split - 1) / split;
+    const int start = by * kb;
+    int end = start + kb;
+    if (end > blocks_per_row) end = blocks_per_row;
+
+    float sum0 = 0.0f, sum1 = 0.0f;
+
+    __shared__ unsigned char s_blk[880];
+    int bg = start;
+    for (; bg + 4 <= end; bg += 4) {
+        const unsigned int* src0 = (const unsigned int*)(row0_data + bg * 110);
+        const unsigned int* src1 = (const unsigned int*)(row1_data + bg * 110);
+        #pragma unroll
+        for (int t = tid; t < 110; t += 32) {
+            ((unsigned int*)s_blk)[t] = src0[t];
+            ((unsigned int*)s_blk)[110 + t] = src1[t];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int bi = 0; bi < 4; bi++) {
+            // INT_MAX-safe: base index for the activation offset
+            q8dot_process_block(
+                s_blk + bi * 110, s_blk + 440 + bi * 110,
+                xscales, (bg + bi) * 8, xs, bg + bi,
+                tid, ib, l, i, half, qs_base, shift_lo, shift_hi,
+                &sum0, &sum1);
+        }
+        __syncthreads();
+    }
+    for (; bg < end; bg++) {
+        q8dot_process_block(
+            row0_data + bg * 110, row1_data + bg * 110,
+            xscales, bg * 8, xs, bg,
+            tid, ib, l, i, half, qs_base, shift_lo, shift_hi,
+            &sum0, &sum1);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down(sum0, offset);
+        sum1 += __shfl_down(sum1, offset);
+    }
+    if (tid == 0) {
+        atomicAdd(&y[row0], sum0);
+        if (have_row1) atomicAdd(&y[row1], sum1);
+    }
+}

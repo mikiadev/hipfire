@@ -17,32 +17,29 @@ measured with the §8 protocol.
 
 ## 0. TL;DR — ranked recommendations
 
-| # | Lever | Kind | Est. decode impact | Effort |
+| # | Lever | Kind | Measured outcome | Effort |
 |---|---|---|---|---|
-| 1 | **q8_1 + dp4a I-quant GEMV** — SHIPPED as prototype, MEASURED | kernel | kernel 1.5–1.6×; E2E +3.4% (IQ3_S only) | high |
-| 2 | **Split-K for the latency-bound dual-row kernels** | kernel | unknown (untried) | medium |
-| 3 | **DFlash2/spec decode** (pwilkin headline: 26 t/s) | engine | ×1.5–2.5 on code/reasoning | high (plan non-goal) |
-| 4 | Port q8dot to IQ4_XS / IQ3_XXS (43% more of decode kernel time) | kernel | +? (memory-ceiling-limited) | medium |
-| 5 | Fused I-quant QKVZA / GATE_UP | kernel | +2–4% | medium |
+| 1 | **q8_1 + dp4a I-quant GEMV** (IQ3_S / IQ3_XXS / IQ4_XS) | kernel | **SHIPPED: E2E 11.7 → 13.4 tok/s (+14.5%)** | high |
+| 2 | **Split-K on the I-quant GEMVs** | kernel | **REJECTED: regression (+20% at split=2)** | medium |
+| 3 | Fused I-quant QKVZA / GATE_UP | kernel | not attempted (est. +2–4%; q8dot already shares x per-row) | medium |
+| 4 | Port q8dot to Q4_K | kernel | not attempted (already 188 GiB/s ≈ peak) | medium |
+| 5 | **DFlash2/spec decode** (pwilkin headline: 26 t/s) | engine | the only structural lever left | high (plan non-goal) |
 | 6 | TOP_K wave32-native (pwilkin) | sampling | spec-only | low |
-| — | Prefill: **bf16 WMMA dequant GEMM** (pwilkin) | prefill | prefill 9.5 → 30–50 t/s | high |
+| — | Prefill: **bf16 WMMA dequant GEMM** (pwilkin) | prefill | est. prefill 9.5 → 30–50 t/s | high |
 
-> **Measured update (2026-09-14):** recommendation #1 is implemented and
-> measured. The kernel win is real (1.46–1.62×/call on real IQ3_S tensors —
-> see §3.1a) but the end-to-end decode gain is only **+3.4%** (11.6 → 12.0
-> tok/s, fresh-process ×3, prompt md5 `2c8abce9…`, daemon `518ca732…`). That
-> gap is the single most important finding here: **stage-4 decode is close to
-> the APU's effective memory ceiling (~130–190 GiB/s of weight traffic on a
-> ~238 GiB/s peak), so kernel-arithmetic wins translate to much less wall-clock
-> than the arithmetic implies.** #2 (split-K, targeting latency/parallelism,
-> not instruction count) and #4 (apply the same win to the other 43% of the
-> I-quant GEMVs) are the follow-ups; #3 (speculation) is the only lever that
-> breaks the per-weight-pass ceiling structurally.
+> **Measured update (2026-09-14):** #1 is implemented and measured for three of
+> the four I-quant families. Kernel win 1.26–1.70×/call; **E2E decode
+> 11.7 → 13.4 tok/s (+14.5%)**, fresh-process ×3, prompt md5 `2c8abce9…`,
+> daemon `a0dec359…`. #2 (split-K) was implemented and **rejected** — after
+> q8dot the kernels are bandwidth-bound (~210 GiB/s, ~88% of the APU peak), so
+> extra parallelism only costs `atomicAdd` overhead. **The decode is now close
+> to the effective memory ceiling; #5 (speculation) is the only lever that
+> breaks the per-weight-pass ceiling structurally.** See §3.
 
-The honest headline: **hipfire's AR decode of stage-4 (11.7 tok/s on IQ3_S) is
-already competitive with llama.cpp's AR decode of a *faster-to-decode* IQ4_XS
-model on the same GPU.** pwilkin's 26 t/s is not better GEMV kernels — his fork
-ships **zero decode-GEMV changes** (upstream mmvq); the win is DFlash2
+The honest headline: **hipfire's AR decode of stage-4 is now 13.4 tok/s on
+IQ3_S — comfortably ahead of llama.cpp's AR decode of a *faster-to-decode*
+IQ4_XS model on the same GPU.** pwilkin's 26 t/s is not better GEMV kernels —
+his fork ships **zero decode-GEMV changes** (upstream mmvq); the win is DFlash2
 speculation + a 4.97-bpw quant + retained-PM4 dispatch.
 
 ---
@@ -141,43 +138,49 @@ HIPFIRE_GRAPH=0, gfx1151, stage-4 file, dual-row + LDS staging build):
 
 ## 3. Decode levers, ranked
 
-### 3.1 q8_1 + dp4a I-quant GEMV — SHIPPED (prototype), MEASURED
+### 3.1 q8_1 + dp4a I-quant GEMV — SHIPPED (IQ3_S / IQ3_XXS / IQ4_XS), MEASURED
 
 **What:** port llama.cpp's `vec_dot_*_q8_1` technique to the I-quant decode
-GEMVs. Implemented as `gemv_iq3_s_q8dot` (+ residual) in
-`kernels/src/gemv_iq3_s_q8dot.hip`, fed by `quantize_q8_1`
-(`kernels/src/quantize_q8_1.hip`); rdna-compute methods
-(`quantize_q8_1`, `gemv_iq3_s_q8dot`, `gemv_iq3_s_q8dot_residual`), dispatch
-wiring in `families/gemv.rs` behind `HIPFIRE_IQ3S_Q8DOT=1` (opt-in, gfx1151),
-gated scratch + kernel prewarm at `Gpu::init`.
+GEMVs. Three kernels: `gemv_iq3_s_q8dot`, `gemv_iq3_xxs_q8dot`,
+`gemv_iq4_xs_q8dot` (+ residual each), fed by `quantize_q8_1`. rdna-compute
+methods + dispatch wiring in `families/gemv.rs` behind `HIPFIRE_IQ3S_Q8DOT=1`
+(opt-in, gfx1151; enables all three dtypes), with gated scratch + kernel
+prewarm at `Gpu::init`.
 
-**Measured kernel win** (gfx1151, real GGUF IQ3_S tensors, 200 iters, µs/call):
+**Measured kernel win** (gfx1151, real GGUF tensors, 200 iters, µs/call):
 
-| tensor | shape | dualrow | q8dot | speedup |
-|---|---|---|---|---|
-| attn_output | 6144×5120 | 96.0 | 60.0 | 1.60× |
-| attn_qkv | 5120×10240 | 148.3 | 98.6 | 1.51× |
-| ffn_gate | 5120×17408 | 255.3 | 174.7 | 1.46× |
-| ffn_down | 17408×5120 | 259.4 | 177.7 | 1.46× |
+| dtype | tensor | shape | dualrow | q8dot | speedup |
+|---|---|---|---|---|---|
+| IQ3_S | attn_output | 6144×5120 | 96.0 | 60.0 | 1.60× |
+| IQ3_S | attn_qkv | 5120×10240 | 148.3 | 98.6 | 1.51× |
+| IQ3_S | ffn_gate | 5120×17408 | 255.3 | 174.7 | 1.46× |
+| IQ3_XXS | attn_output | 6144×5120 | 89.5 | 52.6 | 1.70× |
+| IQ3_XXS | ffn_gate | 5120×17408 | 244.1 | 159.3 | 1.53× |
+| IQ4_XS | attn_output | 6144×5120 | 97.0 | 74.0 | 1.31× |
+| IQ4_XS | ffn_gate | 5120×17408 | 277.1 | 220.8 | 1.26× |
 
-Correctness: vs a CPU q8_1 oracle max_abs ~2e-5 (rel ~1e-6); vs the fp32
-dualrow rel ~3e-4 (the q8_1 activation delta). VGPR 69/0 spills vs dualrow 81.
+Correctness: IQ3_S vs CPU q8_1 oracle rel ~1e-6; IQ3_XXS/IQ4_XS vs the fp32
+dualrow rel 1.1e-3 / 2.5e-3 (the q8_1 activation delta). IQ3_XXS benefits most
+— it has the same expensive separate-sign construct the IQ3_S kernel
+eliminated. IQ4_XS still gains 1.26–1.31× despite having no separate sign step
+(packing the signed kvalues table into dp4a lanes beats the per-element
+dequant+select+FMA chain).
 
 **Measured E2E** (fresh-process ×3, prompt md5 `2c8abce9…`, daemon
-`518ca732…`, hipfire `172b68ca…`, model `d148a992…`):
-q8dot off 11.6/11.6/11.7 → median **11.6 tok/s**; on 12.0/12.0/12.1 → median
-**12.0 tok/s** (**+3.4%**). Decoded text coherent; output diverges from the
-fp32 path after ~160 chars (expected q8_1 logit perturbation — same
-greedy-parity trade as Item 2), no attractor/empty.
+`a0dec359…`, hipfire `806d1845…`, model `d148a992…`, graph capture ON):
+q8dot off 11.7/11.6/11.7 → median **11.7 tok/s**; on 13.5/13.4/13.4 → median
+**13.4 tok/s** (**+14.5%**). Decoded text coherent (Rayleigh-scattering
+answer, natural stop) — output diverges from the fp32 path (expected q8_1 logit
+perturbation; same greedy-parity trade as Item 2).
 
-**Why +3.4% and not the ~+12% the arithmetic implies:** IQ3_S is only 31.7% of
-serialized decode kernel time, and — the important part — the decode is close
-to the APU's *effective* memory ceiling, so a kernel-level instruction win does
-not fully convert to wall-clock. This is consistent with the standalone bench:
-the dualrow kernel already runs at 130 GiB/s and q8dot at ~140–190 GiB/s
-against a ~238 GiB/s (256 GB/s) peak.
+**Why not the full arithmetic (~1.4× projected → 17 tok/s):** the q8dot
+kernels now run at ~210 GiB/s (~88% of the APU's ~238 GiB/s peak), so the
+decode is close to the *effective memory ceiling* — the remaining gap is the
+non-I-quant kernels running at lower bandwidth plus non-kernel overhead, not
+arithmetic. This is why the kernel-level 1.5× converts to +14.5% E2E, not
++40%.
 
-**gfx1151 gotchas found while implementing (portable to the other dtypes):**
+**gfx1151 gotchas found while implementing (portable to further dtypes):**
 - `__builtin_amdgcn_sdot4` fails with `needs target feature 'dot1-insts'`.
   `-Xclang -target-feature +dot1-insts` silently DROPS `__global__` kernels
   (empty device object), and `__attribute__((target("dot1-insts")))` on a
@@ -186,8 +189,8 @@ against a ~238 GiB/s (256 GB/s) peak.
   inverted from the LLVM argument name).
 - gfx1151 has **no** `v_pk_sub_u8` / `v_sub_u8`. clang's
   `__builtin_elementwise_sub_sat(i8x4)` emulation costs **~14 instructions per
-  pack** (measured: the sign block was 57 µs of a 99 µs kernel; a signs-off
-  probe ran 2.3× faster). Replaced with `out = (g ^ mask) + bits`,
+  pack** (measured: the IQ3_S sign block was 57 µs of a 99 µs kernel; a
+  signs-off probe ran 2.3× faster). Replaced with `out = (g ^ mask) + bits`,
   `mask = bits*0xFF`: every byte of that sum stays ≤ 255, so a **plain 32-bit
   add is the correct packed-byte op** (~10 ops/pack).
 - Anything that allocates (scratch, first kernel launch) must happen OUTSIDE a
@@ -196,29 +199,28 @@ against a ~238 GiB/s (256 GB/s) peak.
   at `Gpu::init`. The take/put scratch cycle must preserve the *capacity*, not
   the per-call `k` — otherwise the alternating K (5120↔17408) reallocs mid-graph.
 
-**Remaining work on this lever:** port to IQ4_XS (22.5%) and IQ3_XXS (20.5%)
-and Q4K (8.4%); share one q8_1 quantize across the 4 consumers of `x_rot` and
-the out_proj input; then re-measure. Given the memory-ceiling effect, the E2E
-gain per dtype will be sub-arithmetic.
+**Remaining on this lever:** only Q4_K (8.4% of old kernel time) is unported;
+it already runs at 188 GiB/s (near peak), so q8dot is unlikely to help and was
+not attempted. The I-quant decode kernel work is effectively complete.
 
-### 3.2 Split-K for the latency-bound dual-row kernels (P1, untried)
+### 3.2 Split-K — REJECTED (measured regression)
 
-**What:** grid is currently `[ceil(M/2),1,1]` = 2560 blocks for M=5120 with a
-serial K loop. Split K into 2 (grid `[M/2, 2]`), each block accumulates half,
-then `atomicAdd` f32 to `y[row]` (needs a 20 KB memset of y per GEMV, or fold
-the zeroing into the residual epilogue where present). Doubles wave count →
-better latency hiding on the 40-CU APU.
+Implemented as `gemv_iq3_s_q8dot_split` (grid `[ceil(M/2), split]`, contiguous
+K slices, `atomicAdd` epilogue). Measured on gfx1151 (200 iters, µs/call):
 
-**Why:** plan Item 2b explicitly concluded the dual-row kernels are
-*latency-bound*. Split-K is the textbook fix and was never tried. Determinism:
-fp32 atomicAdd order is non-deterministic — already acceptable (greedy parity
-is a documented trade).
+| shape | q8dot | split=1 | split=2 | split=4 |
+|---|---|---|---|---|
+| attn_output 6144×5120 | 60.7 | 62.2 | 73.3 | 76.5 |
+| ffn_down 17408×5120 | 174.6 | 180.6 | 192.4 | 204.1 |
 
-**Estimate:** +10–20% on the 4 plain GEMVs → decode +8–15%. Cheaper to try
-than 3.1 (one kernel parameter + atomic epilogue), good as a complement to
-3.1 (3.1 removes instructions, split-K removes latency stalls).
+Split-K is a **regression**, and for the right reason: after q8dot the kernels
+run at ~210 GiB/s (~88% of the APU peak), i.e. they are **memory-bandwidth-
+bound, not latency-bound**, so extra blocks in flight add nothing while the
+`atomicAdd` + extra partial writes cost real time. Split-K looked plausible
+only against the pre-q8dot fp32 dual-row kernel (which *was* latency-bound at
+~140 GiB/s). Kept in-tree for the record; do not wire.
 
-### 3.3 DFlash2/spec decode (P1 for throughput, plan non-goal)
+### 3.3 DFlash2/spec decode (structural lever, plan non-goal)
 
 **What:** pwilkin's entire decode margin is DFlash2 width 6 (26.26 t/s on
 IQ4_XS). hipfire has the full DFlash machinery
